@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::fs_ops::{NAME_MAX, exists_nofollow, holds_mount_point, remove_temp_tree, rename_noreplace, truncate};
 
@@ -214,6 +214,21 @@ fn own_start() -> Option<u64> {
     *START.get_or_init(|| start_of(std::process::id()))
 }
 
+// true when the live process of this pid started clearly after the time, with room for the second of the boot time
+#[cfg(target_os = "linux")]
+fn started_after(pid: u32, at: SystemTime) -> bool {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let boot = fs::read_to_string("/proc/stat").ok().and_then(|stat| stat.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok()));
+    let (Some(boot), Some(start), true) = (boot, start_of(pid), ticks > 0) else { return false };
+    let began = UNIX_EPOCH + Duration::from_secs(boot + start / ticks as u64);
+    at + Duration::from_secs(2) < began
+}
+
+#[cfg(not(target_os = "linux"))]
+fn started_after(_pid: u32, _at: SystemTime) -> bool {
+    false
+}
+
 // without a cheap check the age alone decides
 #[cfg(not(target_os = "linux"))]
 fn process_alive(_owner: Owner) -> bool {
@@ -227,13 +242,15 @@ fn own_start() -> Option<u64> {
 
 // an old item is user data that waits for a replace, so an owner that ended frees it at once, whatever the date of the data
 fn is_stale(path: &Path, owner: Option<Owner>, role: Role, min_age: Duration) -> bool {
-    if owner.is_some_and(Owner::is_live) {
+    let changed = fs::symlink_metadata(path).and_then(|m| m.modified());
+    // a tag with no start time names only a pid, so a process that started after the item last changed is not its owner
+    let reused = owner.is_some_and(|o| o.start.is_none() && changed.as_ref().is_ok_and(|&at| started_after(o.pid, at)));
+    if !reused && owner.is_some_and(Owner::is_live) {
         return false;
     }
-    if role == Role::Old && owner.is_some_and(Owner::has_ended) {
+    if role == Role::Old && (reused || owner.is_some_and(Owner::has_ended)) {
         return true;
     }
-    let changed = fs::symlink_metadata(path).and_then(|m| m.modified());
     changed.is_ok_and(|at| SystemTime::now().duration_since(at).is_ok_and(|age| age >= min_age))
 }
 
@@ -407,5 +424,24 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("report.txt")).unwrap(), "data", "the old item got its name back");
         assert!(!old.exists() && !part.exists(), "a pid with another start time is not the owner");
         assert!(own_part.exists(), "the same pid with the same start time keeps its item");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tag_without_a_start_time_frees_when_a_newer_process_holds_its_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let (old, part, fresh) = (format!(".a.txt.{pid}-5-1{OLD}"), format!(".b.bin.{pid}-5-1{PART}"), format!(".c.txt.{pid}-5-1{OLD}"));
+        for name in [&old, &part, &fresh] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        backdate(&dir.join(&old));
+        backdate(&dir.join(&part));
+        sweep(dir, SAFE_AGE, &AtomicBool::new(false));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(names_in(dir), [fresh, "a.txt".to_string()], "the old item is back, the part is gone, the item that is newer than the process stays");
     }
 }
