@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::fs_ops::{Entry, exists_nofollow, stat_entry, unique_dest};
+use crate::fs_ops::{Entry, exists_nofollow, is_within, same_dir, stat_entry, unique_dest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -149,7 +149,7 @@ struct Worker<'a> {
 
 fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io::Result<()> {
     for src in sources {
-        if src.is_dir() && dest_dir.starts_with(src) {
+        if is_real_dir(src) && is_within(dest_dir, src) {
             return Err(io::Error::other("Cannot put a folder inside itself."));
         }
     }
@@ -174,23 +174,24 @@ impl Worker<'_> {
         let name = src.file_name().ok_or_else(|| io::Error::other("The source has no name."))?;
         *self.p.current.lock().unwrap() = name.to_string_lossy().into_owned();
         let mut target = dest_dir.join(name);
-        if target == src {
-            if self.p.kind == JobKind::Move {
-                self.p.add_done(tree_size(src));
-                return Ok(());
-            }
-            target = unique_dest(dest_dir, name);
-        } else if exists_nofollow(&target) {
-            if is_real_dir(src) && is_real_dir(&target) {
-                return self.merge(src, &target);
-            }
-            match self.resolve(src, &target)? {
-                Resolution::Skip => {
+        if exists_nofollow(&target) {
+            if src.parent().is_some_and(|dir| same_dir(dir, dest_dir)) {
+                if self.p.kind == JobKind::Move {
                     self.p.add_done(tree_size(src));
                     return Ok(());
                 }
-                Resolution::KeepBoth => target = unique_dest(dest_dir, name),
-                Resolution::Replace => return self.replace(src, &target, name.to_owned()),
+                target = unique_dest(dest_dir, name);
+            } else if is_real_dir(src) && is_real_dir(&target) {
+                return self.merge(src, &target);
+            } else {
+                match self.resolve(src, &target)? {
+                    Resolution::Skip => {
+                        self.p.add_done(tree_size(src));
+                        return Ok(());
+                    }
+                    Resolution::KeepBoth => target = unique_dest(dest_dir, name),
+                    Resolution::Replace => return self.replace(src, &target, name.to_owned()),
+                }
             }
         }
         self.place(src, &target)
@@ -210,7 +211,7 @@ impl Worker<'_> {
 
     // the new item lands under a staging name first so a failed copy never costs the old item
     fn replace(&mut self, src: &Path, target: &Path, name: OsString) -> io::Result<()> {
-        if src.starts_with(target) {
+        if is_real_dir(target) && src.parent().is_some_and(|dir| is_within(dir, target)) {
             return Err(io::Error::other("Cannot replace a folder with something inside it."));
         }
         let mut staging_name = OsString::from(".");
@@ -420,6 +421,54 @@ mod tests {
         fs::create_dir_all(dir.join("inner")).unwrap();
         let p = spawn(JobKind::Copy, vec![dir.clone()], dir.join("inner"), ASK);
         assert!(matches!(wait(&p), JobState::Failed(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_put_a_folder_inside_itself_through_a_link() {
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let tmp = tempfile::tempdir().unwrap();
+            let real = tmp.path().join("real/d");
+            fs::create_dir_all(real.join("c1")).unwrap();
+            fs::write(real.join("f.txt"), "x").unwrap();
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let p = spawn(kind, vec![real.clone()], link.join("c1"), ASK);
+            assert_eq!(wait(&p), JobState::Failed("Cannot put a folder inside itself.".into()));
+            assert!(names_in(&real.join("c1")).is_empty(), "nothing was copied");
+            assert_eq!(names_in(&real), ["c1", "f.txt"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pasted_into_its_own_folder_through_a_link_is_never_lost() {
+        for (kind, expect) in [(JobKind::Copy, vec!["x (2).txt", "x.txt"]), (JobKind::Move, vec!["x.txt"])] {
+            let tmp = tempfile::tempdir().unwrap();
+            let real = tmp.path().join("real");
+            fs::create_dir(&real).unwrap();
+            fs::write(real.join("x.txt"), "data").unwrap();
+            let alias = tmp.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let p = spawn(kind, vec![real.join("x.txt")], alias, Policy::Always(Resolution::Replace));
+            assert_eq!(wait(&p), JobState::Done);
+            assert_eq!(names_in(&real), expect);
+            assert_eq!(read(real.join("x.txt")), "data");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_moved_into_its_own_parent_through_a_link_asks_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir_all(real.join("d")).unwrap();
+        fs::write(real.join("d/f.txt"), "data").unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let p = spawn(JobKind::Move, vec![real.join("d")], alias, ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(read(real.join("d/f.txt")), "data");
     }
 
     #[test]

@@ -153,6 +153,29 @@ pub fn exists_nofollow(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+// identity follows links, so a folder and a link to it count as one folder
+#[cfg(unix)]
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+// true when path is dir itself or lies anywhere below it, whatever links the path text goes through
+pub fn is_within(path: &Path, dir: &Path) -> bool {
+    fs::canonicalize(path).is_ok_and(|real| real.ancestors().any(|a| same_dir(a, dir)))
+}
+
 pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
     let first = dir.join(name);
     if !exists_nofollow(&first) {
