@@ -208,6 +208,8 @@ func _run() -> void:
 	await _preview_replay()
 	await _move_refreshes_source()
 	await _unknown_job()
+	await _places_refresh()
+	_missing_folder()
 	await _opening()
 	_glyphs()
 	_keyboard_fallback()
@@ -546,6 +548,65 @@ func _unknown_job() -> void:
 	check(counter.count == 0, "polling an unknown job id raises no script error (%d)" % counter.count)
 	app.jobs.erase(99)
 	OS.remove_logger(counter)
+
+
+func place_labels() -> Array:
+	return app.places.map(func(p): return p["label"])
+
+
+func _places_refresh() -> void:
+	var home: Dictionary = app.places[0]
+	var card := {"label": "SD CARD", "path": root_dir, "kind": "drive"}
+	var drives: Array = [home]
+	app.places_source = func() -> Array: return drives.duplicate(true)
+	app.mode = app.Mode.FILES
+	drives.append(card)
+	press("jf_pane")
+	check(place_labels() == [home["label"], "SD CARD"], "opening the places pane lists a card that was inserted: %s" % [place_labels()])
+	press("jf_down")
+	check(app.mode == app.Mode.PLACES and app.place_cursor == 1, "the cursor can rest on the new card")
+	drives.pop_back()
+	app._clock += 60.0
+	await until(func(): return place_labels() == [home["label"]], "a timer drops a card that was removed")
+	check(app.mode == app.Mode.PLACES and app.place_cursor == 0, "the cursor falls back to the last place that exists (%d)" % app.place_cursor)
+	drives.append(card)
+	app._clock += 60.0
+	await until(func(): return place_labels() == [home["label"], "SD CARD"], "a timer lists a card that was inserted")
+	app.mode = app.Mode.FILES
+	app.places_source = app.core.places
+	app.places = app.places_source.call()
+
+
+func rm_tree(path: String) -> void:
+	if not path.begins_with(root_dir + "/"):
+		return
+	for d in DirAccess.get_directories_at(path):
+		rm_tree(path + "/" + d)
+	for f in DirAccess.get_files_at(path):
+		DirAccess.remove_absolute(path + "/" + f)
+	DirAccess.remove_absolute(path)
+
+
+func _missing_folder() -> void:
+	var base := root_dir + "/vanish"
+	write(base + "/top/mid/f.txt", "x")
+	write(base + "/keep.txt", "x")
+	app.navigate(base + "/top/mid")
+	rm_tree(base + "/top")
+	app.refresh()
+	check(app.cwd == base, "refresh leaves a deleted folder for the nearest one that exists (%s)" % app.cwd)
+	check(names() == ["keep.txt"], "the nearest folder lists its own entries: %s" % [names()])
+	check(app._toast_label.text.begins_with("The folder mid is gone."), "a toast says that the folder is gone: %s" % app._toast_label.text)
+
+	write(base + "/top/mid/f.txt", "x")
+	app.navigate(base + "/top/mid")
+	rm_tree(base + "/top")
+	press("jf_back")
+	check(app.cwd == base, "B on a deleted folder also lands on the nearest one that exists (%s)" % app.cwd)
+
+	app.cwd = "Z:\\gone"
+	app.refresh()
+	check(app.cwd == app.places[0]["path"], "a folder with no ancestor that exists falls back to home (%s)" % app.cwd)
 
 
 func _opening() -> void:
