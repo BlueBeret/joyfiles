@@ -227,7 +227,7 @@ fn same_item(a: &Path, b: &Path) -> bool {
     a.parent().zip(b.parent()).is_some_and(|(x, y)| same_dir(x, y)) && name(a) == name(b)
 }
 
-fn display_name(path: &Path) -> String {
+pub fn display_name(path: &Path) -> String {
     path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
 }
 

@@ -106,9 +106,7 @@ impl JoyCore {
                 vdict! { "ok" => true, "entries" => &arr, "error" => "" }
             }
             Err(e) => {
-                let dir = path_of(&path);
-                let name = dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy().into_owned();
-                let error = format!("Could not open \"{name}\": {}.", fs_ops::reason(&e));
+                let error = format!("Could not open \"{}\": {}.", fs_ops::display_name(&path_of(&path)), fs_ops::reason(&e));
                 vdict! { "ok" => false, "entries" => &VarArray::new(), "error" => error.as_str() }
             }
         }
@@ -197,7 +195,10 @@ impl JoyCore {
                 "items" => p.items.clone().and_then(Result::ok).map_or(-1, |n| n as i64),
                 "items_error" => p.items.and_then(Result::err).unwrap_or_default().as_str(),
             },
-            Err(e) => vdict! { "ok" => false, "error" => e.to_string().as_str() },
+            Err(e) => {
+                let error = format!("Could not read \"{}\": {}.", fs_ops::display_name(&path_of(&path)), fs_ops::reason(&e));
+                vdict! { "ok" => false, "error" => error.as_str() }
+            }
         }
     }
 
