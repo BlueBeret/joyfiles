@@ -197,6 +197,7 @@ func _run() -> void:
 	await _sorting()
 	await _filtering()
 	await _images()
+	await _preview_replay()
 	await _opening()
 	_glyphs()
 	_keyboard_fallback()
@@ -473,6 +474,26 @@ func _images() -> void:
 	press("jf_left")
 	press("jf_back")
 	check(app.mode == app.Mode.FILES and app.entries[app.cursor]["name"] == "three.webp", "B closes the preview on the image we reached")
+
+
+func _preview_replay() -> void:
+	var base := root_dir + "/replay"
+	_png(base + "/dest/b.png", 16, 16, Color.RED)
+	_png(base + "/dest/c.png", 16, 16, Color.BLUE)
+	write_size(base + "/src/a.bin", 8 * 1024 * 1024)
+	app.navigate(base + "/src")
+	pick("Select all")
+	pick("Copy")
+	show(base + "/dest")
+	cursor_to("c.png")
+	pick("Paste")
+	press("jf_accept")
+	check(app.mode == app.Mode.PREVIEW and app.preview.current()["name"] == "c.png", "A opens the preview on c.png while the paste runs")
+	check(not app.jobs.is_empty() and names() == ["b.png", "c.png"], "the folder has not refreshed when the preview opens")
+	await until(jobs_done, "the paste ends while the preview is open")
+	check(names() == ["a.bin", "b.png", "c.png"], "the refresh adds a.bin in front: %s" % [names()])
+	press("jf_back")
+	check(app.mode == app.Mode.FILES and app.entries[app.cursor]["name"] == "c.png", "B closes the preview on c.png after a refresh moved it (cursor on %s)" % app.entries[app.cursor]["name"])
 
 
 func _opening() -> void:
