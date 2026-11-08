@@ -480,8 +480,18 @@ func _app_menu() -> Array:
 		["Sort...", _open_sort_menu],
 		["Hide hidden files" if settings.show_hidden else "Show hidden files", _toggle_hidden],
 		["Refresh", refresh],
-		["Quit Joyfiles", func(): quitter.call()],
+		["Quit Joyfiles", _ask_quit],
 	]
+
+
+func _ask_quit() -> void:
+	if jobs.is_empty():
+		quitter.call()
+		return
+	var what := "A job is still running." if jobs.size() == 1 else "%d jobs are still running." % jobs.size()
+	_confirm_label.text = what + " Quit anyway?"
+	_on_confirm = quitter
+	mode = Mode.CONFIRM
 
 
 func _open_sort_menu() -> void:
