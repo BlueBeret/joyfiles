@@ -174,8 +174,8 @@ struct Worker<'a> {
 
 enum Task {
     Transfer { src: PathBuf, dest_dir: PathBuf },
-    // a move removes a merged source folder once its children are gone
-    EndMerge(PathBuf),
+    // the merged folder takes the rights and times of the source, and a move removes the source once its children are gone
+    EndMerge { src: PathBuf, target: PathBuf, meta: fs::Metadata },
 }
 
 fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io::Result<()> {
@@ -202,9 +202,12 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io
                     worker.fail(&src, &e)?;
                 }
             }
-            Task::EndMerge(src) => {
-                // the folder stays when a child was skipped
-                let _ = fs::remove_dir(src);
+            Task::EndMerge { src, target, meta } => {
+                keep_metadata(&target, &meta);
+                if p.kind == JobKind::Move {
+                    // the folder stays when a child was skipped
+                    let _ = fs::remove_dir(src);
+                }
             }
         }
     }
@@ -256,10 +259,9 @@ impl Worker<'_> {
 
     // two folders with one name join, and only files that clash are asked about
     fn merge(&mut self, src: &Path, target: &Path) -> io::Result<()> {
+        let meta = fs::symlink_metadata(src)?;
         let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
-        if self.p.kind == JobKind::Move {
-            self.tasks.push(Task::EndMerge(src.to_path_buf()));
-        }
+        self.tasks.push(Task::EndMerge { src: src.to_path_buf(), target: target.to_path_buf(), meta });
         for entry in children.into_iter().rev() {
             self.tasks.push(Task::Transfer { src: entry.path(), dest_dir: target.to_path_buf() });
         }
@@ -320,10 +322,21 @@ impl Worker<'_> {
     // a move deletes each source item right after its copy, so an item that failed keeps its source
     fn copy_tree(&mut self, src: &Path, dest: &Path, delete_source: bool) -> io::Result<()> {
         let mut pending = vec![Step::Copy(src.to_path_buf(), dest.to_path_buf())];
+        let result = self.run_steps(&mut pending, delete_source);
+        // a cancel still gives each folder made so far the rights and times of its source
+        for step in pending.into_iter().rev() {
+            if let Step::Close { dest, meta, .. } = step {
+                keep_metadata(&dest, &meta);
+            }
+        }
+        result
+    }
+
+    fn run_steps(&mut self, pending: &mut Vec<Step>, delete_source: bool) -> io::Result<()> {
         while let Some(step) = pending.pop() {
             match step {
                 Step::Copy(src, dest) => {
-                    if let Err(e) = self.copy_one(&src, &dest, delete_source, &mut pending) {
+                    if let Err(e) = self.copy_one(&src, &dest, delete_source, pending) {
                         self.fail(&src, &e)?;
                     }
                 }
@@ -848,6 +861,61 @@ mod tests {
         }
         assert_eq!(dir_mode, 0o700, "the new folder is private from the start");
         assert!(part_modes.iter().all(|m| m & 0o077 == 0), "the unfinished file is private: {part_modes:?}");
+    }
+
+    #[cfg(unix)]
+    fn mode_and_mtime(p: &Path) -> (u32, std::time::SystemTime) {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = fs::metadata(p).unwrap();
+        (meta.permissions().mode() & 0o777, meta.modified().unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_copy_still_gives_its_new_folders_the_rights_and_times_of_the_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("ro");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("big.bin"), vec![0u8; 256 << 20]).unwrap();
+        File::open(&src).unwrap().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_577_934_245)).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), ASK);
+        while p.done_bytes.load(Ordering::Relaxed) == 0 && p.state() == JobState::Running {
+            thread::yield_now();
+        }
+        p.request_cancel();
+        assert!(p.wait_finished(Instant::now() + Duration::from_secs(10)));
+        if p.state() != JobState::Cancelled {
+            eprintln!("skipped: the copy ended before the cancel");
+            return;
+        }
+        assert_eq!(mode_and_mtime(&out.join("ro")), mode_and_mtime(&src));
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_merge_gives_the_folder_the_rights_and_times_of_the_source() {
+        use std::os::unix::fs::PermissionsExt;
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("src/d");
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("f"), "f").unwrap();
+            File::open(&src).unwrap().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_577_934_245)).unwrap();
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o700)).unwrap();
+            let want = mode_and_mtime(&src);
+            let out = tmp.path().join("out");
+            fs::create_dir_all(out.join("d")).unwrap();
+            fs::set_permissions(out.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+            let p = spawn(kind, vec![src.clone()], out.clone(), ASK);
+            assert_eq!(wait(&p), JobState::Done);
+            assert_eq!(mode_and_mtime(&out.join("d")), want, "{kind:?}");
+            assert_eq!(read(out.join("d/f")), "f");
+        }
     }
 
     #[cfg(target_os = "linux")]
