@@ -178,6 +178,12 @@ fn parse_owner(tag: &[u8]) -> Option<Owner> {
     parts.next().is_none().then_some(Owner { pid, job, start })
 }
 
+// a user name that ends like this could be taken for a temporary item
+pub fn has_temp_suffix(name: &OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    bytes.ends_with(PART.as_bytes()) || bytes.ends_with(OLD.as_bytes())
+}
+
 // the list never shows such an item, even with hidden files shown
 pub fn is_temp_name(name: &OsStr) -> bool {
     parse(name).is_some()
@@ -240,11 +246,25 @@ fn own_start() -> Option<u64> {
     None
 }
 
+// the rename that parked an old item changed its status time, while its own time still shows the date of the user data
+#[cfg(unix)]
+fn parked_at(path: &Path) -> Option<SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).ok()?;
+    u64::try_from(meta.ctime()).ok().map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+#[cfg(not(unix))]
+fn parked_at(_path: &Path) -> Option<SystemTime> {
+    None
+}
+
 // an old item is user data that waits for a replace, so an owner that ended frees it at once, whatever the date of the data
 fn is_stale(path: &Path, owner: Option<Owner>, role: Role, min_age: Duration) -> bool {
     let changed = fs::symlink_metadata(path).and_then(|m| m.modified());
-    // a tag with no start time names only a pid, so a process that started after the item last changed is not its owner
-    let reused = owner.is_some_and(|o| o.start.is_none() && changed.as_ref().is_ok_and(|&at| started_after(o.pid, at)));
+    // a tag with no start time names only a pid, so a process that started after the item was parked or last written is not its owner
+    let since = if role == Role::Old { parked_at(path).or_else(|| changed.as_ref().ok().copied()) } else { changed.as_ref().ok().copied() };
+    let reused = owner.is_some_and(|o| o.start.is_none() && since.is_some_and(|at| started_after(o.pid, at)));
     if !reused && owner.is_some_and(Owner::is_live) {
         return false;
     }
@@ -428,7 +448,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_tag_without_a_start_time_frees_when_a_newer_process_holds_its_pid() {
+    fn a_tag_without_a_start_time_frees_a_part_but_keeps_an_old_item_of_a_live_pid() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -442,6 +462,6 @@ mod tests {
         sweep(dir, SAFE_AGE, &AtomicBool::new(false));
         child.kill().unwrap();
         child.wait().unwrap();
-        assert_eq!(names_in(dir), [fresh, "a.txt".to_string()], "the old item is back, the part is gone, the item that is newer than the process stays");
+        assert_eq!(names_in(dir), [old, fresh], "the part is gone, and an old item stays because its rename came after the process started");
     }
 }

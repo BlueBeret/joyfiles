@@ -178,6 +178,9 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name.contains(['/', '\\', '\0']) {
         return Err("The name cannot contain a slash.".into());
     }
+    if parts::has_temp_suffix(OsStr::new(name)) {
+        return Err("The name cannot end with .joyfiles-part or .joyfiles-old, because Joyfiles uses those endings for its own temporary items.".into());
+    }
     #[cfg(windows)]
     if name.contains(['<', '>', ':', '"', '|', '?', '*']) {
         return Err("The name cannot contain < > : \" | ? *".into());
@@ -223,15 +226,28 @@ pub fn rename(path: &Path, new_name: impl AsRef<OsStr>) -> Result<PathBuf, Strin
         // a drive that ignores case treats a direct rename to the new case as a rename that changes nothing
         let temp = parts::park_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default(), parts::Owner::rename()).map_err(failed)?;
         let moved = rename_noreplace(path, &temp).and_then(|()| rename_noreplace(&temp, &dest));
-        if moved.is_err() && exists_nofollow(&temp) {
-            let _ = rename_noreplace(&temp, path);
-        }
+        let left = if moved.is_err() && exists_nofollow(&temp) { put_back(&temp, path) } else { None };
         parts::clear_hold(&temp, path);
-        moved.map_err(failed)?;
+        if let Err(e) = moved {
+            return Err(match left {
+                Some(at) => format!("{} It is now \"{}\".", failed(e), display_name(&at)),
+                None => failed(e),
+            });
+        }
         return Ok(dest);
     }
     rename_noreplace(path, &dest).map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists { format!("\"{new_name}\" already exists.") } else { failed(e) })?;
     Ok(dest)
+}
+
+// the item gets its name back, or a visible name when something took that name, so it never stays under a temporary name
+fn put_back(temp: &Path, path: &Path) -> Option<PathBuf> {
+    if rename_noreplace(temp, path).is_ok() {
+        return None;
+    }
+    let is_dir = fs::symlink_metadata(temp).is_ok_and(|m| m.is_dir());
+    let rest = unique_dest(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default(), is_dir);
+    Some(if rename_noreplace(temp, &rest).is_ok() { rest } else { temp.to_path_buf() })
 }
 
 // true when dest reaches the item at path only because the drive ignores case, and no entry has the exact new name
@@ -1193,5 +1209,37 @@ mod tests {
                 assert_eq!(read_to(&dest), "racer");
             }
         }
+    }
+
+    #[test]
+    fn a_name_that_ends_like_a_temporary_item_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("report.txt"), "precious").unwrap();
+        for name in [".report.joyfiles-part", ".report.joyfiles-old", "report.joyfiles-part"] {
+            assert!(validate_name(name).is_err(), "{name}");
+            assert!(rename(&tmp.path().join("report.txt"), name).is_err(), "{name}");
+            assert!(make_dir(tmp.path(), name).is_err(), "{name}");
+        }
+        assert!(validate_name("report.joyfiles.txt").is_ok());
+        assert_eq!(fs::read_to_string(tmp.path().join("report.txt")).unwrap(), "precious");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_case_rename_never_leaves_the_item_under_a_temporary_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let temp = parts::temp_path(dir, OsStr::new("a"), parts::Owner::rename(), parts::Role::Old);
+        fs::write(&temp, "mine").unwrap();
+        fs::write(dir.join("a"), "racer").unwrap();
+        let left = put_back(&temp, &dir.join("a")).unwrap();
+        assert_eq!(left, dir.join("a (2)"));
+        assert_eq!(fs::read_to_string(&left).unwrap(), "mine");
+        assert_eq!(fs::read_to_string(dir.join("a")).unwrap(), "racer");
+        let temp = parts::temp_path(dir, OsStr::new("b"), parts::Owner::rename(), parts::Role::Old);
+        fs::write(&temp, "mine").unwrap();
+        assert_eq!(put_back(&temp, &dir.join("b")), None);
+        assert_eq!(fs::read_to_string(dir.join("b")).unwrap(), "mine");
     }
 }
