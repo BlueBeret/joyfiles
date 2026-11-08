@@ -246,6 +246,32 @@ mod tests {
         assert_eq!(up, ["readme", "a.png", "b.png", "c.PNG", "a.txt"]);
     }
 
+    // run with: cargo test --release -- --ignored --nocapture stage_times, set JF_PERF_DIR to test another folder
+    #[test]
+    #[ignore]
+    fn stage_times_for_a_big_folder() {
+        use std::time::Instant;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::env::var("JF_PERF_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+            for i in 0..20000 {
+                fs::write(tmp.path().join(format!("file_{i:05}.txt")), "x").unwrap();
+            }
+            tmp.path().to_path_buf()
+        });
+        for run in 0..5 {
+            let t = Instant::now();
+            let names = fs::read_dir(&dir).unwrap().filter_map(Result::ok).count();
+            let read = t.elapsed();
+            let t = Instant::now();
+            let mut entries: Vec<Entry> = fs::read_dir(&dir).unwrap().filter_map(Result::ok).filter_map(|e| stat_entry(&e.path())).collect();
+            let listed = t.elapsed();
+            let t = Instant::now();
+            sort_entries(&mut entries, SortKey::Name, false);
+            let sorted = t.elapsed();
+            println!("run {run}: {names} names, read_dir {read:?}, read_dir and stat {listed:?}, sort {sorted:?}");
+        }
+    }
+
     #[test]
     fn sort_key_parse_falls_back_to_name() {
         assert_eq!(SortKey::parse("size"), SortKey::Size);
