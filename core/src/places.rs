@@ -59,17 +59,31 @@ fn drives() -> Vec<Place> {
 // the Steam Linux Runtime container shows a runtime /usr at "/", so list mount folders and never "/"
 #[cfg(not(windows))]
 fn drives() -> Vec<Place> {
-    let user = std::env::var("USER").unwrap_or_default();
-    let roots = [
-        PathBuf::from("/run/media").join(&user),
-        PathBuf::from("/media").join(&user),
-        PathBuf::from("/media"),
-        PathBuf::from("/mnt"),
-    ];
+    let user = user_name(std::env::var("USER").ok(), std::env::var("LOGNAME").ok(), dirs::home_dir());
+    drives_under(Path::new("/"), user.as_deref())
+}
+
+// an empty user name would make the shared media folder list each user as a drive
+#[cfg(not(windows))]
+fn user_name(user: Option<String>, logname: Option<String>, home: Option<PathBuf>) -> Option<String> {
+    let from_home = home.and_then(|h| h.file_name().map(|n| n.to_string_lossy().into_owned()));
+    [user, logname, from_home].into_iter().flatten().find(|name| !name.is_empty())
+}
+
+#[cfg(not(windows))]
+fn drives_under(base: &Path, user: Option<&str>) -> Vec<Place> {
+    let mut roots = Vec::new();
+    if let Some(user) = user {
+        roots.push(base.join("run/media").join(user));
+        roots.push(base.join("media").join(user));
+    }
+    roots.push(base.join("media"));
+    roots.push(base.join("mnt"));
+    let own_media = user.map(|u| base.join("media").join(u));
     let mut out: Vec<Place> = Vec::new();
     for root in roots {
         for path in child_dirs(&root) {
-            if out.iter().all(|o| o.path != path) && path != Path::new("/media").join(&user) {
+            if out.iter().all(|o| o.path != path) && Some(&path) != own_media.as_ref() {
                 let label = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 out.push(Place { label, path, kind: PlaceKind::Drive });
             }
@@ -95,5 +109,20 @@ mod tests {
         let list = places();
         assert_eq!(list[0].kind, PlaceKind::Home);
         assert!(list.iter().all(|p| p.path != Path::new("/")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn without_user_the_drives_still_come_from_the_home_folder_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["run/media/alice/CARD", "media/alice/USB", "media/STICK", "mnt/disk"] {
+            fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        }
+        let user = user_name(None, None, Some(PathBuf::from("/home/alice")));
+        let labels: Vec<String> = drives_under(tmp.path(), user.as_deref()).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, ["CARD", "USB", "STICK", "disk"]);
+        let unknown = user_name(None, Some(String::new()), None);
+        let paths: Vec<PathBuf> = drives_under(tmp.path(), unknown.as_deref()).into_iter().map(|p| p.path).collect();
+        assert!(!paths.contains(&tmp.path().join("run/media/alice")), "a user folder in run/media never shows as a drive");
     }
 }
