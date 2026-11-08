@@ -83,18 +83,18 @@ func _build_detail(box: VBoxContainer) -> void:
 	_detail_title = Theme_.label("", Theme_.DANGER, 24, true)
 	_detail_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	head.add_child(_detail_title)
-	_detail_count = Theme_.label("", Theme_.MUTED, 20)
+	_detail_count = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	head.add_child(_detail_count)
 	for i in DETAIL_ROWS:
 		var row := PanelContainer.new()
 		row.custom_minimum_size.y = DETAIL_ROW_HEIGHT
 		var lines := VBoxContainer.new()
 		row.add_child(lines)
-		var message := Theme_.label("", Theme_.TEXT, 21)
+		var message := Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
 		message.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		message.max_lines_visible = 2
 		lines.add_child(message)
-		var where := Theme_.label("", Theme_.MUTED, 18, true)
+		var where := Theme_.label("", Theme_.MUTED, Theme_.SIZE_SMALL, true)
 		lines.add_child(where)
 		_detail.add_child(row)
 		_detail_rows.append({"row": row, "message": message, "path": where})
@@ -190,7 +190,7 @@ func _make_row() -> Dictionary:
 	var title := Theme_.label("", Theme_.TEXT, 22, true)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	line.add_child(title)
-	var info := Theme_.label("", Theme_.MUTED, 20)
+	var info := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	line.add_child(info)
 	var bar := Theme_.progress(0.0)
 	box.add_child(bar)
@@ -204,7 +204,7 @@ func _make_report_row() -> Dictionary:
 	var title := Theme_.label("", Theme_.DANGER, 22, true)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	line.add_child(title)
-	var info := Theme_.label("Open the list", Theme_.WARN, 20)
+	var info := Theme_.label("Open the list", Theme_.WARN, Theme_.SIZE_BODY)
 	line.add_child(info)
 	return {"row": row, "title": title}
 
@@ -219,12 +219,12 @@ func _fill_row(parts: Dictionary, job: Dictionary, focused: bool) -> void:
 	parts["info"].text = "Needs an answer" if waiting else "%d%%  %s of %s" % [int(ratio * 100.0), Theme_.human_size(done), Theme_.human_size(total)]
 	parts["info"].add_theme_color_override("font_color", Theme_.WARN if waiting else Theme_.MUTED)
 	parts["bar"].value = ratio
-	parts["row"].add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL if focused else Color.TRANSPARENT, 8, 12))
+	parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(focused, Color.TRANSPARENT, 8, 12, 12))
 
 
 func _fill_report_row(parts: Dictionary, report: Dictionary, focused: bool) -> void:
 	parts["title"].text = report["title"]
-	parts["row"].add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL if focused else Color.TRANSPARENT, 8, 12))
+	parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(focused, Color.TRANSPARENT, 8, 12, 12))
 
 
 func _render_detail() -> void:
@@ -250,4 +250,4 @@ func _render_detail() -> void:
 			continue
 		parts["message"].text = failures[at]["error"]
 		parts["path"].text = JoyPathText.printable(failures[at]["path"])
-		parts["row"].add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL if at == failure_cursor else Color.TRANSPARENT, 8, 10))
+		parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(at == failure_cursor))

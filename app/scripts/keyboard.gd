@@ -131,5 +131,5 @@ func _render() -> void:
 			cap.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 			var focused: bool = r == row and c == _col()
 			var active: bool = key == "{shift}" and shift
-			cap.add_theme_stylebox_override("normal", Theme_.box(Theme_.ACCENT if focused else (Theme_.ROW_SEL if active else Theme_.BG), 8))
+			cap.add_theme_stylebox_override("normal", Theme_.focus_box(focused, Theme_.ROW_SEL if active else Theme_.BG, 8, 8, 8))
 			line.add_child(cap)

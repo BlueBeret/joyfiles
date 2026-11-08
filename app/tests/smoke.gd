@@ -9,6 +9,7 @@ class ErrorCounter extends Logger:
 
 var app: Control
 var failures := 0
+var audited := 0
 var root_dir := ""
 var settings_file := ""
 
@@ -223,6 +224,7 @@ func _run() -> void:
 	_glyphs()
 	_keyboard_fallback()
 	_settings_types()
+	_contrast()
 	app.queue_free()
 	await frames()
 	var input_suite: GDScript = load("res://tests/input.gd")
@@ -760,6 +762,97 @@ func _settings_types() -> void:
 	check(unknown.sort_key == "name" and unknown.show_hidden, "an unknown sort key falls back to name")
 	var good := _load_settings('[view]\nsort_key="type"\nshow_hidden=true\nsort_desc=true\n')
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
+
+
+# the fill that a text sits on, found from the nearest ancestor that paints one
+func _surface_under(node: Node) -> Color:
+	var up := node
+	while up is Control:
+		var style: StyleBox = null
+		if up is Label:
+			style = up.get_theme_stylebox("normal")
+		elif up is PanelContainer:
+			style = up.get_theme_stylebox("panel")
+		if style is StyleBoxFlat and style.bg_color.a >= 1.0:
+			return style.bg_color
+		up = up.get_parent()
+	return Theme_.BG
+
+
+func _weak_text(node: Node, found: Array = []) -> Array:
+	for child in node.get_children():
+		if child is Label and child.is_visible_in_tree() and child.text != "":
+			audited += 1
+			var ratio := Theme_.contrast(child.get_theme_color("font_color"), _surface_under(child))
+			if ratio < Theme_.MIN_TEXT_CONTRAST:
+				found.append("'%s' %.2f" % [child.text.left(24), ratio])
+		_weak_text(child, found)
+	return found
+
+
+func audit(what: String) -> void:
+	var weak := _weak_text(app)
+	check(weak.is_empty(), "%s: every visible text reads at 4.5:1 %s" % [what, weak.slice(0, 3)])
+
+
+func _contrast() -> void:
+	var weak := Theme_.contrast_rows().filter(func(r: Array) -> bool: return r[1] < r[2])
+	check(weak.is_empty(), "every ink reads on every surface: %s" % [weak.map(func(r: Array) -> String: return "%s %.2f" % [r[0], r[1]])])
+	var base := root_dir + "/contrast"
+	DirAccess.make_dir_recursive_absolute(base + "/folder")
+	write(base + "/plain.txt", "x")
+	write(base + "/.hidden.txt", "x")
+	app.settings.show_hidden = true
+	app.navigate(base)
+	app.mode = app.Mode.FILES
+	app.selected[base + "/folder"] = true
+	app.selected[base + "/.hidden.txt"] = true
+	cursor_to(".hidden.txt")
+	app._render()
+	audit("the cursor on a selected hidden file")
+	cursor_to("folder")
+	app._render()
+	audit("the cursor on a selected folder")
+	app.selected.clear()
+	cursor_to("plain.txt")
+	app._set_filter("p")
+	app._render()
+	audit("a filter in the header")
+	app._set_filter("")
+	press("jf_pane")
+	audit("the focused place")
+	press("jf_back")
+	press("jf_start")
+	audit("the Start menu")
+	press("jf_back")
+	app.toast("Could not do that.", true)
+	audit("an error toast")
+	press("jf_search")
+	audit("the keyboard")
+	press("jf_view")
+	app._ask_trash(PackedStringArray([base + "/plain.txt"]))
+	app._render()
+	audit("the trash question")
+	press("jf_back")
+	app._open_props(base + "/plain.txt")
+	app._render()
+	audit("the properties")
+	press("jf_back")
+	app.conflict_panel.open({"name": "plain.txt", "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 1700000000})
+	app.mode = app.Mode.CONFLICT
+	app._render()
+	audit("the clash prompt")
+	app.mode = app.Mode.FILES
+	app.jobs[900] = {"watch": [], "kind": "copy", "current": "movie.mp4", "total_bytes": 100, "done_bytes": 40, "state": "running", "conflict": {}}
+	app.mode = app.Mode.JOBS
+	app._render()
+	audit("the jobs panel")
+	app.jobs.erase(900)
+	check(audited > 50, "the audit looked at the visible texts of every screen (%d)" % audited)
+	app.mode = app.Mode.FILES
+	app.settings.show_hidden = false
+	app.refresh()
+	app._render()
 
 
 func shell(script: String, dir: String) -> void:

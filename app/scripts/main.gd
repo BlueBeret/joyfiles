@@ -5,6 +5,7 @@ enum Mode { FILES, PLACES, MENU, KEYBOARD, CONFIRM, CONFLICT, JOBS, PROPS, PREVI
 const VISIBLE_ROWS := 12
 const ROW_HEIGHT := 50
 const THUMB_BOX := 42
+const MARK_WIDTH := 30
 const TOAST_FONT := 22
 const TOAST_MAX_WIDTH := 880.0
 const TOAST_LIFT := 84
@@ -880,7 +881,7 @@ func _build_ui() -> void:
 	root.add_child(body)
 	var side := PanelContainer.new()
 	side.custom_minimum_size.x = 280
-	side.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL.darkened(0.15), 0, 8))
+	side.add_theme_stylebox_override("panel", Theme_.box(Theme_.SIDE, 0, 8))
 	_places_box = VBoxContainer.new()
 	side.add_child(_places_box)
 	body.add_child(side)
@@ -894,6 +895,10 @@ func _build_ui() -> void:
 		var hb := HBoxContainer.new()
 		hb.add_theme_constant_override("separation", 14)
 		row.add_child(hb)
+		var mark := Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
+		mark.custom_minimum_size.x = MARK_WIDTH
+		mark.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		hb.add_child(mark)
 		var slot := Control.new()
 		slot.custom_minimum_size = Vector2(THUMB_BOX, THUMB_BOX)
 		hb.add_child(slot)
@@ -903,7 +908,7 @@ func _build_ui() -> void:
 		thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 		thumb.visible = false
 		slot.add_child(thumb)
-		var glyph := Theme_.label("", Theme_.ACCENT, 22)
+		var glyph := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 		glyph.set_anchors_preset(Control.PRESET_FULL_RECT)
 		glyph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		glyph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
@@ -911,11 +916,11 @@ func _build_ui() -> void:
 		var name_label := Theme_.label("", Theme_.TEXT, 24, true)
 		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		hb.add_child(name_label)
-		var size_label := Theme_.label("", Theme_.MUTED, 20)
+		var size_label := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 		hb.add_child(size_label)
 		list.add_child(row)
 		_rows.append(row)
-		_row_parts.append({"glyph": glyph, "thumb": thumb, "name": name_label, "size": size_label})
+		_row_parts.append({"mark": mark, "glyph": glyph, "thumb": thumb, "name": name_label, "size": size_label})
 
 	_footer = HBoxContainer.new()
 	var footer_panel := PanelContainer.new()
@@ -1011,6 +1016,7 @@ func _render_rows() -> void:
 		part["thumb"].visible = false
 		if idx >= entries.size():
 			row.add_theme_stylebox_override("panel", Theme_.box_xy(Color.TRANSPARENT, 8, 8, 4))
+			part["mark"].text = ""
 			part["glyph"].text = ""
 			part["name"].text = ""
 			part["size"].text = ""
@@ -1021,17 +1027,15 @@ func _render_rows() -> void:
 		var e: Dictionary = entries[idx]
 		var is_cursor: bool = idx == cursor and mode != Mode.PLACES
 		var is_selected: bool = selected.has(e["path"])
-		var bg := Theme_.ACCENT if is_cursor else (Theme_.ROW_SEL if is_selected else Color.TRANSPARENT)
-		row.add_theme_stylebox_override("panel", Theme_.box_xy(bg, 8, 8, 4))
+		row.add_theme_stylebox_override("panel", Theme_.focus_box(is_cursor, Theme_.ROW_SEL if is_selected else Color.TRANSPARENT, 8, 8, 4))
 		var tex: Texture2D = null
 		if _previewable(e):
 			wanted.append(e["path"])
 			tex = thumbs.texture(e["path"], JoyThumbs.THUMB_SIDE)
 		part["thumb"].texture = tex
 		part["thumb"].visible = tex != null
-		part["thumb"].modulate.a = 0.45 if is_selected else 1.0
-		var shape := "" if tex != null else ("▰" if e["is_dir"] else "▫")
-		part["glyph"].text = ("✓" if is_selected else "") + shape
+		part["mark"].text = "✓" if is_selected else ""
+		part["glyph"].text = "" if tex != null else ("▰" if e["is_dir"] else "▫")
 		part["glyph"].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
 		part["name"].text = e["name"]
 		part["name"].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
@@ -1048,13 +1052,13 @@ func _empty_text() -> String:
 func _render_places() -> void:
 	for child in _places_box.get_children():
 		child.queue_free()
-	_places_box.add_child(Theme_.label("PLACES", Theme_.MUTED, 18))
+	_places_box.add_child(Theme_.label("PLACES", Theme_.MUTED, Theme_.SIZE_SMALL))
 	for i in places.size():
 		var p: Dictionary = places[i]
-		var l := Theme_.label(("◉ " if p["kind"] == "drive" else "• ") + p["label"], Theme_.TEXT, 22, true)
+		var l := Theme_.label(("◉ " if p["kind"] == "drive" else "• ") + p["label"], Theme_.TEXT, Theme_.SIZE_BODY, true)
 		var focused: bool = mode == Mode.PLACES and i == place_cursor
 		var current: bool = cwd == p["path"]
-		l.add_theme_stylebox_override("normal", Theme_.box(Theme_.ACCENT if focused else (Theme_.ROW_SEL if current else Color.TRANSPARENT), 8, 8))
+		l.add_theme_stylebox_override("normal", Theme_.focus_box(focused, Theme_.ROW_SEL if current else Color.TRANSPARENT, 8, 8, 8))
 		_places_box.add_child(l)
 
 
@@ -1070,8 +1074,8 @@ func _render_menu() -> void:
 	for child in _menu_box.get_children():
 		child.queue_free()
 	for i in menu_items.size():
-		var l := Theme_.label(menu_items[i][0], Theme_.TEXT, 24)
-		l.add_theme_stylebox_override("normal", Theme_.box(Theme_.ACCENT if i == menu_cursor else Color.TRANSPARENT, 8, 10))
+		var l := Theme_.label(menu_items[i][0], Theme_.TEXT, Theme_.SIZE_LIST)
+		l.add_theme_stylebox_override("normal", Theme_.focus_box(i == menu_cursor))
 		_menu_box.add_child(l)
 
 

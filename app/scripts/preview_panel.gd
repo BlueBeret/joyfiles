@@ -39,7 +39,7 @@ func _init() -> void:
 	_image.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	_image.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	frame.add_child(_image)
-	_info = Theme_.label("", Theme_.MUTED, 20)
+	_info = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	box.add_child(_info)
 	_hints = HBoxContainer.new()
 	box.add_child(_hints)

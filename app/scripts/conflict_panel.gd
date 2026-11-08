@@ -33,9 +33,9 @@ func _init() -> void:
 	_title.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
 	_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	box.add_child(_title)
-	_existing = Theme_.label("", Theme_.MUTED, 20)
+	_existing = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	box.add_child(_existing)
-	_incoming = Theme_.label("", Theme_.MUTED, 20)
+	_incoming = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	box.add_child(_incoming)
 	var list := VBoxContainer.new()
 	box.add_child(list)
@@ -78,4 +78,4 @@ func _render() -> void:
 	for i in _rows.size():
 		var text: String = CHOICES[i][0] if i < CHOICES.size() else "[%s] Do this for all other clashes" % ("x" if apply_all else " ")
 		_rows[i].text = text
-		_rows[i].add_theme_stylebox_override("normal", Theme_.box(Theme_.ACCENT if i == cursor else Color.TRANSPARENT, 8, 10))
+		_rows[i].add_theme_stylebox_override("normal", Theme_.focus_box(i == cursor))
