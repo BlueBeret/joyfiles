@@ -901,7 +901,7 @@ func _modal_layout() -> void:
 	app._render()
 	await frames(4)
 	check(_inside(app.props_panel) and app.props_panel._scroll.is_scrollable(), "a very long path scrolls inside a panel that fits the window")
-	check(app.props_panel.hint_pairs()[0] == ["jf_up", "Scroll"], "the properties show a scroll hint when the values overflow")
+	check(JoyCommands.hints(app.props_panel.commands)[0] == ["jf_up", "Scroll"], "the properties show a scroll hint when the values overflow")
 	press("jf_down")
 	await frames(2)
 	check(app.props_panel._scroll.scroll_vertical > 0, "the down key scrolls the properties")
@@ -924,7 +924,7 @@ func _modal_layout() -> void:
 	app.mode = app.Mode.JOBS
 	app._render()
 	await frames(2)
-	check(app.jobs_panel.hint_pairs({}) == [["jf_back", "Close"]], "the jobs hints offer only Close when no job runs: %s" % [app.jobs_panel.hint_pairs({})])
+	check(JoyCommands.hints(app.jobs_panel.commands) == [["jf_back", "Close"]], "the jobs hints offer only Close when no job runs: %s" % [JoyCommands.hints(app.jobs_panel.commands)])
 	press("jf_back")
 
 

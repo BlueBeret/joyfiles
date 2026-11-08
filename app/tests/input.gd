@@ -378,7 +378,7 @@ func _hysteresis() -> void:
 		await step()
 	axis(JOY_AXIS_TRIGGER_RIGHT, 0.0)
 	await step(2)
-	check(app.cursor <= app.VISIBLE_ROWS, "a trigger flapping around 0.5 for a second pages at most once (%d)" % app.cursor)
+	check(app.cursor <= app.visible_rows, "a trigger flapping around 0.5 for a second pages at most once (%d)" % app.cursor)
 	app.cursor = 20
 	app._clamp_view()
 	axis(JOY_AXIS_LEFT_Y, 1.0)
@@ -429,7 +429,7 @@ func _page_repeat() -> void:
 	await step(30)
 	var page_from: int = app.cursor
 	await step(30)
-	var pages: float = (app.cursor - page_from) * 2.0 / app.VISIBLE_ROWS
+	var pages: float = (app.cursor - page_from) * 2.0 / app.visible_rows
 	axis(JOY_AXIS_TRIGGER_RIGHT, 0.0)
 	await step(2)
 	app.cursor = 0
@@ -534,7 +534,7 @@ func _hints_follow_state() -> void:
 	app.paste()
 	await until_prompt()
 	await step(2)
-	check(drawn(app._hints) == drawn(app.conflict_panel), "the clash prompt and the footer show the same hints: %s and %s" % [drawn(app.conflict_panel), drawn(app._hints)])
+	check(drawn(app.conflict_panel) == app._hints_for_mode() and drawn(app._hints).is_empty(), "the clash prompt draws the hints of its table and the footer draws none: %s and %s" % [drawn(app.conflict_panel), drawn(app._hints)])
 	await finish_jobs()
 
 	var pics := data + "/pics"
@@ -543,7 +543,7 @@ func _hints_follow_state() -> void:
 	await fresh(pics)
 	await tap(JOY_BUTTON_A)
 	await step(2)
-	check(app.mode == app.Mode.PREVIEW and drawn(app._hints) == drawn(app.preview), "the preview and the footer show the same hints: %s and %s" % [drawn(app.preview), drawn(app._hints)])
+	check(app.mode == app.Mode.PREVIEW and drawn(app.preview) == app._hints_for_mode() and drawn(app._hints).is_empty(), "the preview draws the hints of its table and the footer draws none: %s and %s" % [drawn(app.preview), drawn(app._hints)])
 	check(not hinted(app._hints_for_mode(), "jf_left"), "the first image offers no Previous: %s" % [app._hints_for_mode()])
 
 
