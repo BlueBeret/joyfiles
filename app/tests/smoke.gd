@@ -1,5 +1,12 @@
 extends SceneTree
 
+class ErrorCounter extends Logger:
+	var count := 0
+
+	func _log_error(_function: String, _file: String, _line: int, _code: String, _rationale: String, _editor_notify: bool, _error_type: int, _script_backtraces: Array[ScriptBacktrace]) -> void:
+		count += 1
+
+
 var app: Control
 var failures := 0
 var root_dir := ""
@@ -199,6 +206,8 @@ func _run() -> void:
 	_filter_selection()
 	await _images()
 	await _preview_replay()
+	await _move_refreshes_source()
+	await _unknown_job()
 	await _opening()
 	_glyphs()
 	_keyboard_fallback()
@@ -502,6 +511,41 @@ func _preview_replay() -> void:
 	app.refresh()
 	press("jf_back")
 	check(app.mode == app.Mode.FILES and app.cursor < app.entries.size(), "B closes the preview of a file that vanished (cursor %d of %d)" % [app.cursor, app.entries.size()])
+
+
+func _move_refreshes_source() -> void:
+	var base := root_dir + "/moving"
+	write(base + "/src/x.txt", "new")
+	write(base + "/dst/x.txt", "old")
+	app.navigate(base + "/src")
+	pick("Select all")
+	pick("Cut")
+	app.navigate(base + "/dst")
+	pick("Paste")
+	app.navigate(base + "/src")
+	check(names() == ["x.txt"], "the source lists its file while the move waits on a clash: %s" % [names()])
+	await until(func(): return app.mode == app.Mode.CONFLICT, "the move asks about the clash")
+	press("jf_up")
+	press("jf_accept")
+	await until(jobs_done, "the move ends")
+	check(text_of(base + "/dst/x.txt") == "new" and not FileAccess.file_exists(base + "/src/x.txt"), "the move replaced the file and emptied the source")
+	check(names().is_empty(), "the source folder refreshes when a move ends (%s)" % [names()])
+
+
+func _unknown_job() -> void:
+	var base := root_dir + "/stray"
+	write(base + "/in/s.txt", "x")
+	DirAccess.make_dir_recursive_absolute(base + "/out")
+	var counter := ErrorCounter.new()
+	OS.add_logger(counter)
+	app.jobs[99] = {"dest": ""}
+	var stray: int = app.core.start_job(false, PackedStringArray([base + "/in/s.txt"]), base + "/out")
+	await until(func(): return FileAccess.file_exists(base + "/out/s.txt"), "a job that the app never tracked still runs")
+	await frames(10)
+	check(not app.jobs.has(stray), "the app ignores a job it does not track")
+	check(counter.count == 0, "polling an unknown job id raises no script error (%d)" % counter.count)
+	app.jobs.erase(99)
+	OS.remove_logger(counter)
 
 
 func _opening() -> void:
