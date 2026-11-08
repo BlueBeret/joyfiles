@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::fs_ops::{Entry, exists_nofollow, is_within, reason, same_dir, stat_entry, temp_path, unique_dest};
+use crate::fs_ops::{Entry, Failure, exists_nofollow, summary, is_within, reason, same_dir, stat_entry, temp_path, unique_dest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -51,13 +51,6 @@ pub struct Conflict {
     pub name: String,
     pub src: Entry,
     pub dest: Entry,
-}
-
-// one item the job could not copy, move or read, the job goes on with the rest
-#[derive(Debug, Clone, PartialEq)]
-pub struct Failure {
-    pub path: PathBuf,
-    pub message: String,
 }
 
 #[derive(Debug, Default)]
@@ -152,16 +145,6 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
         *worker.state.lock().unwrap() = end;
     });
     progress
-}
-
-// the old single error text stays meaningful for a caller that reads no failure list
-fn summary(failures: &[Failure]) -> Option<String> {
-    let first = &failures.first()?.message;
-    Some(match failures.len() {
-        1 => first.clone(),
-        2 => format!("{first} 1 more item also failed."),
-        n => format!("{first} {} more items also failed.", n - 1),
-    })
 }
 
 struct Worker<'a> {

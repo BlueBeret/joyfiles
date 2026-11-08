@@ -193,6 +193,47 @@ pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+// one item an operation could not handle, the operation goes on with the rest
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+// the old single error text stays meaningful for a caller that reads no failure list
+pub fn summary(failures: &[Failure]) -> Option<String> {
+    let first = &failures.first()?.message;
+    Some(match failures.len() {
+        1 => first.clone(),
+        2 => format!("{first} 1 more item also failed."),
+        n => format!("{first} {} more items also failed.", n - 1),
+    })
+}
+
+// one call per item, so a failed item never stops the others
+pub fn trash_items(paths: &[PathBuf]) -> Vec<Failure> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let e = trash::delete(path).err()?;
+            let message = format!("Could not move \"{}\" to the trash: {}.", display_name(path), trash_reason(&e));
+            Some(Failure { path: path.clone(), message })
+        })
+        .collect()
+}
+
+// the Display text of a trash error is a debug dump, so the reason comes from the variant
+fn trash_reason(e: &trash::Error) -> String {
+    match e {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        trash::Error::FileSystem { source, .. } => reason(source),
+        trash::Error::Os { code, .. } => reason(&io::Error::from_raw_os_error(*code)),
+        trash::Error::CouldNotAccess { .. } | trash::Error::CanonicalizePath { .. } => reason(&io::ErrorKind::NotFound.into()),
+        trash::Error::TargetedRoot => "a drive root cannot go to the trash".into(),
+        _ => "the trash did not accept it".into(),
+    }
+}
+
 // the reason part of a sentence such as: Could not copy "a.txt": permission denied.
 pub fn reason(e: &io::Error) -> String {
     use io::ErrorKind::*;
@@ -460,6 +501,23 @@ mod tests {
         assert!(rename(&a, "x/y").is_err());
         assert!(rename(&a, "b").is_err());
         assert_eq!(rename(&a, " c ").unwrap(), tmp.path().join("c"));
+    }
+
+    // the test removes what it put in the trash, found by the temp folder it came from
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trash_goes_on_past_a_missing_item_and_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (x1, missing, x2) = (tmp.path().join("x1"), tmp.path().join("missing"), tmp.path().join("x2"));
+        fs::write(&x1, "1").unwrap();
+        fs::write(&x2, "2").unwrap();
+        let failures = trash_items(&[x1.clone(), missing.clone(), x2.clone()]);
+        let ours: Vec<_> = trash::os_limited::list().unwrap().into_iter().filter(|i| i.original_parent == tmp.path()).collect();
+        trash::os_limited::purge_all(&ours).unwrap();
+        assert!(!x1.exists() && !x2.exists(), "both real items went to the trash");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, missing);
+        assert_eq!(failures[0].message, "Could not move \"missing\" to the trash: the file or folder does not exist.");
     }
 
     #[cfg(unix)]

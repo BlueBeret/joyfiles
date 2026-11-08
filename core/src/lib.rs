@@ -11,7 +11,8 @@ use std::sync::atomic::Ordering;
 use godot::prelude::*;
 
 use fs_ops::SortKey;
-use jobs::{Conflict, Failure, JobKind, JobState, Policy, Progress, Resolution};
+use fs_ops::Failure;
+use jobs::{Conflict, JobKind, JobState, Policy, Progress, Resolution};
 use props::SizeScan;
 
 struct JoyfilesExtension;
@@ -116,10 +117,18 @@ impl JoyCore {
         result_dict(fs_ops::make_dir(&path_of(&parent), &name.to_string()))
     }
 
+    // ok is true only when every item went to the trash, and trashed counts the items that did
     #[func]
     fn trash(&self, paths: PackedStringArray) -> VarDictionary {
         let list: Vec<PathBuf> = paths.as_slice().iter().map(path_of).collect();
-        result_dict(trash::delete_all(&list).map(|_| PathBuf::new()).map_err(|e| e.to_string()))
+        let failures = fs_ops::trash_items(&list);
+        vdict! {
+            "ok" => failures.is_empty(),
+            "path" => "",
+            "error" => fs_ops::summary(&failures).unwrap_or_default().as_str(),
+            "trashed" => (list.len() - failures.len()) as i64,
+            "failures" => &failures_array(&failures),
+        }
     }
 
     #[func]
