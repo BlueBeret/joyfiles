@@ -148,6 +148,28 @@ pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+// the reason part of a sentence such as: Could not copy "a.txt": permission denied.
+pub fn reason(e: &io::Error) -> String {
+    use io::ErrorKind::*;
+    let text = match e.kind() {
+        NotFound => "the file or folder does not exist",
+        PermissionDenied => "permission denied",
+        StorageFull => "the drive is full",
+        ReadOnlyFilesystem => "the drive is read only",
+        FileTooLarge => "the file is too large for the drive",
+        InvalidFilename => "the name is too long",
+        InvalidInput => "the drive does not accept this name",
+        DirectoryNotEmpty => "the folder is not empty",
+        _ => {
+            let raw = e.to_string();
+            let raw = raw.split(" (os error").next().unwrap_or_default().trim_end_matches('.');
+            let mut chars = raw.chars();
+            return chars.next().map_or_else(String::new, |c| c.to_lowercase().chain(chars).collect());
+        }
+    };
+    text.into()
+}
+
 // a broken link still occupies its name, so this check never follows links
 pub fn exists_nofollow(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()

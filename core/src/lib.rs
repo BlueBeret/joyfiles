@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use godot::prelude::*;
 
 use fs_ops::SortKey;
-use jobs::{Conflict, JobKind, JobState, Policy, Progress, Resolution};
+use jobs::{Conflict, Failure, JobKind, JobState, Policy, Progress, Resolution};
 use props::SizeScan;
 
 struct JoyfilesExtension;
@@ -53,6 +53,15 @@ fn conflict_dict(c: &Conflict) -> VarDictionary {
         "src_modified" => c.src.modified,
         "dest_modified" => c.dest.modified,
     }
+}
+
+fn failures_array(failures: &[Failure]) -> VarArray {
+    let mut arr = VarArray::new();
+    for f in failures {
+        let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        arr.push(&vdict! { "path" => &gstr(&f.path), "name" => name.as_str(), "error" => f.message.as_str() }.to_variant());
+    }
+    arr
 }
 
 #[godot_api]
@@ -189,7 +198,7 @@ impl JoyCore {
         }
     }
 
-    // finished jobs leave the table after one poll so the UI sees each end state once
+    // finished jobs leave the table after one poll so the UI sees each end state and failure list once
     #[func]
     fn poll_jobs(&mut self) -> VarArray {
         let mut arr = VarArray::new();
@@ -209,6 +218,7 @@ impl JoyCore {
                 "kind" => if p.kind == JobKind::Move { "move" } else { "copy" },
                 "state" => state,
                 "error" => error.as_str(),
+                "failures" => &failures_array(&p.failures()),
                 "current" => p.current.lock().unwrap().as_str(),
                 "conflict" => &p.pending_conflict().map_or_else(VarDictionary::new, |c| conflict_dict(&c)),
                 "done_bytes" => p.done_bytes.load(Ordering::Relaxed) as i64,

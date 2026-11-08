@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::fs_ops::{Entry, exists_nofollow, is_within, same_dir, stat_entry, unique_dest};
+use crate::fs_ops::{Entry, exists_nofollow, is_within, reason, same_dir, stat_entry, unique_dest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -54,6 +54,13 @@ pub struct Conflict {
     pub dest: Entry,
 }
 
+// one item the job could not copy, move or read, the job goes on with the rest
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failure {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 #[derive(Debug, Default)]
 struct Gate {
     question: Option<Conflict>,
@@ -68,6 +75,7 @@ pub struct Progress {
     pub cancel: AtomicBool,
     pub state: Mutex<JobState>,
     pub current: Mutex<String>,
+    failures: Mutex<Vec<Failure>>,
     gate: Mutex<Gate>,
     wake: Condvar,
 }
@@ -75,6 +83,10 @@ pub struct Progress {
 impl Progress {
     pub fn state(&self) -> JobState {
         self.state.lock().unwrap().clone()
+    }
+
+    pub fn failures(&self) -> Vec<Failure> {
+        self.failures.lock().unwrap().clone()
     }
 
     // taking the gate lock before the notify means a worker never misses the flag
@@ -127,19 +139,30 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
         cancel: AtomicBool::new(false),
         state: Mutex::new(JobState::Running),
         current: Mutex::new(String::new()),
+        failures: Mutex::new(Vec::new()),
         gate: Mutex::new(Gate::default()),
         wake: Condvar::new(),
     });
     let worker = Arc::clone(&progress);
     thread::spawn(move || {
         let end = match run(&worker, &sources, &dest_dir, policy) {
-            Ok(()) => JobState::Done,
+            Ok(()) => summary(&worker.failures()).map_or(JobState::Done, JobState::Failed),
             Err(_) if worker.cancel.load(Ordering::Relaxed) => JobState::Cancelled,
             Err(e) => JobState::Failed(e.to_string()),
         };
         *worker.state.lock().unwrap() = end;
     });
     progress
+}
+
+// the old single error text stays meaningful for a caller that reads no failure list
+fn summary(failures: &[Failure]) -> Option<String> {
+    let first = &failures.first()?.message;
+    Some(match failures.len() {
+        1 => first.clone(),
+        2 => format!("{first} 1 more item also failed."),
+        n => format!("{first} {} more items also failed.", n - 1),
+    })
 }
 
 struct Worker<'a> {
@@ -156,6 +179,9 @@ enum Task {
 }
 
 fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io::Result<()> {
+    if !dest_dir.is_dir() {
+        return Err(io::Error::other("The destination folder does not exist."));
+    }
     for src in sources {
         if is_real_dir(src) && is_within(dest_dir, src) {
             return Err(io::Error::other("Cannot put a folder inside itself."));
@@ -171,7 +197,11 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io
     let mut worker = Worker { p, sticky, tasks };
     while let Some(task) = worker.tasks.pop() {
         match task {
-            Task::Transfer { src, dest_dir } => worker.transfer(&src, &dest_dir)?,
+            Task::Transfer { src, dest_dir } => {
+                if let Err(e) = worker.transfer(&src, &dest_dir) {
+                    worker.fail(&src, &e)?;
+                }
+            }
             Task::EndMerge(src) => {
                 // the folder stays when a child was skipped
                 let _ = fs::remove_dir(src);
@@ -182,6 +212,18 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io
 }
 
 impl Worker<'_> {
+    // records the error and lets the job go on, unless the user cancelled
+    fn fail(&self, path: &Path, err: &io::Error) -> io::Result<()> {
+        if self.p.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("Cancelled."));
+        }
+        let verb = if self.p.kind == JobKind::Move { "move" } else { "copy" };
+        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+        let message = format!("Could not {verb} \"{name}\": {}.", reason(err));
+        self.p.failures.lock().unwrap().push(Failure { path: path.to_path_buf(), message });
+        Ok(())
+    }
+
     fn transfer(&mut self, src: &Path, dest_dir: &Path) -> io::Result<()> {
         if self.p.cancel.load(Ordering::Relaxed) {
             return Err(io::Error::other("Cancelled."));
@@ -262,12 +304,57 @@ impl Worker<'_> {
             self.p.add_done(tree_size(target));
             return Ok(());
         }
-        copy_tree(self.p, src, target)?;
-        if self.p.kind == JobKind::Move {
-            remove_tree(src)?;
+        self.copy_tree(src, target, self.p.kind == JobKind::Move)
+    }
+
+    // a move deletes each source item right after its copy, so an item that failed keeps its source
+    fn copy_tree(&mut self, src: &Path, dest: &Path, delete_source: bool) -> io::Result<()> {
+        let mut pending = vec![Step::Copy(src.to_path_buf(), dest.to_path_buf())];
+        while let Some(step) = pending.pop() {
+            match step {
+                Step::Copy(src, dest) => {
+                    if let Err(e) = self.copy_one(&src, &dest, delete_source, &mut pending) {
+                        self.fail(&src, &e)?;
+                    }
+                }
+                Step::Close(src) => match fs::remove_dir(&src) {
+                    Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.fail(&src, &e)?,
+                    _ => {}
+                },
+            }
         }
         Ok(())
     }
+
+    fn copy_one(&mut self, src: &Path, dest: &Path, delete_source: bool, pending: &mut Vec<Step>) -> io::Result<()> {
+        let meta = fs::symlink_metadata(src)?;
+        if meta.is_dir() {
+            fs::create_dir(dest)?;
+            if delete_source {
+                pending.push(Step::Close(src.to_path_buf()));
+            }
+            let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
+            for entry in children.into_iter().rev() {
+                pending.push(Step::Copy(entry.path(), dest.join(entry.file_name())));
+            }
+            return Ok(());
+        }
+        if meta.file_type().is_symlink() {
+            copy_symlink(src, dest)?;
+        } else {
+            copy_file(self.p, src, dest)?;
+        }
+        if delete_source {
+            fs::remove_file(src)?;
+        }
+        Ok(())
+    }
+}
+
+enum Step {
+    Copy(PathBuf, PathBuf),
+    // a move removes a source folder after its children, and the folder stays when one of them failed
+    Close(PathBuf),
 }
 
 fn is_real_dir(path: &Path) -> bool {
@@ -291,28 +378,13 @@ fn tree_size(path: &Path) -> u64 {
     total
 }
 
-fn copy_tree(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
-    let mut pending = vec![(src.to_path_buf(), dest.to_path_buf())];
-    while let Some((src, dest)) = pending.pop() {
-        let meta = fs::symlink_metadata(&src)?;
-        if meta.is_dir() {
-            fs::create_dir(&dest)?;
-            let children = fs::read_dir(&src)?.collect::<io::Result<Vec<_>>>()?;
-            for entry in children.into_iter().rev() {
-                pending.push((entry.path(), dest.join(entry.file_name())));
-            }
-        } else if meta.file_type().is_symlink() {
-            copy_symlink(&src, &dest)?;
-        } else {
-            copy_file(p, &src, &dest)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(fs::read_link(src)?, dest)
+    const EPERM: i32 = 1;
+    std::os::unix::fs::symlink(fs::read_link(src)?, dest).map_err(|e| match e.raw_os_error() {
+        Some(EPERM) => io::Error::new(io::ErrorKind::Unsupported, "the drive cannot hold links"),
+        _ => e,
+    })
 }
 
 #[cfg(not(unix))]
@@ -397,6 +469,70 @@ mod tests {
         fs::write(src.join("a.txt"), "new").unwrap();
         fs::write(out.join("a.txt"), "old").unwrap();
         (tmp, src, out)
+    }
+
+    // returns None when this user can read a mode 000 file anyway
+    #[cfg(unix)]
+    fn unreadable(path: &Path) -> Option<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, "secret").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        File::open(path).is_err().then_some(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_failing_item_does_not_stop_the_job_and_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("ok.txt"), "ok").unwrap();
+        let Some(()) = unreadable(&src.join("sub/locked.txt")) else { return };
+        fs::write(src.join("sub/later.txt"), "later").unwrap();
+        fs::write(src.join("zz_last.txt"), "last").unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let list = vec![src.join("ok.txt"), src.join("sub"), src.join("zz_last.txt")];
+        let p = spawn(JobKind::Copy, list, out.clone(), ASK);
+        let JobState::Failed(text) = wait(&p) else { panic!("the job reports the failure") };
+        assert!(text.contains("\"locked.txt\""), "the error names the file: {text}");
+        assert_eq!(names_in(&out), ["ok.txt", "sub", "zz_last.txt"]);
+        assert_eq!(names_in(&out.join("sub")), ["later.txt"]);
+        let failed: Vec<PathBuf> = p.failures().into_iter().map(|f| f.path).collect();
+        assert_eq!(failed, [src.join("sub/locked.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_to_another_drive_keeps_each_source_item_it_could_not_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let here = tempfile::tempdir().unwrap();
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&base).unwrap();
+        let there = tempfile::tempdir_in(&base).unwrap();
+        if fs::metadata(here.path()).unwrap().dev() == fs::metadata(there.path()).unwrap().dev() {
+            eprintln!("skipped: the two temp folders are on one drive");
+            return;
+        }
+        let src = here.path().join("d");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("sub/b.txt"), "b").unwrap();
+        let Some(()) = unreadable(&src.join("sub/locked.txt")) else { return };
+        let p = spawn(JobKind::Move, vec![src.clone()], there.path().to_path_buf(), ASK);
+        assert!(matches!(wait(&p), JobState::Failed(_)));
+        assert_eq!(names_in(&src), ["sub"], "only the folder that holds the failed file stays");
+        assert_eq!(names_in(&src.join("sub")), ["locked.txt"]);
+        assert_eq!(read(there.path().join("d/a.txt")), "a");
+        assert_eq!(read(there.path().join("d/sub/b.txt")), "b");
+    }
+
+    #[test]
+    fn a_missing_destination_fails_the_job_before_it_touches_anything() {
+        let (tmp, src, _out) = clash();
+        let p = spawn(JobKind::Move, vec![src.join("a.txt")], tmp.path().join("gone"), ASK);
+        assert_eq!(wait(&p), JobState::Failed("The destination folder does not exist.".into()));
+        assert_eq!(read(src.join("a.txt")), "new");
     }
 
     #[test]
