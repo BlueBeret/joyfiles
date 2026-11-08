@@ -181,6 +181,8 @@ struct Worker<'a> {
     merged: Vec<PathBuf>,
     // what this job placed, so a later item with a name that clashes on a drive that ignores case never replaces it
     created: HashSet<ItemKey>,
+    // folders this job merged into, so a later item of that name never replaces them
+    merged_into: HashSet<ItemKey>,
 }
 
 #[cfg(unix)]
@@ -252,7 +254,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new() };
+    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new(), merged_into: HashSet::new() };
     let result = worker.run_tasks();
     worker.finish();
     result
@@ -371,7 +373,11 @@ impl Worker<'_> {
                 target = unique_dest(dest_dir, name, is_real_dir(src));
             } else if is_real_dir(src) && is_real_dir(&target) {
                 return self.merge(src, &target);
-            } else if self.made_here(&target) {
+            } else if let Some(choice) = self.held_choice(&target) {
+                if choice == Resolution::Skip {
+                    self.p.add_done(tree_size(src));
+                    return Ok(());
+                }
                 target = unique_dest(dest_dir, name, is_real_dir(src));
             } else {
                 match self.resolve(src, &target)? {
@@ -393,7 +399,12 @@ impl Worker<'_> {
             return Err(mount_point_error());
         }
         let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
-        self.tasks.push(Task::EndMerge(src.to_path_buf()));
+        if self.p.kind == JobKind::Move {
+            self.tasks.push(Task::EndMerge(src.to_path_buf()));
+        }
+        if let Some(key) = item_key(target) {
+            self.merged_into.insert(key);
+        }
         for entry in children.into_iter().rev() {
             self.tasks.push(Task::Transfer { src: entry.path(), dest_dir: target.to_path_buf() });
         }
@@ -482,6 +493,15 @@ impl Worker<'_> {
         !self.created.is_empty() && path.ancestors().filter_map(item_key).any(|key| self.created.contains(&key))
     }
 
+    // an item that holds data of this job is never replaced, so only Skip or a new name is left for a clash with it
+    fn held_choice(&self, path: &Path) -> Option<Resolution> {
+        if self.made_here(path) {
+            return Some(Resolution::KeepBoth);
+        }
+        let merged = item_key(path).is_some_and(|key| self.merged_into.contains(&key));
+        merged.then(|| if self.sticky == Some(Resolution::Skip) { Resolution::Skip } else { Resolution::KeepBoth })
+    }
+
     fn record(&mut self, path: &Path) {
         if let Some(key) = item_key(path) {
             self.created.insert(key);
@@ -505,7 +525,10 @@ impl Worker<'_> {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             done => return done.map(|()| Some(dest.to_path_buf())),
         }
-        let choice = if self.made_here(dest) { Resolution::KeepBoth } else { self.resolve(src, dest)? };
+        let choice = match self.held_choice(dest) {
+            Some(choice) => choice,
+            None => self.resolve(src, dest)?,
+        };
         match choice {
             Resolution::Skip => Ok(None),
             Resolution::KeepBoth => {
@@ -513,8 +536,8 @@ impl Worker<'_> {
                 rename_noreplace(part, &other).map(|()| Some(other))
             }
             Resolution::Replace => {
-                // a plain copy never synced its part, and the old item goes right after the swap
-                fs::OpenOptions::new().write(true).open(part).and_then(|f| f.sync_all())?;
+                // a plain copy never synced its part, and a read only part still opens for a sync
+                fs::OpenOptions::new().write(true).open(part).or_else(|_| File::open(part)).and_then(|f| f.sync_all())?;
                 self.swap_in(part, dest).map(|()| Some(dest.to_path_buf()))
             }
         }
@@ -2033,5 +2056,80 @@ mod tests {
         assert!(matches!(wait(&p), JobState::Failed(_)));
         assert_eq!(read(out.join("d/d")), "keep me");
         assert_eq!(names_in(&out), ["d"]);
+    }
+
+    #[test]
+    fn a_copy_never_removes_an_empty_source_folder_it_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(src.join("empty")).unwrap();
+        fs::create_dir_all(src.join("tree/inner")).unwrap();
+        fs::create_dir_all(out.join("empty")).unwrap();
+        fs::create_dir_all(out.join("tree/inner")).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join("empty"), src.join("tree")], out.clone(), Policy::Always(Resolution::Skip));
+        assert_eq!(wait(&p), JobState::Done);
+        assert!(src.join("empty").is_dir() && src.join("tree/inner").is_dir());
+    }
+
+    #[test]
+    fn a_folder_and_a_file_of_one_name_never_destroy_the_files_the_folder_merged() {
+        for kind in [JobKind::Move, JobKind::Copy] {
+            for choice in [Resolution::Replace, Resolution::KeepBoth, Resolution::Skip] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (s0, s1, out) = (tmp.path().join("s0"), tmp.path().join("s1"), tmp.path().join("out"));
+                fs::create_dir_all(s0.join("h")).unwrap();
+                fs::create_dir_all(&s1).unwrap();
+                fs::create_dir_all(out.join("h")).unwrap();
+                fs::write(s0.join("h/photo.jpg"), "photo").unwrap();
+                fs::write(s1.join("h"), "file").unwrap();
+                fs::write(out.join("h/old.txt"), "old").unwrap();
+                let p = spawn(kind, vec![s0.join("h"), s1.join("h")], out.clone(), Policy::Always(choice));
+                assert_eq!(wait(&p), JobState::Done, "{kind:?} {choice:?}");
+                assert_eq!(read(out.join("h/photo.jpg")), "photo", "{kind:?} {choice:?}");
+                assert_eq!(read(out.join("h/old.txt")), "old", "{kind:?} {choice:?}");
+                if choice == Resolution::Skip {
+                    assert_eq!(names_in(&out), ["h"]);
+                    assert_eq!(read(s1.join("h")), "file");
+                } else {
+                    let kept = names_in(&out).into_iter().filter(|n| n != "h").map(|n| read(out.join(n))).collect::<Vec<_>>();
+                    assert_eq!(kept, ["file"], "{kind:?} {choice:?} the file stays under a new name");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_before_a_folder_of_one_name_keeps_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (s0, s1, out) = (tmp.path().join("s0"), tmp.path().join("s1"), tmp.path().join("out"));
+        fs::create_dir_all(s0.join("h")).unwrap();
+        fs::create_dir_all(&s1).unwrap();
+        fs::create_dir_all(out.join("h")).unwrap();
+        fs::write(s0.join("h/photo.jpg"), "photo").unwrap();
+        fs::write(s1.join("h"), "file").unwrap();
+        let p = spawn(JobKind::Copy, vec![s1.join("h"), s0.join("h")], out.clone(), Policy::Always(Resolution::Replace));
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(names_in(&out).len(), 2, "the reverse order keeps both too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replace_over_a_name_race_works_for_a_read_only_part() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let part = out.join(".x.joyfiles-part");
+        fs::write(&part, "new").unwrap();
+        fs::set_permissions(&part, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::write(out.join("x"), "racer").unwrap();
+        let p = spawn(JobKind::Copy, vec![], out.clone(), Policy::Always(Resolution::Replace));
+        assert_eq!(wait(&p), JobState::Done);
+        let live = parts::LiveJob::start();
+        let mut worker = Worker { p: &p, owner: live.owner(), sticky: Some(Resolution::Replace), tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), merged_into: HashSet::new(), created: HashSet::new() };
+        let placed = worker.place_part(&out.join("src"), &part, &out.join("x")).unwrap();
+        assert_eq!(placed, Some(out.join("x")));
+        assert_eq!(read(out.join("x")), "new");
     }
 }
