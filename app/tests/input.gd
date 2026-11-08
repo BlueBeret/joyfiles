@@ -56,7 +56,7 @@ func step(n := 1) -> void:
 		app._process(FRAME)
 
 
-# a new screen ignores A and B for a moment, so a deliberate press waits past that
+# a new screen ignores every press for a moment, so a deliberate press waits past that
 func settle() -> void:
 	await step(12)
 
@@ -217,6 +217,7 @@ func _open_does_not_repeat() -> void:
 	check(opened.size() == 1, "holding A on a file opens it once (%d opens)" % opened.size())
 	await fresh(chain)
 	await tap(JOY_BUTTON_LEFT_SHOULDER)
+	await settle()
 	btn(JOY_BUTTON_DPAD_RIGHT, true)
 	await step(60)
 	btn(JOY_BUTTON_DPAD_RIGHT, false)
@@ -304,6 +305,18 @@ func _prompt_ignores_held_direction() -> void:
 	await center()
 	await finish_jobs()
 
+	var base3 := clash("late")
+	await fresh(data)
+	copy_into_dst(base3)
+	app.paste()
+	await until_prompt()
+	btn(JOY_BUTTON_DPAD_DOWN, true)
+	await step(40)
+	check(app.conflict_panel.cursor == 1, "D-pad Down pressed just after the prompt opens and held leaves the choice on Keep both (%d)" % app.conflict_panel.cursor)
+	btn(JOY_BUTTON_DPAD_DOWN, false)
+	await step(2)
+	await finish_jobs()
+
 
 func double_tap_a() -> void:
 	for i in 2:
@@ -321,6 +334,7 @@ func _double_tap() -> void:
 	app.cursor = 2
 	var target: String = app.entries[2]["path"]
 	await tap(JOY_BUTTON_X)
+	await settle()
 	for i in menu_index("Move to trash"):
 		await tap(JOY_BUTTON_DPAD_DOWN)
 	await double_tap_a()
@@ -332,6 +346,7 @@ func _double_tap() -> void:
 	await fresh(data + "/many")
 	app.jobs[999] = {"watch": [], "state": "running"}
 	await tap(JOY_BUTTON_START)
+	await settle()
 	for i in menu_index("Quit"):
 		await tap(JOY_BUTTON_DPAD_DOWN)
 	await double_tap_a()
@@ -479,10 +494,12 @@ func _repeat_survives_other_presses() -> void:
 func _menus_return() -> void:
 	await fresh(data + "/many")
 	await tap(JOY_BUTTON_LEFT_SHOULDER)
+	await settle()
 	await tap(JOY_BUTTON_START)
 	await settle()
 	await tap(JOY_BUTTON_B)
 	check(app.mode == app.Mode.PLACES, "closing the Start menu returns to Places (mode %d)" % app.mode)
+	await settle()
 	await tap(JOY_BUTTON_LEFT_STICK)
 	await settle()
 	await tap(JOY_BUTTON_B)
@@ -548,6 +565,7 @@ func _preview_follows_refresh() -> void:
 		png(base + "/" + n)
 	await fresh(base)
 	await tap(JOY_BUTTON_A)
+	await settle()
 	DirAccess.remove_absolute(base + "/i2.png")
 	png(base + "/i0.png")
 	app.refresh()
