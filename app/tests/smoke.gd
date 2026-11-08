@@ -107,7 +107,6 @@ func start_app(path: String) -> Control:
 	instance.start_path = path
 	instance.settings_path = settings_file
 	instance.opener = func(_path: String) -> int: return OK
-	instance.opener = func(_path: String) -> int: return OK
 	root.add_child(instance)
 	return instance
 
@@ -214,6 +213,7 @@ func _run() -> void:
 	await _quit_with_job()
 	_missing_folder()
 	await _opening()
+	await _finish_toasts()
 	_part_files()
 	_glyphs()
 	_keyboard_fallback()
@@ -739,6 +739,28 @@ func _settings_types() -> void:
 	check(unknown.sort_key == "name" and unknown.show_hidden, "an unknown sort key falls back to name")
 	var good := _load_settings('[view]\nsort_key="type"\nshow_hidden=true\nsort_desc=true\n')
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
+
+
+func _finish_toasts() -> void:
+	var base := root_dir + "/finishing"
+	for n in ["f1.txt", "f2.txt", "f3.txt"]:
+		write("%s/src/%s" % [base, n], "x")
+	DirAccess.make_dir_recursive_absolute(base + "/dst")
+	DirAccess.make_dir_recursive_absolute(base + "/dst2")
+	app.navigate(base + "/src")
+	pick("Select all")
+	pick("Copy")
+	app.navigate(base + "/dst")
+	pick("Paste")
+	await until(jobs_done, "the three item paste ends")
+	check(app._toast_label.text == "Copied 3 items.", "the toast counts the copied items: %s" % app._toast_label.text)
+	app.navigate(base + "/src")
+	cursor_to("f1.txt")
+	pick("Cut")
+	app.navigate(base + "/dst2")
+	pick("Paste")
+	await until(jobs_done, "the one item move ends")
+	check(app._toast_label.text == "Moved f1.txt.", "the toast names a single moved item: %s" % app._toast_label.text)
 
 
 func _part_files() -> void:

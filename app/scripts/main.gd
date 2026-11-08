@@ -511,12 +511,13 @@ func _open_menu(items: Array) -> void:
 
 
 func _set_clipboard(paths: PackedStringArray, is_move: bool) -> void:
-	clipboard = {"move": is_move, "paths": paths}
+	clipboard = {"move": is_move, "paths": paths, "label": _label_of(paths)}
 	selected.clear()
 	toast("%d item(s) ready to %s. Open a folder and pick Paste." % [paths.size(), "move" if is_move else "copy"])
 
 
 func paste() -> void:
+	var label: String = clipboard.get("label", _label_of(clipboard["paths"]))
 	var id: int = core.start_job(clipboard["move"], clipboard["paths"], cwd)
 	var watch := [cwd]
 	if clipboard["move"]:
@@ -525,7 +526,7 @@ func paste() -> void:
 			if parent not in watch:
 				watch.append(parent)
 		clipboard = {"move": false, "paths": PackedStringArray()}
-	jobs[id] = {"watch": watch}
+	jobs[id] = {"watch": watch, "label": label}
 
 
 func _ask_rename(path: String) -> void:
@@ -552,8 +553,12 @@ func _ask_filter() -> void:
 	_keyboard.set_title(_filter_title())
 
 
+func _label_of(paths: PackedStringArray) -> String:
+	return paths[0].get_file() if paths.size() == 1 else Theme_.count(paths.size(), "item")
+
+
 func _ask_trash(paths: PackedStringArray) -> void:
-	var what: String = paths[0].get_file() if paths.size() == 1 else "%d items" % paths.size()
+	var what := _label_of(paths)
 	_confirm_label.text = "Move %s to the trash?" % what
 	_on_confirm = func():
 		var r: Dictionary = core.trash(paths)
@@ -610,14 +615,8 @@ func _poll_jobs() -> void:
 		if not jobs.has(id):
 			continue
 		jobs[id].merge(job, true)
-		match job["state"]:
-			"done":
-				toast("Finished: %s." % job["current"])
-			"failed":
-				toast(job["error"], true)
-			"cancelled":
-				toast("The job was cancelled.")
 		if job["state"] != "running":
+			_announce_end(jobs[id])
 			ended = true
 			if cwd in jobs[id].get("watch", []):
 				refresh()
@@ -631,6 +630,17 @@ func _poll_jobs() -> void:
 		_render_hints()
 	if mode == Mode.JOBS:
 		_render_overlay()
+
+
+func _announce_end(job: Dictionary) -> void:
+	var moved: bool = job["kind"] == "move"
+	match job["state"]:
+		"done":
+			toast("%s %s." % ["Moved" if moved else "Copied", job.get("label", job["current"])])
+		"failed":
+			toast(job["error"], true)
+		"cancelled":
+			toast("The job was cancelled.")
 
 
 func _ask_next_conflict() -> void:
