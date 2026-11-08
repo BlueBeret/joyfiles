@@ -201,8 +201,10 @@ impl JoyCore {
         }
     }
 
+    // a scan the panel cancelled is never polled again, so each new scan drops cancelled scans that ended
     #[func]
     fn start_size_scan(&mut self, path: GString) -> i64 {
+        self.scans.retain(|_, s| !(s.cancel.load(Ordering::Relaxed) && s.done.load(Ordering::Relaxed)));
         self.next_scan += 1;
         self.scans.insert(self.next_scan, props::spawn_size_scan(path_of(&path)));
         self.next_scan
