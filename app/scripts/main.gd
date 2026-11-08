@@ -10,6 +10,7 @@ const TOAST_MAX_WIDTH := 880.0
 const TOAST_LIFT := 84
 const REPEAT_DELAY := 0.35
 const REPEAT_RATE := 0.06
+const PLACES_REFRESH_SECONDS := 3.0
 # a clash prompt never cuts into a menu, a keyboard or a confirm that the user is using
 const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
 
@@ -52,6 +53,7 @@ var _on_change: Callable
 var _on_cancel: Callable
 var _on_confirm: Callable
 var _toast_until := 0.0
+var _places_at := 0.0
 var _conflict_job := -1
 var _conflict_return := Mode.FILES
 
@@ -154,6 +156,8 @@ func _process(delta: float) -> void:
 		_repeat_at = _clock + REPEAT_RATE
 		fire(_held)
 	_poll_jobs()
+	if _clock >= _places_at:
+		refresh_places()
 	if thumbs.poll():
 		_render()
 	if mode == Mode.PROPS:
@@ -178,7 +182,7 @@ func _files_action(action: String) -> void:
 		"jf_page_down": _move(VISIBLE_ROWS)
 		"jf_accept", "jf_right": _open_current()
 		"jf_back": _back()
-		"jf_left", "jf_pane": mode = Mode.PLACES
+		"jf_left", "jf_pane": _open_places()
 		"jf_select": _toggle_select()
 		"jf_menu": _open_menu(_file_menu())
 		"jf_start": _open_menu(_app_menu())
@@ -219,6 +223,26 @@ func _confirm_action(action: String) -> void:
 
 
 # navigation
+
+func _open_places() -> void:
+	refresh_places()
+	mode = Mode.PLACES
+
+
+# a card can be mounted or removed at any time, so the list is read again on a timer
+func refresh_places() -> void:
+	_places_at = _clock + PLACES_REFRESH_SECONDS
+	var fresh: Array = places_source.call()
+	if fresh.is_empty() or fresh == places:
+		return
+	var focused: String = places[place_cursor]["path"] if place_cursor < places.size() else ""
+	places = fresh
+	place_cursor = 0
+	for i in places.size():
+		if places[i]["path"] == focused:
+			place_cursor = i
+	_render_places()
+
 
 func _list(path: String) -> Variant:
 	var result: Dictionary = core.list_dir(path, settings.show_hidden, settings.sort_key, settings.sort_desc)
