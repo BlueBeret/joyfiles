@@ -213,6 +213,7 @@ func _run() -> void:
 	await _quit_with_job()
 	_missing_folder()
 	await _opening()
+	await _job_failures()
 	await _finish_toasts()
 	_part_files()
 	_glyphs()
@@ -739,6 +740,87 @@ func _settings_types() -> void:
 	check(unknown.sort_key == "name" and unknown.show_hidden, "an unknown sort key falls back to name")
 	var good := _load_settings('[view]\nsort_key="type"\nshow_hidden=true\nsort_desc=true\n')
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
+
+
+func open_jobs_report() -> int:
+	press("jf_jobs")
+	check(app.mode == app.Mode.JOBS, "the jobs button opens the panel")
+	var id: int = app.jobs_panel.focused_report()
+	check(id >= 0, "the panel focuses a failure report")
+	return id
+
+
+func _job_failures() -> void:
+	var base := root_dir + "/failing"
+	DirAccess.make_dir_recursive_absolute(base + "/dst")
+	var probe: int = app.core.start_job(false, PackedStringArray([base + "/nothing.txt"]), base + "/dst")
+	var ended: Array = []
+	for i in 400:
+		ended = app.core.poll_jobs().filter(func(j: Dictionary) -> bool: return j["id"] == probe and j["state"] != "running")
+		if not ended.is_empty():
+			break
+		await process_frame
+	check(not ended.is_empty() and ended[0]["state"] == "failed", "a job with a failed item ends failed")
+	var item: Dictionary = ended[0]["failures"][0] if not ended.is_empty() and not ended[0]["failures"].is_empty() else {}
+	check(item.keys() == ["path", "name", "error"] and item["name"] == "nothing.txt", "poll_jobs lists each failure with path, name and error: %s" % [item])
+
+	for n in ["a.txt", "b.txt", "c.txt"]:
+		write("%s/src/%s" % [base, n], "x")
+	app.navigate(base + "/src")
+	pick("Select all")
+	pick("Copy")
+	DirAccess.remove_absolute(base + "/src/b.txt")
+	DirAccess.remove_absolute(base + "/src/c.txt")
+	app.navigate(base + "/dst")
+	pick("Paste")
+	await until(jobs_done, "a paste with two vanished sources ends")
+	check(FileAccess.file_exists(base + "/dst/a.txt"), "the item that exists was copied")
+	check(app.reports.size() == 1, "the ended job leaves one report (%d)" % app.reports.size())
+	var report: Dictionary = app.reports.values()[0]
+	var failed_names: Array = report["failures"].map(func(f: Dictionary) -> String: return f["name"])
+	check(failed_names == ["b.txt", "c.txt"], "the report holds every failed item: %s" % [failed_names])
+	check(app.last_error == "2 items could not be copied. Open Jobs to see them.", "the toast counts the failures and says where to look: %s" % app.last_error)
+	check(app._status.text == "2 items failed. Open Jobs to see why.", "the footer keeps the failure in view after the toast: %s" % app._status.text)
+	check(app._hints_for_mode().has(["jf_jobs", "Jobs"]), "the jobs hint stays while a report waits")
+	check(app._jobs_label() == "Jobs (1 failed)", "the Start menu counts the report: %s" % app._jobs_label())
+
+	var id := open_jobs_report()
+	press("jf_accept")
+	check(app.jobs_panel.viewing == id and app.jobs_panel.failure_texts.size() == 2, "A opens the failure list")
+	check(app.jobs_panel.failure_texts[0].contains("b.txt") and app.jobs_panel.failure_texts[1].contains("c.txt"), "the list names each failed item: %s" % [app.jobs_panel.failure_texts])
+	check(app._hints_for_mode() == [["jf_menu", "Dismiss"], ["jf_back", "Back"]], "the footer hints match the failure list: %s" % [app._hints_for_mode()])
+	check(app.jobs_panel._detail_rows[1]["path"].text.ends_with("/src/c.txt"), "each row shows where the item is")
+	press("jf_back")
+	check(app.mode == app.Mode.JOBS and app.jobs_panel.viewing == -1, "B leaves the list and keeps the panel open")
+	press("jf_back")
+	check(app.mode == app.Mode.FILES and app.reports.size() == 1, "closing the panel keeps the report")
+	open_jobs_report()
+	press("jf_menu")
+	check(app.reports.is_empty() and app.jobs_panel.report_ids.is_empty(), "X dismisses the report")
+	check(app._status.text == "" and not app._hints_for_mode().any(func(p: Array) -> bool: return p[0] == "jf_jobs"), "a dismissed report leaves no trace in the footer")
+	press("jf_back")
+
+	for i in 12:
+		write("%s/many/src/f%02d.txt" % [base, i], "x")
+	DirAccess.make_dir_recursive_absolute(base + "/many/dst")
+	app.navigate(base + "/many/src")
+	pick("Select all")
+	pick("Copy")
+	for i in range(1, 12):
+		DirAccess.remove_absolute("%s/many/src/f%02d.txt" % [base, i])
+	app.navigate(base + "/many/dst")
+	pick("Paste")
+	await until(jobs_done, "the paste with eleven vanished sources ends")
+	open_jobs_report()
+	press("jf_accept")
+	check(app.jobs_panel.failure_texts.size() == 11, "the list holds all eleven failures (%d)" % app.jobs_panel.failure_texts.size())
+	for i in 3:
+		press("jf_page_down")
+	var last_row: Dictionary = app.jobs_panel._detail_rows[app.jobs_panel.DETAIL_ROWS - 1]
+	check(app.jobs_panel.failure_cursor == 10 and last_row["message"].text == app.jobs_panel.failure_texts[10], "paging reaches the last failure (cursor %d)" % app.jobs_panel.failure_cursor)
+	press("jf_menu")
+	check(app.mode == app.Mode.JOBS and app.jobs_panel.viewing == -1 and app.reports.is_empty(), "X inside the list dismisses the report and shows the jobs")
+	press("jf_back")
 
 
 func _finish_toasts() -> void:

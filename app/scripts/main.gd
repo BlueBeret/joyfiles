@@ -36,6 +36,8 @@ var place_cursor := 0
 var menu_items: Array = []
 var menu_cursor := 0
 var jobs := {}
+# one entry per ended operation that left failed items, kept until the user dismisses it
+var reports := {}
 var last_error := ""
 var conflict_panel: JoyConflict
 var jobs_panel: JoyJobs
@@ -57,6 +59,7 @@ var _toast_until := 0.0
 var _places_at := 0.0
 var _conflict_job := -1
 var _conflict_return := Mode.FILES
+var _report_seq := 0
 
 var _path_label: Label
 var _filter_label: Label
@@ -112,7 +115,7 @@ func _ready() -> void:
 	}
 	_overlay_renderers = {
 		Mode.MENU: _render_menu,
-		Mode.JOBS: func(): jobs_panel.update(jobs),
+		Mode.JOBS: func(): jobs_panel.update(jobs, reports),
 		Mode.PREVIEW: preview.refresh,
 	}
 	places = places_source.call()
@@ -475,13 +478,20 @@ func select_all() -> void:
 
 func _app_menu() -> Array:
 	return [
-		["Jobs (%d)" % jobs.size() if not jobs.is_empty() else "Jobs", _open_jobs],
+		[_jobs_label(), _open_jobs],
 		["Filter this folder", _ask_filter],
 		["Sort...", _open_sort_menu],
 		["Hide hidden files" if settings.show_hidden else "Show hidden files", _toggle_hidden],
 		["Refresh", refresh],
 		["Quit Joyfiles", _ask_quit],
 	]
+
+
+func _jobs_label() -> String:
+	if reports.is_empty():
+		return "Jobs (%d)" % jobs.size() if not jobs.is_empty() else "Jobs"
+	var running := "%d running, " % jobs.size() if not jobs.is_empty() else ""
+	return "Jobs (%s%d failed)" % [running, reports.size()]
 
 
 func _ask_quit() -> void:
@@ -569,6 +579,19 @@ func _ask_trash(paths: PackedStringArray) -> void:
 	mode = Mode.CONFIRM
 
 
+func _add_report(title: String, failures: Array) -> void:
+	_report_seq += 1
+	reports[_report_seq] = {"title": title, "failures": failures}
+
+
+func _see_jobs(count: int) -> String:
+	return "Open Jobs to see %s." % ("it" if count == 1 else "them")
+
+
+func _on_report_dismissed(id: int) -> void:
+	reports.erase(id)
+
+
 func _ask_text(title: String, initial: String, on_submit: Callable, on_change := Callable(), on_cancel := Callable()) -> void:
 	_on_submit = on_submit
 	_on_change = on_change
@@ -633,6 +656,14 @@ func _poll_jobs() -> void:
 
 func _announce_end(job: Dictionary) -> void:
 	var moved: bool = job["kind"] == "move"
+	var failures: Array = job["failures"]
+	if not failures.is_empty():
+		var cancelled: bool = job["state"] == "cancelled"
+		var many := Theme_.count(failures.size(), "item")
+		_add_report("%s: %s failed%s" % ["Move" if moved else "Copy", many, " (cancelled)" if cancelled else ""], failures)
+		var what := "The job was cancelled. %s had failed before that." % many if cancelled else "%s could not be %s." % [many, "moved" if moved else "copied"]
+		toast("%s %s" % [what, _see_jobs(failures.size())], true)
+		return
 	match job["state"]:
 		"done":
 			toast("%s %s." % ["Moved" if moved else "Copied", job.get("label", job["current"])])
@@ -821,6 +852,7 @@ func _build_ui() -> void:
 	jobs_panel.closed.connect(func(): mode = Mode.FILES)
 	jobs_panel.cancel_requested.connect(core.cancel_job)
 	jobs_panel.answer_requested.connect(_on_answer_requested)
+	jobs_panel.dismissed.connect(_on_report_dismissed)
 	_overlay.add_child(jobs_panel)
 	props_panel = JoyProps.new()
 	props_panel.closed.connect(_on_props_closed)
@@ -858,6 +890,7 @@ func _render() -> void:
 	_render_places()
 	_render_overlay()
 	_render_hints()
+	_render_status()
 
 
 func _render_rows() -> void:
@@ -934,15 +967,14 @@ const HINTS := {
 	Mode.KEYBOARD: [],
 	Mode.CONFIRM: [["jf_accept", "Yes"], ["jf_back", "No"]],
 	Mode.CONFLICT: [["jf_accept", "Choose"], ["jf_select", "All"], ["jf_back", "Cancel job"]],
-	Mode.JOBS: [["jf_menu", "Cancel job"], ["jf_back", "Close"]],
 	Mode.PROPS: [["jf_back", "Close"]],
 	Mode.PREVIEW: [["jf_left", "Previous"], ["jf_right", "Next"], ["jf_back", "Close"]],
 }
 
 
 func _hints_for_mode() -> Array:
-	var pairs: Array = HINTS[mode].duplicate()
-	if mode in PROMPT_MODES and not jobs.is_empty():
+	var pairs: Array = jobs_panel.hint_pairs(jobs) if mode == Mode.JOBS else HINTS[mode].duplicate()
+	if mode in PROMPT_MODES and not (jobs.is_empty() and reports.is_empty()):
 		pairs.append(["jf_jobs", "Jobs"])
 	if mode == Mode.FILES and filter != "":
 		pairs = pairs.map(func(p: Array) -> Array: return [p[0], "Clear filter"] if p[0] == "jf_back" else p)
@@ -959,7 +991,9 @@ func _render_hints() -> void:
 func _render_status() -> void:
 	var running := jobs.values().filter(func(j): return j.get("state", "running") == "running")
 	if running.is_empty():
-		_status.text = ""
+		var failed: int = reports.values().reduce(func(n: int, r: Dictionary) -> int: return n + r["failures"].size(), 0)
+		_status.text = "" if reports.is_empty() else "%s failed. Open Jobs to see why." % Theme_.count(failed, "item")
+		_status.add_theme_color_override("font_color", Theme_.DANGER)
 		return
 	var j: Dictionary = running[0]
 	_status.add_theme_color_override("font_color", Theme_.TEXT)
