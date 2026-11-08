@@ -709,29 +709,50 @@ mod tests {
         assert_eq!(listed.map_err(|e| e.kind()), Err(io::ErrorKind::PermissionDenied));
     }
 
-    // the test removes what it put in the trash, found by the temp folder it came from
+    // a child process gets its own data home on the drive of the items, so nothing reaches a real trash
     #[cfg(target_os = "linux")]
     #[test]
     fn trash_goes_on_past_a_missing_item_and_names_it() {
-        let tmp = tempfile::tempdir().unwrap();
+        let Some(home) = std::env::var_os("JF_TRASH_TEST_HOME") else {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+            fs::create_dir_all(&base).unwrap();
+            let home = tempfile::tempdir_in(&base).unwrap();
+            let me = std::env::current_exe().unwrap();
+            let name = "fs_ops::tests::trash_goes_on_past_a_missing_item_and_names_it";
+            let out = std::process::Command::new(me).args(["--exact", name, "--test-threads=1"]).env("JF_TRASH_TEST_HOME", home.path()).env("XDG_DATA_HOME", home.path()).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+            assert!(fs::read_dir(home.path().join("Trash/files")).unwrap().next().is_none(), "the child emptied its trash");
+            return;
+        };
+        let tmp = tempfile::tempdir_in(&home).unwrap();
         let (x1, missing, x2) = (tmp.path().join("x1"), tmp.path().join("missing"), tmp.path().join("x2"));
         fs::write(&x1, "1").unwrap();
         fs::write(&x2, "2").unwrap();
         let failures = trash_items(&[x1.clone(), missing.clone(), x2.clone()]);
         let ours: Vec<_> = trash::os_limited::list().unwrap().into_iter().filter(|i| i.original_parent == tmp.path()).collect();
         trash::os_limited::purge_all(&ours).unwrap();
+        assert!(Path::new(&home).join("Trash/files").is_dir(), "the items went to the trash in the test data home");
         assert!(!x1.exists() && !x2.exists(), "both real items went to the trash");
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].path, missing);
         assert_eq!(failures[0].message, "Could not move \"missing\" to the trash: the file or folder does not exist.");
     }
 
+    #[test]
+    fn a_name_the_drive_refuses_is_not_called_too_long() {
+        assert_eq!(reason(&io::ErrorKind::InvalidFilename.into()), "the drive does not accept this name");
+        #[cfg(unix)]
+        assert_eq!(reason(&io::Error::from_raw_os_error(libc::ENAMETOOLONG)), "the name is too long");
+        #[cfg(windows)]
+        assert_eq!(reason(&io::Error::from_raw_os_error(123)), "the drive does not accept this name");
+    }
+
     #[cfg(windows)]
     #[test]
     fn names_that_windows_would_change_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        for bad in ["x.", "con", "NUL.txt", "com1", "LPT9.log"] {
-            assert!(make_dir(tmp.path(), bad).is_err(), "{bad} is refused");
+        for bad in ["x.", "con", "NUL.txt", "com1", "LPT9.log", "a\tb", "a\u{1}b", "COM0", "lpt0.txt", "COM\u{b9}", "LPT\u{b3}.log"] {
+            assert!(make_dir(tmp.path(), bad).is_err(), "{bad:?} is refused");
         }
         assert!(names(list_dir(tmp.path(), true, SortKey::Name, false).unwrap()).is_empty());
         assert!(make_dir(tmp.path(), "console").is_ok());
