@@ -222,6 +222,12 @@ func _run() -> void:
 	_glyphs()
 	_keyboard_fallback()
 	_settings_types()
+	app.queue_free()
+	await frames()
+	var input_suite: GDScript = load("res://tests/input.gd")
+	check(input_suite.can_instantiate(), "the input checks load")
+	if input_suite.can_instantiate():
+		await input_suite.new(self).run()
 
 	DirAccess.remove_absolute(settings_file)
 	print("RESULT %s (%d failures)" % ["OK" if failures == 0 else "FAILED", failures])
