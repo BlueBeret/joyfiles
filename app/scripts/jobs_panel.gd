@@ -7,7 +7,9 @@ signal answer_requested(id: int)
 signal dismissed(id: int)
 
 const DETAIL_ROWS := 4
-const DETAIL_ROW_HEIGHT := 88
+const DETAIL_ROW_HEIGHT := 108
+# the lists scroll past this height, so the title and the hints always fit in an 800 pixel window
+const LIST_MAX_HEIGHT := 500.0
 
 var cursor := 0
 var ids: Array = []
@@ -21,6 +23,7 @@ var failure_texts: Array = []
 var commands: Array = []
 var _jobs := {}
 var _reports := {}
+var _scroll: JoyScrollBox
 var _list: VBoxContainer
 var _report_list: VBoxContainer
 var _empty: Label
@@ -58,15 +61,19 @@ func _init() -> void:
 	box.add_theme_constant_override("separation", 14)
 	box.custom_minimum_size.x = 760
 	add_child(box)
-	box.add_child(Theme_.label("Jobs", Theme_.TEXT, 28))
+	box.add_child(Theme_.label("Jobs", Theme_.TEXT, Theme_.SIZE_HEAD))
+	var lists := VBoxContainer.new()
+	lists.add_theme_constant_override("separation", 8)
+	_scroll = JoyScrollBox.new(lists, LIST_MAX_HEIGHT)
+	box.add_child(_scroll)
 	_list = VBoxContainer.new()
 	_list.add_theme_constant_override("separation", 8)
-	box.add_child(_list)
+	lists.add_child(_list)
 	_report_list = VBoxContainer.new()
 	_report_list.add_theme_constant_override("separation", 8)
-	box.add_child(_report_list)
-	_empty = Theme_.label("No jobs are running.", Theme_.MUTED, 22)
-	box.add_child(_empty)
+	lists.add_child(_report_list)
+	_empty = Theme_.label("No jobs are running.", Theme_.MUTED, Theme_.SIZE_BODY)
+	lists.add_child(_empty)
 	_build_detail(box)
 	_hints_box = VBoxContainer.new()
 	box.add_child(_hints_box)
@@ -167,10 +174,22 @@ func update(jobs: Dictionary, reports := {}) -> void:
 			_report_list.add_child(_report_rows[id]["row"])
 		_fill_report_row(_report_rows[id], reports[id], ids.size() + i == cursor)
 	_render_detail()
-	_list.visible = viewing < 0
-	_report_list.visible = viewing < 0
-	_empty.visible = viewing < 0 and ids.is_empty() and report_ids.is_empty()
+	_scroll.visible = viewing < 0
+	_empty.visible = ids.is_empty() and report_ids.is_empty()
 	Theme_.update_hints(_hints_box, JoyCommands.hints(commands))
+	if viewing < 0:
+		_keep_cursor_visible()
+
+
+# the row that the cursor is on scrolls into view, once the layout has the new rows
+func _keep_cursor_visible() -> void:
+	var focused: Control = null
+	if cursor < ids.size():
+		focused = _rows[ids[cursor]]["row"]
+	elif cursor - ids.size() < report_ids.size():
+		focused = _report_rows[report_ids[cursor - ids.size()]]["row"]
+	if focused != null:
+		_scroll.reveal(focused)
 
 
 func _drop_gone(rows: Dictionary, data: Dictionary) -> void:
@@ -241,7 +260,7 @@ func _render_detail() -> void:
 	elif failure_cursor >= failure_top + DETAIL_ROWS:
 		failure_top = failure_cursor - DETAIL_ROWS + 1
 	_detail_title.text = report["title"]
-	_detail_count.text = "%d of %d" % [failure_cursor + 1, failures.size()]
+	_detail_count.text = "%s of %s" % [Theme_.with_commas(failure_cursor + 1), Theme_.with_commas(failures.size())]
 	for i in DETAIL_ROWS:
 		var parts: Dictionary = _detail_rows[i]
 		var at := failure_top + i
