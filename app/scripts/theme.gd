@@ -31,6 +31,8 @@ const SIZE_BODY := 22
 const SIZE_LIST := 24
 const SIZE_TITLE := 26
 const SIZE_HEAD := 28
+const SIZE_FIELD := 32
+const TYPE_SCALE := [SIZE_SMALL, SIZE_BODY, SIZE_LIST, SIZE_TITLE, SIZE_HEAD, SIZE_FIELD]
 const FONT_DIR := "res://fonts/"
 # the first font covers Latin, Greek and Cyrillic, the others cover scripts and symbols that a device can lack
 const FONT_FILES := ["NotoSans", "NotoSansThai", "NotoSansArabic", "NotoSansHebrew", "NotoSansSymbols2-Subset"]
@@ -42,16 +44,29 @@ static var _theme: Theme
 # one theme for the whole window, so every label gets the bundled font and the same default size
 static func theme() -> Theme:
 	if _theme == null:
-		var faces: Array[Font] = []
+		var faces: Array[FontFile] = []
 		for stem: String in FONT_FILES:
 			faces.append(load("%s%s.ttf" % [FONT_DIR, stem]))
+		# a line is as tall as the tallest font in the chain, so every fallback gets the line box of the base font
+		for face: FontFile in faces.slice(1):
+			for size: int in TYPE_SCALE:
+				face.set_cache_ascent(0, size, faces[0].get_ascent(size))
+				face.set_cache_descent(0, size, faces[0].get_descent(size))
+		var fallbacks: Array[Font] = []
+		fallbacks.assign(faces.slice(1))
 		var font := FontVariation.new()
 		font.base_font = faces[0]
-		font.fallbacks = faces.slice(1)
+		font.fallbacks = fallbacks
 		_theme = Theme.new()
 		_theme.default_font = font
 		_theme.default_font_size = BASE_SIZE
 		_theme.set_color("font_color", "Label", TEXT)
+		var track := box(Color(1, 1, 1, 0.08), 5, 0)
+		track.content_margin_left = 5
+		track.content_margin_right = 5
+		_theme.set_stylebox("scroll", "VScrollBar", track)
+		for grabber: String in ["grabber", "grabber_highlight", "grabber_pressed"]:
+			_theme.set_stylebox(grabber, "VScrollBar", box(MUTED, 5, 0))
 	return _theme
 
 
@@ -102,6 +117,18 @@ static func focus_box(focused: bool, plain := Color.TRANSPARENT, radius := 8, ma
 		s.set_border_width_all(RING_WIDTH)
 		s.border_color = RING
 	return s
+
+
+# the largest size that keeps the aspect of an image in a box, and a thin image still gets a visible line
+static func fit_rect(image: Vector2, box: Vector2, min_side: float) -> Rect2:
+	var k := minf(box.x / image.x, box.y / image.y)
+	var shown := Vector2(clampf(image.x * k, min_side, box.x), clampf(image.y * k, min_side, box.y))
+	return Rect2((box - shown) / 2.0, shown)
+
+
+# an image that grows two times or more stays sharp, and any other image is smoothed
+static func filter_for(image: Vector2, shown: Vector2) -> int:
+	return CanvasItem.TEXTURE_FILTER_NEAREST if maxf(shown.x / image.x, shown.y / image.y) >= 2.0 else CanvasItem.TEXTURE_FILTER_LINEAR
 
 
 static func text_width(text: String, size: int) -> float:
