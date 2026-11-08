@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::fs_ops::{Entry, exists_nofollow, is_within, reason, same_dir, stat_entry, unique_dest};
+use crate::fs_ops::{Entry, exists_nofollow, is_within, reason, same_dir, stat_entry, temp_path, unique_dest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -395,14 +395,27 @@ fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
     fs::copy(src, dest).map(|_| ())
 }
 
+// the bytes go to a temporary name first, so a crash or an error never leaves a short file under the real name
 fn copy_file(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
     let mut input = File::open(src)?;
-    let mut output = File::create_new(dest)?;
+    let part = temp_path(dest.parent().unwrap_or(Path::new(".")), dest.file_name().unwrap_or_default());
+    let result = write_part(p, &mut input, &part).and_then(|()| {
+        if exists_nofollow(dest) {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        fs::rename(&part, dest)
+    });
+    if result.is_err() {
+        let _ = fs::remove_file(&part);
+    }
+    result
+}
+
+fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
+    let mut output = File::create_new(part)?;
     let mut buf = vec![0u8; 1 << 20];
     loop {
         if p.cancel.load(Ordering::Relaxed) {
-            drop(output);
-            let _ = fs::remove_file(dest);
             return Err(io::Error::other("Cancelled."));
         }
         let n = input.read(&mut buf)?;
@@ -412,8 +425,7 @@ fn copy_file(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
         output.write_all(&buf[..n])?;
         p.add_done(n as u64);
     }
-    output.set_permissions(input.metadata()?.permissions())?;
-    Ok(())
+    output.set_permissions(input.metadata()?.permissions())
 }
 
 fn remove_tree(path: &Path) -> io::Result<()> {
@@ -549,6 +561,16 @@ mod tests {
         let mut failed: Vec<PathBuf> = p.failures().into_iter().map(|f| f.path).collect();
         failed.sort();
         assert_eq!(failed, [src.join("pipe"), src.join("sock")]);
+    }
+
+    // reading /proc/self/mem at offset 0 fails, so it stands in for a disk error in the middle of a copy
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_copy_that_fails_midway_leaves_no_file_under_the_final_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = spawn(JobKind::Copy, vec![PathBuf::from("/proc/self/mem")], tmp.path().to_path_buf(), ASK);
+        assert!(matches!(wait(&p), JobState::Failed(_)));
+        assert!(names_in(tmp.path()).is_empty(), "no partial file and no temporary file stays");
     }
 
     #[test]

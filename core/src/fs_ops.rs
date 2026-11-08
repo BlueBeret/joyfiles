@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -196,6 +196,46 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 // true when path is dir itself or lies anywhere below it, whatever links the path text goes through
 pub fn is_within(path: &Path, dir: &Path) -> bool {
     fs::canonicalize(path).is_ok_and(|real| real.ancestors().any(|a| same_dir(a, dir)))
+}
+
+// most drives allow 255 bytes in one name
+const NAME_MAX: usize = 255;
+const PART_SUFFIX: &str = ".joyfiles-part";
+
+// a name valid as text is cut on a character boundary, because some drives refuse broken text
+fn truncate(name: &OsStr, max: usize) -> OsString {
+    if name.len() <= max {
+        return name.to_owned();
+    }
+    if let Some(text) = name.to_str() {
+        let end = (0..=max).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        return text[..end].into();
+    }
+    #[cfg(unix)]
+    let cut = {
+        use std::os::unix::ffi::OsStrExt;
+        OsStr::from_bytes(&name.as_bytes()[..max]).to_owned()
+    };
+    #[cfg(not(unix))]
+    let cut = truncate(OsStr::new(&*name.to_string_lossy()), max);
+    cut
+}
+
+// a hidden name in the same folder, so a rename puts the finished item in place in one step
+pub fn temp_path(dir: &Path, name: &OsStr) -> PathBuf {
+    let stem = truncate(name, NAME_MAX - 1 - PART_SUFFIX.len() - 8);
+    (1..)
+        .map(|n| {
+            let mut temp = OsString::from(".");
+            temp.push(&stem);
+            if n > 1 {
+                temp.push(format!(".{n}"));
+            }
+            temp.push(PART_SUFFIX);
+            dir.join(temp)
+        })
+        .find(|p| !exists_nofollow(p))
+        .expect("an unused name exists")
 }
 
 pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
