@@ -3,3 +3,4 @@ app/.godot/
 app/bin/
 *.import
 build/
+.claude/

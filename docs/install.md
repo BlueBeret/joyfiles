@@ -6,7 +6,7 @@ After you add it, you start Joyfiles from Game Mode and you do not need a mouse.
 
 ## Download
 
-Open the Releases page of the Joyfiles repository on GitHub.
+Open the [Releases page](https://github.com/BlueBeret/joyfiles/releases) of the Joyfiles repository on GitHub.
 Download one file from the newest release.
 
 | Your device | File to download |
