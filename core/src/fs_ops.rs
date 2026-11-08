@@ -61,7 +61,8 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
     }
 }
 
-fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String) {
+// the raw name breaks ties last, so names that differ only in case keep a fixed order
+fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String, String) {
     let (number, kind) = match key {
         SortKey::Name => (0, String::new()),
         SortKey::Size => (e.size as i64, String::new()),
@@ -69,7 +70,47 @@ fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String) {
         SortKey::Type if e.is_dir => (0, String::new()),
         SortKey::Type => (0, extension_of(&e.name)),
     };
-    (!e.is_dir, number, kind, e.name.to_lowercase())
+    (!e.is_dir, number, kind, natural_key(&e.name), e.name.clone())
+}
+
+// a run of digits becomes a zero mark, its length and its digits, so "Level 2" sorts before "Level 10"
+fn natural_key(name: &str) -> String {
+    let mut key = String::with_capacity(name.len() + 8);
+    let mut chars = name.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if !c.is_ascii_digit() {
+            fold(c, &mut key);
+            chars.next();
+            continue;
+        }
+        let mut digits = String::new();
+        while let Some(d) = chars.next_if(char::is_ascii_digit) {
+            digits.push(d);
+        }
+        let value = digits.trim_start_matches('0');
+        key.push('\0');
+        key.push(char::from_u32(value.len() as u32).unwrap_or(char::MAX));
+        key.push_str(value);
+    }
+    key
+}
+
+// base letters for U+00C0 to U+017F, and a zero keeps the letter as it is
+const LATIN: &[u8] = concat!(
+    "aaaaaaaceeeeiiii", "dnooooo\0ouuuuy\0s", "aaaaaaaceeeeiiii", "dnooooo\0ouuuuy\0y",
+    "aaaaaaccccccccdd", "ddeeeeeeeeeegggg", "gggghhhhiiiiiiii", "iiiijjkkklllllll",
+    "lllnnnnnnnnnoooo", "oooorrrrrrssssss", "ssttttttuuuuuuuu", "uuuuwwyyyzzzzzzs",
+)
+.as_bytes();
+const _: () = assert!(LATIN.len() == 0x180 - 0xC0);
+
+// lower case without accents, so "Éclair" sorts next to "eclair" and not after "z"
+fn fold(c: char, out: &mut String) {
+    match c as u32 {
+        0x300..=0x36F => {}
+        n @ 0xC0..0x180 if LATIN[(n - 0xC0) as usize] != 0 => out.push(LATIN[(n - 0xC0) as usize] as char),
+        _ => out.extend(c.to_lowercase()),
+    }
 }
 
 pub fn extension_of(name: &str) -> String {
@@ -400,6 +441,20 @@ mod tests {
         let listed = list_dir(tmp.path(), false, SortKey::Name, false).unwrap();
         assert_eq!(names(listed), ["zdir", "A.txt", "b.txt"]);
         assert_eq!(list_dir(tmp.path(), true, SortKey::Name, false).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn name_sort_is_natural_and_ignores_case_and_accents() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["Game 10", "Game 2", "game 3"] {
+            fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        for name in ["Level 10.txt", "level 3.txt", "Zed.txt", "Level 2.txt", "zebra.txt", "Éclair.txt", "Level 1.txt", "ecran.txt", "file007.txt", "file7b.txt"] {
+            write_sized(tmp.path(), name, 1, 0);
+        }
+        let listed = names(list_dir(tmp.path(), false, SortKey::Name, false).unwrap());
+        let want = ["Game 2", "game 3", "Game 10", "Éclair.txt", "ecran.txt", "file007.txt", "file7b.txt", "Level 1.txt", "Level 2.txt", "level 3.txt", "Level 10.txt", "zebra.txt", "Zed.txt"];
+        assert_eq!(listed, want);
     }
 
     #[test]
