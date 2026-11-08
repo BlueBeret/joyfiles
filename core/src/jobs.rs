@@ -341,8 +341,11 @@ impl Worker<'_> {
         }
         if meta.file_type().is_symlink() {
             copy_symlink(src, dest)?;
-        } else {
+        } else if meta.is_file() {
             copy_file(self.p, src, dest)?;
+        } else {
+            // opening a pipe for reading blocks until a writer comes, so pipes, sockets and devices are skipped
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "it is not a regular file"));
         }
         if delete_source {
             fs::remove_file(src)?;
@@ -525,6 +528,27 @@ mod tests {
         assert_eq!(names_in(&src.join("sub")), ["locked.txt"]);
         assert_eq!(read(there.path().join("d/a.txt")), "a");
         assert_eq!(read(there.path().join("d/sub/b.txt")), "b");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_socket_is_skipped_and_reported_without_a_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        let made = std::process::Command::new("mkfifo").arg(src.join("pipe")).status().unwrap();
+        assert!(made.success());
+        let _socket = std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+        fs::write(src.join("z.txt"), "z").unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), ASK);
+        assert!(matches!(wait(&p), JobState::Failed(_)));
+        assert_eq!(names_in(&out.join("src")), ["a.txt", "z.txt"]);
+        let mut failed: Vec<PathBuf> = p.failures().into_iter().map(|f| f.path).collect();
+        failed.sort();
+        assert_eq!(failed, [src.join("pipe"), src.join("sock")]);
     }
 
     #[test]
