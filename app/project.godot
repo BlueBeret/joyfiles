@@ -16,6 +16,10 @@ window/size/mode=3
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 
+[input_devices]
+
+joypads/ignore_joypad_on_unfocused_application=true
+
 [rendering]
 
 renderer/rendering_method="gl_compatibility"

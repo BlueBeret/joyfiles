@@ -37,17 +37,18 @@ static func install() -> void:
 
 
 static func _event_for(binding: Array) -> InputEvent:
+	var e: InputEvent
 	match binding[0]:
 		BTN:
-			var b := InputEventJoypadButton.new()
-			b.button_index = binding[1]
-			return b
+			e = InputEventJoypadButton.new()
+			e.button_index = binding[1]
 		AXIS:
-			var m := InputEventJoypadMotion.new()
-			m.axis = binding[1]
-			m.axis_value = binding[2]
-			return m
+			e = InputEventJoypadMotion.new()
+			e.axis = binding[1]
+			e.axis_value = binding[2]
 		_:
-			var k := InputEventKey.new()
-			k.physical_keycode = binding[1]
-			return k
+			e = InputEventKey.new()
+			e.physical_keycode = binding[1]
+	# device -1 matches every pad, so a second pad or a pad that Windows renumbers still works
+	e.device = -1
+	return e
