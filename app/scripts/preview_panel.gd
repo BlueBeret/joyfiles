@@ -71,10 +71,14 @@ func refresh() -> void:
 	_thumbs.want(_wanted_paths(), JoyThumbs.PREVIEW_SIDE)
 
 
+func _loadable(e: Dictionary) -> bool:
+	return JoyThumbs.is_image(e["name"]) and not JoyPathText.is_opaque(e["path"])
+
+
 func _step(direction: int) -> void:
 	var i := index + direction
 	while i >= 0 and i < _entries.size():
-		if JoyThumbs.is_image(_entries[i]["name"]):
+		if _loadable(_entries[i]):
 			index = i
 			return
 		i += direction
@@ -85,7 +89,7 @@ func _wanted_paths() -> Array:
 	for direction: int in [1, -1]:
 		var i := index + direction
 		while i >= 0 and i < _entries.size():
-			if JoyThumbs.is_image(_entries[i]["name"]):
+			if _loadable(_entries[i]):
 				paths.append(_entries[i]["path"])
 				break
 			i += direction

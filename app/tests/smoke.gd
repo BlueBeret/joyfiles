@@ -217,6 +217,7 @@ func _run() -> void:
 	await _finish_toasts()
 	await _trash_partial()
 	_props_unknown()
+	await _opaque_paths()
 	_part_files()
 	_glyphs()
 	_keyboard_fallback()
@@ -744,6 +745,13 @@ func _settings_types() -> void:
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
 
 
+func shell(script: String, dir: String) -> void:
+	var output: Array = []
+	OS.set_environment("JF_DIR", dir)
+	var code := OS.execute("bash", ["-c", script], output, true)
+	check(code == 0, "shell step ran (exit %d): %s" % [code, output])
+
+
 func open_jobs_report() -> int:
 	press("jf_jobs")
 	check(app.mode == app.Mode.JOBS, "the jobs button opens the panel")
@@ -891,6 +899,78 @@ func _props_unknown() -> void:
 		check(shown["Size"] == "Unknown (permission denied)" and app.props_panel.scan_done, "its size is unknown too, and no scan runs (%s)" % shown["Size"])
 	press("jf_back")
 	FileAccess.set_unix_permissions(base + "/closed", owner_only)
+
+
+func _opaque_paths() -> void:
+	if OS.get_name() != "Linux":
+		return
+	var base := root_dir + "/opaque"
+	var counter := ErrorCounter.new()
+	OS.add_logger(counter)
+	_png(base + "/ok.png", 16, 16, Color.RED)
+	DirAccess.make_dir_recursive_absolute(base + "/aaa_dir")
+	DirAccess.make_dir_recursive_absolute(base + "/out")
+	shell("cp \"$JF_DIR/ok.png\" \"$JF_DIR/caf$(printf '\\351').png\"", base)
+	shell("printf x > \"$JF_DIR/note$(printf '\\351').txt\"", base)
+	shell("mkdir \"$JF_DIR/dir$(printf '\\351')\" && printf x > \"$JF_DIR/dir$(printf '\\351')/inner.txt\"", base)
+	check(app.core.join(base, "ok.png") == base + "/ok.png", "core.join builds a child path")
+	show(base)
+	var odd: Array = app.entries.filter(func(e: Dictionary) -> bool: return JoyPathText.is_opaque(e["path"]))
+	check(odd.size() == 3, "three entries carry a name that is not valid text (%d)" % odd.size())
+	check(names().has("caf\ufffd.png") and names().has("note\ufffd.txt") and names().has("dir\ufffd"), "the list shows the readable name: %s" % [names()])
+	await until(func(): return app.thumbs.entry(base + "/ok.png", JoyThumbs.THUMB_SIDE).has("tex"), "the valid image next to it still gets a thumbnail")
+	await frames(30)
+	check(not app.thumbs.cache.keys().any(func(k: String) -> bool: return JoyPathText.is_opaque(k)), "no thumbnail is requested for a path that is not valid text")
+	check(counter.count == 0, "listing such a folder raises no engine error (%d)" % counter.count)
+
+	var opened: Array = []
+	app.opener = func(p: String) -> int:
+		opened.append(p)
+		return OK
+	cursor_to("caf\ufffd.png")
+	press("jf_accept")
+	check(app.mode == app.Mode.FILES and opened.is_empty(), "A on such an image neither previews nor hands the path to the system")
+	check(app.last_error.begins_with("Could not open caf\ufffd.png."), "the toast says why it cannot open: %s" % app.last_error)
+	cursor_to("ok.png")
+	press("jf_accept")
+	check(app.mode == app.Mode.PREVIEW, "the valid image still previews")
+	press("jf_right")
+	check(app.preview.current()["name"] == "ok.png", "the preview skips an image whose name is not valid text")
+	press("jf_back")
+	app.opener = func(_path: String) -> int: return OK
+
+	cursor_to("note\ufffd.txt")
+	pick("Rename")
+	check(app._keyboard.text == "note\ufffd.txt", "rename starts from the readable name (%s)" % app._keyboard.text)
+	press("jf_view")
+	cursor_to("note\ufffd.txt")
+	pick("Properties")
+	check(app.props_panel.shown["Name"] == "note\ufffd.txt" and app.props_panel.shown["Path"] == base + "/note\ufffd.txt", "properties show the name field and a path with U+FFFD: %s" % [app.props_panel.shown])
+	press("jf_back")
+	pick("Copy")
+	check(app.clipboard["label"] == "note\ufffd.txt", "the clipboard labels the item with its readable name")
+	app.navigate(base + "/out")
+	pick("Paste")
+	await until(jobs_done, "the copy of such a file ends")
+	check(app._toast_label.text == "Copied note\ufffd.txt." and app.reports.is_empty(), "the toast names the copy: %s" % app._toast_label.text)
+	check(names() == ["note\ufffd.txt"] and JoyPathText.is_opaque(app.entries[0]["path"]), "the copy kept the exact name: %s" % [names()])
+
+	show(base)
+	cursor_to("dir\ufffd")
+	press("jf_accept")
+	check(names() == ["inner.txt"] and JoyPathText.is_opaque(app.cwd), "A opens a folder whose name is not valid text")
+	check(not JoyPathText.is_opaque(app._path_label.text) and app._path_label.text.contains("\ufffd"), "the header shows U+FFFD for the bad byte (%s)" % app._path_label.text)
+	press("jf_back")
+	check(app.cwd == base and app.entries[app.cursor]["name"] == "dir\ufffd", "B goes up and lands on that folder (cursor on %s)" % app.entries[app.cursor]["name"])
+	check(not app._toast_label.text.contains("not available"), "going up from it does not call it a missing folder: %s" % app._toast_label.text)
+	cursor_to("dir\ufffd")
+	pick("Properties")
+	check(app.props_panel.shown["Name"] == "dir\ufffd" and not JoyPathText.is_opaque(app.props_panel.shown["Path"]), "properties of such a folder show a path without escape characters")
+	await until(func(): return app.props_panel.scan_done, "the scan of such a folder ends")
+	check(app.props_panel.shown["Size"].begins_with("1 B"), "the scan counts the file inside (%s)" % app.props_panel.shown["Size"])
+	press("jf_back")
+	check(counter.count == 0, "none of this raises an engine error (%d)" % counter.count)
+	OS.remove_logger(counter)
 
 
 func _part_files() -> void:

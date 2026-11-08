@@ -295,15 +295,38 @@ func go_up() -> void:
 	var parent: String = core.parent_dir(cwd)
 	if parent == "":
 		return
-	if not DirAccess.dir_exists_absolute(cwd):
+	if not _dir_exists(cwd):
 		_leave_missing_folder()
 		return
-	navigate(parent, cwd.get_file() if cwd.get_file() != "" else cwd)
+	navigate(parent, _focus_of(cwd))
+
+
+# the core answers for every path, but Godot cannot open a path that is not valid text
+func _dir_exists(path: String) -> bool:
+	var info: Dictionary = core.props(path)
+	return info["ok"] and info["is_dir"]
+
+
+# the list names a folder by its text, but a path that is not valid text only matches as a whole
+func _focus_of(path: String) -> String:
+	return path if JoyPathText.is_opaque(path) or path.get_file() == "" else path.get_file()
+
+
+# a name from the list is already readable, and any other name loses its escape characters
+func _name_of(path: String) -> String:
+	for e: Dictionary in all_entries:
+		if e["path"] == path:
+			return e["name"]
+	return JoyPathText.printable(path.get_file())
+
+
+func _label_of(paths: PackedStringArray) -> String:
+	return _name_of(paths[0]) if paths.size() == 1 else Theme_.count(paths.size(), "item")
 
 
 # a deleted folder or a removed card leaves a stale list, so move to the nearest folder that still lists
 func _leave_missing_folder() -> void:
-	var gone := cwd.get_file() if cwd.get_file() != "" else cwd
+	var gone := JoyPathText.printable(cwd.get_file() if cwd.get_file() != "" else cwd)
 	var candidates: Array = []
 	var path: String = core.parent_dir(cwd)
 	while path != "":
@@ -321,7 +344,7 @@ func _leave_missing_folder() -> void:
 
 func _pretty_path(path: String) -> String:
 	var home: String = places[0]["path"]
-	return ("~" + path.trim_prefix(home)) if path.begins_with(home) else path
+	return JoyPathText.printable(("~" + path.trim_prefix(home)) if path.begins_with(home) else path)
 
 
 func _back() -> void:
@@ -343,7 +366,7 @@ func _apply_filter(focus_name := "") -> void:
 	cursor = 0
 	if focus_name != "":
 		for i in entries.size():
-			if entries[i]["name"] == focus_name:
+			if entries[i]["name"] == focus_name or entries[i]["path"] == focus_name:
 				cursor = i
 				break
 	top = 0
@@ -376,7 +399,7 @@ func _clamp_view() -> void:
 
 
 func _previewable(e: Dictionary) -> bool:
-	return not e["is_dir"] and JoyThumbs.is_image(e["name"]) and e["size"] <= JoyThumbs.MAX_FILE_BYTES
+	return not e["is_dir"] and JoyThumbs.is_image(e["name"]) and e["size"] <= JoyThumbs.MAX_FILE_BYTES and not JoyPathText.is_opaque(e["path"])
 
 
 func _open_current() -> void:
@@ -394,6 +417,9 @@ func _open_current() -> void:
 
 # a good result is no proof, because Game Mode can accept the call and show nothing
 func _open_file(e: Dictionary) -> void:
+	if JoyPathText.is_opaque(e["path"]):
+		toast("Could not open %s. Its name is not valid text, so no app can be asked to open it." % e["name"], true)
+		return
 	var err: int = opener.call(e["path"])
 	if err == OK:
 		toast("Asked the system to open %s. If nothing happens, open it in Desktop Mode." % e["name"])
@@ -539,7 +565,7 @@ func paste() -> void:
 
 
 func _ask_rename(path: String) -> void:
-	_ask_text("Rename", path.get_file(), func(new_name: String):
+	_ask_text("Rename", _name_of(path), func(new_name: String):
 		var r: Dictionary = core.rename(path, new_name)
 		if r["ok"]:
 			refresh(r["path"].get_file())
@@ -560,10 +586,6 @@ func _ask_filter() -> void:
 	var before := filter
 	_ask_text("Filter this folder", filter, _set_filter, _set_filter, func(): _set_filter(before))
 	_keyboard.set_title(_filter_title())
-
-
-func _label_of(paths: PackedStringArray) -> String:
-	return paths[0].get_file() if paths.size() == 1 else Theme_.count(paths.size(), "item")
 
 
 func _ask_trash(paths: PackedStringArray) -> void:

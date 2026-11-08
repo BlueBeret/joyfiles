@@ -44,15 +44,15 @@ func open(core: JoyCore, path: String) -> void:
 	shown.clear()
 	var info: Dictionary = core.props(path)
 	if not info["ok"]:
-		_put("Name", path.get_file())
-		_put("Path", path)
+		_put("Name", JoyPathText.printable(path.get_file()))
+		_put("Path", JoyPathText.printable(path))
 		_put("Type", "Unknown")
 		_put("Size", info["error"])
 		_put("Modified", "")
 		_put("Contains", "")
 		return
 	_put("Name", info["name"])
-	_put("Path", info["path"])
+	_put("Path", JoyPathText.printable(info["path"]))
 	_put("Type", info["type"] + (" (link)" if info["is_symlink"] else ""))
 	_put("Modified", Theme_.human_date(info["modified"]))
 	if info["is_dir"] and info["items"] < 0:

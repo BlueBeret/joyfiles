@@ -36,6 +36,8 @@ func texture(path: String, side: int) -> Texture2D:
 func want(paths: Array, side: int) -> void:
 	_queue.clear()
 	for path: String in paths:
+		if JoyPathText.is_opaque(path):
+			continue
 		var key := key_of(path, side)
 		if not cache.has(key) and not _active.has(key):
 			_queue.append([key, path, side])
