@@ -16,6 +16,7 @@ const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
 var start_path := ""
 var settings_path := "user://settings.cfg"
 var opener := Callable()
+var places_source := Callable()
 var core := JoyCore.new()
 var settings: JoySettings
 var thumbs := JoyThumbs.new()
@@ -81,6 +82,8 @@ func _ready() -> void:
 	settings.load_file()
 	if not opener.is_valid():
 		opener = _shell_open
+	if not places_source.is_valid():
+		places_source = core.places
 	_build_ui()
 	_handlers = {
 		Mode.FILES: _files_action,
@@ -107,7 +110,7 @@ func _ready() -> void:
 		Mode.JOBS: func(): jobs_panel.update(jobs),
 		Mode.PREVIEW: preview.refresh,
 	}
-	places = core.places()
+	places = places_source.call()
 	var arg_path := _arg_path()
 	navigate(arg_path if arg_path != "" else (start_path if start_path != "" else places[0]["path"]))
 	_render()
