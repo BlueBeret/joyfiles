@@ -2,3 +2,4 @@ core/target/
 app/.godot/
 app/bin/
 *.import
+build/
