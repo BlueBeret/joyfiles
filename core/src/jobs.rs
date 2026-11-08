@@ -511,23 +511,76 @@ fn copy_file(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
 fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
     let meta = input.metadata()?;
     let mut output = create_private_file(part, &meta)?;
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        if p.cancel.load(Ordering::Relaxed) {
-            return Err(io::Error::other("Cancelled."));
-        }
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        output.write_all(&buf[..n])?;
-        p.add_done(n as u64);
+    if !copy_sparse(p, input, &mut output, &meta)? {
+        copy_range(p, input, &mut output, u64::MAX)?;
     }
     if let Ok(times) = file_times(&meta) {
         let _ = output.set_times(times);
     }
     let _ = output.set_permissions(copy_permissions(&meta));
     Ok(())
+}
+
+// copies up to count bytes from the current positions and stops early at the end of the input
+fn copy_range(p: &Progress, input: &mut File, output: &mut File, count: u64) -> io::Result<()> {
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = count;
+    while left > 0 {
+        if p.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("Cancelled."));
+        }
+        let n = input.read(&mut buf[..left.min(1 << 20) as usize])?;
+        if n == 0 {
+            break;
+        }
+        output.write_all(&buf[..n])?;
+        p.add_done(n as u64);
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+// a file with holes keeps them, so a sparse disk image does not fill the drive, and false asks for the plain copy
+#[cfg(target_os = "linux")]
+fn copy_sparse(p: &Progress, input: &mut File, output: &mut File, meta: &fs::Metadata) -> io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    if meta.blocks() * 512 >= meta.len() {
+        return Ok(false);
+    }
+    let fd = input.as_raw_fd();
+    // ENXIO means no data after the offset
+    let seek = |pos: u64, whence: i32| match unsafe { libc::lseek(fd, pos as libc::off_t, whence) } {
+        -1 => match io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+            e => Err(e),
+        },
+        at => Ok(Some(at as u64)),
+    };
+    let (mut pos, mut copied) = (0, 0);
+    while pos < meta.len() {
+        let data = match seek(pos, libc::SEEK_DATA) {
+            Ok(Some(data)) => data,
+            Ok(None) => break,
+            Err(e) if pos == 0 && e.raw_os_error() == Some(libc::EINVAL) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let hole = seek(data, libc::SEEK_HOLE)?.unwrap_or(meta.len()).min(meta.len());
+        input.seek(SeekFrom::Start(data))?;
+        output.seek(SeekFrom::Start(data))?;
+        copy_range(p, input, output, hole - data)?;
+        copied += hole - data;
+        pos = hole;
+    }
+    output.set_len(meta.len())?;
+    p.add_done(meta.len().saturating_sub(copied));
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_sparse(_p: &Progress, _input: &mut File, _output: &mut File, _meta: &fs::Metadata) -> io::Result<bool> {
+    Ok(false)
 }
 
 fn remove_tree(path: &Path) -> io::Result<()> {
@@ -795,6 +848,30 @@ mod tests {
         }
         assert_eq!(dir_mode, 0o700, "the new folder is private from the start");
         assert!(part_modes.iter().all(|m| m & 0o077 == 0), "the unfinished file is private: {part_modes:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sparse_file_stays_sparse_and_keeps_its_bytes() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("disk.img");
+        let f = File::create(&src).unwrap();
+        f.set_len(64 << 20).unwrap();
+        f.write_all_at(b"head", 0).unwrap();
+        f.write_all_at(b"middle", 32 << 20).unwrap();
+        if fs::metadata(&src).unwrap().blocks() * 512 >= 64 << 20 {
+            eprintln!("skipped: this drive does not keep holes");
+            return;
+        }
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        let used = fs::metadata(out.join("disk.img")).unwrap().blocks() * 512;
+        assert!(used < 4 << 20, "the copy uses {used} bytes on the drive");
+        assert!(fs::read(out.join("disk.img")).unwrap() == fs::read(&src).unwrap(), "the bytes are the same");
+        assert_eq!(p.done_bytes.load(Ordering::Relaxed), p.total_bytes.load(Ordering::Relaxed));
     }
 
     #[test]
