@@ -445,9 +445,14 @@ func _set_clipboard(paths: PackedStringArray, is_move: bool) -> void:
 
 func paste() -> void:
 	var id: int = core.start_job(clipboard["move"], clipboard["paths"], cwd)
-	jobs[id] = {"dest": cwd}
+	var watch := [cwd]
 	if clipboard["move"]:
+		for path: String in clipboard["paths"]:
+			var parent: String = core.parent_dir(path)
+			if parent not in watch:
+				watch.append(parent)
 		clipboard = {"move": false, "paths": PackedStringArray()}
+	jobs[id] = {"watch": watch}
 
 
 func _ask_rename(path: String) -> void:
@@ -538,7 +543,7 @@ func _poll_jobs() -> void:
 				toast("The job was cancelled.")
 		if job["state"] != "running":
 			ended = true
-			if jobs[id]["dest"] == cwd:
+			if cwd in jobs[id].get("watch", []):
 				refresh()
 			jobs.erase(id)
 	_ask_next_conflict()
