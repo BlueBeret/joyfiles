@@ -466,7 +466,7 @@ impl Worker<'_> {
     }
 
     fn swap_with(&self, new: &Path, target: &Path, aside: &Path) -> io::Result<()> {
-        fs::rename(target, aside)?;
+        rename_noreplace(target, aside)?;
         if let Err(e) = rename_noreplace(new, target) {
             if let Err(back) = rename_noreplace(aside, target) {
                 self.surface(aside, target, "Could not put back the old", &back);

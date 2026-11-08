@@ -222,15 +222,15 @@ pub fn rename(path: &Path, new_name: impl AsRef<OsStr>) -> Result<PathBuf, Strin
         }
         // a drive that ignores case treats a direct rename to the new case as a rename that changes nothing
         let temp = parts::park_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default(), parts::Owner::rename()).map_err(failed)?;
-        let moved = fs::rename(path, &temp).and_then(|()| fs::rename(&temp, &dest));
+        let moved = rename_noreplace(path, &temp).and_then(|()| rename_noreplace(&temp, &dest));
         if moved.is_err() && exists_nofollow(&temp) {
-            let _ = fs::rename(&temp, path);
+            let _ = rename_noreplace(&temp, path);
         }
         parts::clear_hold(&temp, path);
         moved.map_err(failed)?;
         return Ok(dest);
     }
-    fs::rename(path, &dest).map_err(failed)?;
+    rename_noreplace(path, &dest).map_err(|e| if e.kind() == io::ErrorKind::AlreadyExists { format!("\"{new_name}\" already exists.") } else { failed(e) })?;
     Ok(dest)
 }
 
@@ -475,7 +475,45 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    // a hard link fails when the new name exists, so only a plain file can take this way
+    if fs::symlink_metadata(from).is_ok_and(|m| m.is_file()) {
+        match fs::hard_link(from, to) {
+            Ok(()) => return fs::remove_file(from).or_else(|e| fs::remove_file(to).and(Err(e))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => {}
+        }
+    }
+    checked_rename(from, to)
+}
+
+// without the replace flag the call fails when the new name exists
+#[cfg(windows)]
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let wide = |p: &Path| {
+        let full = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut text: Vec<u16> = full.as_os_str().encode_wide().collect();
+        let plain_disk = matches!(full.components().next(), Some(std::path::Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::Disk(_)));
+        if plain_disk && text.len() >= 240 {
+            text.splice(0..0, r"\\?\".encode_utf16());
+        }
+        text.push(0);
+        text
+    };
+    let (a, b) = (wide(from), wide(to));
+    if unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), 0) } != 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    Err(if exists_nofollow(to) { io::ErrorKind::AlreadyExists.into() } else { err })
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     checked_rename(from, to)
 }
@@ -1095,5 +1133,38 @@ mod tests {
         assert!(!inside("/t/out", "/t/tm/elsewhere"), "another folder of the same drive");
         assert!(!inside("/t/out", "/t/other/src"), "another drive");
         assert!(!inside("/t/tm/src", "/t/out"), "the parent is not inside the bind mount");
+    }
+
+    #[test]
+    fn a_rename_never_replaces_a_name_that_a_second_writer_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+        fs::write(&dest, "kept").unwrap();
+        fs::write(&src, "src").unwrap();
+        assert_eq!(rename_noreplace(&src, &dest).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!((read_to(&src), read_to(&dest)), ("src".into(), "kept".into()));
+        fs::remove_file(&dest).unwrap();
+        rename_noreplace(&src, &dest).unwrap();
+        assert_eq!(read_to(&dest), "src");
+        for _ in 0..300 {
+            let _ = fs::remove_file(&dest);
+            fs::write(&src, "src").unwrap();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (stop, path) = (done.clone(), dest.clone());
+            let racer = std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok_and(|mut f| io::Write::write_all(&mut f, b"racer").is_ok()) {
+                        return true;
+                    }
+                }
+                false
+            });
+            let result = rename(&src, "dest");
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            if racer.join().unwrap() {
+                assert!(result.is_err(), "the rename replaced the file of the second writer");
+                assert_eq!(read_to(&dest), "racer");
+            }
+        }
     }
 }
