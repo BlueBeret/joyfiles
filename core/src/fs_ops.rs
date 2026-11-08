@@ -34,12 +34,16 @@ impl SortKey {
     }
 }
 
+// a stat denied for an entry means the folder itself cannot be searched, so the list fails instead of showing empty
 pub fn list_dir(dir: &Path, show_hidden: bool, key: SortKey, descending: bool) -> io::Result<Vec<Entry>> {
-    let mut entries: Vec<Entry> = fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .filter_map(|e| stat_entry(&e.path()))
-        .filter(|e| show_hidden || !e.hidden)
-        .collect();
+    let mut entries = Vec::new();
+    for item in fs::read_dir(dir)?.filter_map(Result::ok) {
+        match read_entry(&item.path()) {
+            Ok(e) if show_hidden || !e.hidden => entries.push(e),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
+            _ => {}
+        }
+    }
     sort_entries(&mut entries, key, descending);
     Ok(entries)
 }
@@ -86,15 +90,19 @@ pub fn type_label(name: &str, is_dir: bool) -> String {
 }
 
 pub fn stat_entry(path: &Path) -> Option<Entry> {
+    read_entry(path).ok()
+}
+
+fn read_entry(path: &Path) -> io::Result<Entry> {
     // fs::metadata follows symlinks so a link to a folder opens like a folder
-    let meta = fs::metadata(path).or_else(|_| fs::symlink_metadata(path)).ok()?;
-    let name = path.file_name()?.to_string_lossy().into_owned();
+    let meta = fs::metadata(path).or_else(|_| fs::symlink_metadata(path))?;
+    let name = path.file_name().ok_or_else(|| io::Error::other("The path has no name."))?.to_string_lossy().into_owned();
     let modified = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs() as i64);
-    Some(Entry {
+    Ok(Entry {
         hidden: is_hidden(&name, &meta),
         is_dir: meta.is_dir(),
         size: if meta.is_dir() { 0 } else { meta.len() },
@@ -501,6 +509,24 @@ mod tests {
         assert!(rename(&a, "x/y").is_err());
         assert!(rename(&a, "b").is_err());
         assert_eq!(rename(&a, " c ").unwrap(), tmp.path().join("c"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_lists_but_cannot_be_searched_is_an_error_not_an_empty_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let half = tmp.path().join("halfperm");
+        fs::create_dir(&half).unwrap();
+        fs::write(half.join("z"), "z").unwrap();
+        fs::set_permissions(&half, fs::Permissions::from_mode(0o600)).unwrap();
+        let searchable = fs::metadata(half.join("z")).is_ok();
+        let listed = list_dir(&half, true, SortKey::Name, false);
+        fs::set_permissions(&half, fs::Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            return;
+        }
+        assert_eq!(listed.map_err(|e| e.kind()), Err(io::ErrorKind::PermissionDenied));
     }
 
     // the test removes what it put in the trash, found by the temp folder it came from

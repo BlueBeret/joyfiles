@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use crate::fs_ops::{stat_entry, type_label};
+use crate::fs_ops::{reason, stat_entry, type_label};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Props {
@@ -16,13 +16,14 @@ pub struct Props {
     pub is_symlink: bool,
     pub size: u64,
     pub modified: i64,
-    pub items: Option<u64>,
+    // empty for a file, and the reason as an error when a folder cannot be read
+    pub items: Option<Result<u64, String>>,
 }
 
 pub fn props(path: &Path) -> io::Result<Props> {
     let link = fs::symlink_metadata(path)?;
     let entry = stat_entry(path).ok_or_else(|| io::Error::other("The item cannot be read."))?;
-    let items = entry.is_dir.then(|| fs::read_dir(path).map_or(0, |rd| rd.filter_map(Result::ok).count() as u64));
+    let items = entry.is_dir.then(|| fs::read_dir(path).map(|rd| rd.filter_map(Result::ok).count() as u64).map_err(|e| reason(&e)));
     Ok(Props {
         type_label: type_label(&entry.name, entry.is_dir),
         is_symlink: link.file_type().is_symlink(),
@@ -103,13 +104,31 @@ mod tests {
     fn props_of_a_folder_count_direct_children_only() {
         let tmp = tree();
         let p = props(&tmp.path().join("d")).unwrap();
-        assert_eq!((p.type_label.as_str(), p.is_dir, p.items), ("Folder", true, Some(2)));
+        assert_eq!((p.type_label.as_str(), p.is_dir, p.items), ("Folder", true, Some(Ok(2))));
     }
 
     #[test]
     fn props_of_a_missing_path_is_an_error() {
         let tmp = tree();
         assert!(props(&tmp.path().join("nope")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn props_of_a_folder_that_cannot_be_read_give_no_item_count() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tree();
+        let d = tmp.path().join("d");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&d).is_ok();
+        let p = props(&d);
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
+        let p = p.unwrap();
+        assert!(p.is_dir);
+        assert_eq!(p.items, Some(Err("permission denied".into())));
     }
 
     #[cfg(unix)]

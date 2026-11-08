@@ -84,7 +84,11 @@ impl JoyCore {
                 }
                 vdict! { "ok" => true, "entries" => &arr, "error" => "" }
             }
-            Err(e) => vdict! { "ok" => false, "entries" => &VarArray::new(), "error" => e.to_string().as_str() },
+            Err(e) => {
+                let name = Path::new(&path.to_string()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+                let error = format!("Could not open \"{name}\": {}.", fs_ops::reason(&e));
+                vdict! { "ok" => false, "entries" => &VarArray::new(), "error" => error.as_str() }
+            }
         }
     }
 
@@ -154,6 +158,7 @@ impl JoyCore {
         self.jobs.get(&id).is_some_and(|p| p.answer(choice, apply_all))
     }
 
+    // items is -1 for a file and for a folder that cannot be read, and items_error then gives the reason
     #[func]
     fn props(&self, path: GString) -> VarDictionary {
         match props::props(&path_of(&path)) {
@@ -167,7 +172,8 @@ impl JoyCore {
                 "is_symlink" => p.is_symlink,
                 "size" => p.size as i64,
                 "modified" => p.modified,
-                "items" => p.items.map_or(-1, |n| n as i64),
+                "items" => p.items.clone().and_then(Result::ok).map_or(-1, |n| n as i64),
+                "items_error" => p.items.and_then(Result::err).unwrap_or_default().as_str(),
             },
             Err(e) => vdict! { "ok" => false, "error" => e.to_string().as_str() },
         }
