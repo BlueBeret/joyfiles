@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  GODOT_VERSION: "4.7.2"
+  JF_GODOT_VERSION: "4.7.2"
+  JF_JOBS: "4"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 squashfs-tools wine zip
+
+      - name: Install rust target
+        run: |
+          rustup update stable --no-self-update
+          rustup target add x86_64-pc-windows-gnu
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            core/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable
+          key: godot-templates-${{ env.GODOT_VERSION }}
+
+      - name: Install Godot
+        run: |
+          base="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable"
+          zip="Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          mkdir -p "$RUNNER_TEMP/godot"
+          cd "$RUNNER_TEMP/godot"
+          curl -fsSL --retry 3 -O "$base/$zip" -O "$base/SHA512-SUMS.txt"
+          awk -v f="$zip" '$2 == f' SHA512-SUMS.txt | sha512sum -c -
+          unzip -q "$zip"
+          mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" godot
+          echo "$RUNNER_TEMP/godot" >> "$GITHUB_PATH"
+
+      - name: Cargo test
+        working-directory: core
+        run: cargo test
+
+      - name: Build Linux library
+        run: scripts/build.sh --release --only linux
+
+      - name: Smoke test
+        run: |
+          scripts/import.sh
+          mkdir -p "$RUNNER_TEMP/smoke"
+          JF_TEST_DIR="$RUNNER_TEMP/smoke" godot --headless --path app -s tests/smoke.gd > smoke.log
+          cat smoke.log
+          grep -q '^RESULT OK' smoke.log
+
+      - name: Export Linux and Windows
+        run: scripts/export.sh all
+
+      - name: Check Linux export
+        run: scripts/check-export.sh linux
+
+      - name: Check Windows export under wine
+        run: scripts/check-export.sh windows
+
+      - name: Package
+        run: |
+          args=()
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            args=(--version "${GITHUB_REF_NAME#v}")
+          fi
+          scripts/package.sh --no-export "${args[@]}"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: joyfiles-linux-x86_64
+          path: build/linux
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: joyfiles-windows-x86_64
+          path: build/windows
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: joyfiles-dist
+          path: build/dist
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: joyfiles-dist
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
