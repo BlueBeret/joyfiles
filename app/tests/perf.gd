@@ -49,6 +49,7 @@ func _run() -> void:
 	app = scene.instantiate()
 	app.start_path = small
 	app.settings_path = small.get_base_dir() + "/jf_perf_settings.cfg"
+	app.opener = func(_path: String) -> int: return OK
 	root.add_child(app)
 	await process_frame
 	await drawn()

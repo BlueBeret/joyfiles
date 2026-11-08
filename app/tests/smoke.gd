@@ -106,6 +106,7 @@ func start_app(path: String) -> Control:
 	var instance: Control = scene.instantiate()
 	instance.start_path = path
 	instance.settings_path = settings_file
+	instance.opener = func(_path: String) -> int: return OK
 	root.add_child(instance)
 	return instance
 

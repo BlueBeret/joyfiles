@@ -140,6 +140,7 @@ func _run() -> void:
 	make_content()
 	app = load("res://main.tscn").instantiate()
 	app.start_path = base
+	app.opener = func(_path: String) -> int: return OK
 	app.settings_path = base.get_base_dir() + "/jf_shot_settings.cfg"
 	root.add_child(app)
 	await until(func(): return app.thumbs.cache.size() >= 3, 120)
