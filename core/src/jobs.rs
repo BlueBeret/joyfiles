@@ -362,7 +362,7 @@ impl Worker<'_> {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "it is not a regular file"));
         }
         if delete_source {
-            fs::remove_file(src)?;
+            remove_item(src)?;
         }
         Ok(())
     }
@@ -433,9 +433,28 @@ fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
     })
 }
 
-#[cfg(not(unix))]
+// Windows keeps file links and folder links apart, so the copy makes the same kind
+#[cfg(windows)]
 fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
-    fs::copy(src, dest).map(|_| ())
+    use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
+    let target = fs::read_link(src)?;
+    if fs::symlink_metadata(src)?.file_type().is_symlink_dir() {
+        symlink_dir(target, dest)
+    } else {
+        symlink_file(target, dest)
+    }
+}
+
+// removes one item that is not a real folder, and on Windows a folder link needs the folder call
+fn remove_item(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if fs::symlink_metadata(path)?.file_type().is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
+    fs::remove_file(path)
 }
 
 // the bytes go to a temporary name first, so a crash or an error never leaves a short file under the real name
@@ -480,7 +499,7 @@ fn remove_tree(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path)?.is_dir() {
         fs::remove_dir_all(path)
     } else {
-        fs::remove_file(path)
+        remove_item(path)
     }
 }
 
@@ -492,9 +511,13 @@ mod tests {
     const ASK: Policy = Policy::Ask;
 
     fn wait(p: &Progress) -> JobState {
+        wait_up_to(p, 10)
+    }
+
+    fn wait_up_to(p: &Progress, secs: u64) -> JobState {
         let start = Instant::now();
         while p.state() == JobState::Running {
-            assert!(start.elapsed() < Duration::from_secs(10), "job finished in time");
+            assert!(start.elapsed() < Duration::from_secs(secs), "job finished in time");
             thread::sleep(Duration::from_millis(5));
         }
         p.state()
@@ -703,6 +726,33 @@ mod tests {
         assert!(p.wait_finished(Instant::now() + Duration::from_secs(10)));
         assert_eq!(p.state(), JobState::Cancelled);
         assert!(names_in(&out).is_empty(), "the temporary file is gone");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn links_copy_as_links_and_a_folder_link_can_be_replaced_on_windows() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("f.txt"), "f").unwrap();
+        if symlink_file("f.txt", src.join("flink")).is_err() {
+            eprintln!("skipped: this user cannot make links");
+            return;
+        }
+        symlink_dir("sub", src.join("dlink")).unwrap();
+        symlink_file("nowhere.txt", src.join("broken")).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), ASK);
+        assert_eq!(wait_up_to(&p, 180), JobState::Done);
+        for name in ["flink", "dlink", "broken"] {
+            assert!(fs::symlink_metadata(out.join("src").join(name)).unwrap().file_type().is_symlink(), "{name} stays a link");
+        }
+        fs::write(tmp.path().join("dlink"), "plain").unwrap();
+        let p = spawn(JobKind::Copy, vec![tmp.path().join("dlink")], out.join("src"), Policy::Always(Resolution::Replace));
+        assert_eq!(wait_up_to(&p, 180), JobState::Done, "a file replaces a folder link");
+        assert_eq!(read(out.join("src/dlink")), "plain");
     }
 
     #[test]
