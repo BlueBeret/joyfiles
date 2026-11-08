@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -36,25 +36,31 @@ impl Role {
 pub struct Owner {
     pid: u32,
     job: u64,
+    // the start time of the process, so a new process that took the pid of a dead one is not taken for it
+    start: Option<u64>,
 }
 
 impl Owner {
     // job 0 stands for a rename, which never outlives its call
     pub fn rename() -> Self {
-        Owner { pid: std::process::id(), job: 0 }
+        Owner { pid: std::process::id(), job: 0, start: own_start() }
+    }
+
+    fn is_this_process(self) -> bool {
+        self.pid == std::process::id() && self.start.is_none_or(|start| Some(start) == own_start())
     }
 
     fn is_live(self) -> bool {
-        if self.pid != std::process::id() {
-            return process_alive(self.pid);
+        if !self.is_this_process() {
+            return process_alive(self);
         }
         self.job == 0 || LIVE.lock().unwrap().contains(&self.job)
     }
 
     // true only when a check proves the owner ended, and a system with no cheap check never proves it
     fn has_ended(self) -> bool {
-        if self.pid != std::process::id() {
-            return cfg!(target_os = "linux") && !process_alive(self.pid);
+        if !self.is_this_process() {
+            return cfg!(target_os = "linux") && !process_alive(self);
         }
         !self.is_live()
     }
@@ -75,7 +81,7 @@ impl LiveJob {
     }
 
     pub fn owner(&self) -> Owner {
-        Owner { pid: std::process::id(), job: self.0 }
+        Owner { pid: std::process::id(), job: self.0, start: own_start() }
     }
 }
 
@@ -100,7 +106,8 @@ pub fn temp_path(dir: &Path, name: &OsStr, owner: Owner, role: Role) -> PathBuf 
 }
 
 fn tag(owner: Owner, role: Role, n: u64) -> String {
-    format!(".{}-{}-{n}{}", owner.pid, owner.job, role.suffix())
+    let start = owner.start.map_or(String::new(), |start| format!("-{start}"));
+    format!(".{}-{}-{n}{start}{}", owner.pid, owner.job, role.suffix())
 }
 
 // the old item keeps its whole name, so a name too long for the tag goes into a hidden folder with a short name
@@ -163,7 +170,12 @@ fn parse_owner(tag: &[u8]) -> Option<Owner> {
     let text = std::str::from_utf8(tag).ok()?;
     let mut parts = text.split('-');
     let (pid, job, _n) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse::<u64>().ok()?);
-    parts.next().is_none().then_some(Owner { pid, job })
+    // an older version wrote no start time, so such an owner is known by its pid alone
+    let start = match parts.next() {
+        Some(text) => Some(text.parse().ok()?),
+        None => None,
+    };
+    parts.next().is_none().then_some(Owner { pid, job, start })
 }
 
 // the list never shows such an item, even with hidden files shown
@@ -171,15 +183,46 @@ pub fn is_temp_name(name: &OsStr) -> bool {
     parse(name).is_some()
 }
 
+// the start time in clock ticks since boot, which is field 22 of the stat line and follows the name in parentheses
 #[cfg(target_os = "linux")]
-fn process_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+fn start_of(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    fields.nth(19)?.parse().ok()
+}
+
+// a zombie has ended, and a pid with another start time belongs to a new process
+#[cfg(target_os = "linux")]
+fn process_alive(owner: Owner) -> bool {
+    let pid = owner.pid;
+    if !Path::new("/proc").join(pid.to_string()).exists() {
+        return false;
+    }
+    let zombie = fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat.rfind(')').is_some_and(|at| stat[at + 1..].trim_start().starts_with('Z')));
+    if zombie {
+        return false;
+    }
+    match (owner.start, start_of(pid)) {
+        (Some(was), Some(now)) => was == now,
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn own_start() -> Option<u64> {
+    static START: OnceLock<Option<u64>> = OnceLock::new();
+    *START.get_or_init(|| start_of(std::process::id()))
 }
 
 // without a cheap check the age alone decides
 #[cfg(not(target_os = "linux"))]
-fn process_alive(_pid: u32) -> bool {
+fn process_alive(_owner: Owner) -> bool {
     false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn own_start() -> Option<u64> {
+    None
 }
 
 // an old item is user data that waits for a replace, so an owner that ended frees it at once, whatever the date of the data
@@ -339,5 +382,30 @@ mod tests {
         sweep(dir, SAFE_AGE, &AtomicBool::new(false));
         assert_eq!(fs::read_to_string(dir.join("edited.txt")).unwrap(), "edited a minute ago");
         assert!(kept.exists(), "the live job keeps its old item");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_frees_items_of_a_pid_that_another_process_reuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let me = std::process::id();
+        let start = own_start().unwrap();
+        let reused = |name: &str, role: Role, start: u64| {
+            let path = dir.join(format!(".{name}.{me}-5-1-{start}{}", role.suffix()));
+            fs::write(&path, "data").unwrap();
+            backdate(&path);
+            path
+        };
+        let old = reused("report.txt", Role::Old, start + 1);
+        let part = reused("big.bin", Role::Part, start + 1);
+        let live = LiveJob::start();
+        let own_part = temp_path(dir, OsStr::new("mine.bin"), live.owner(), Role::Part);
+        fs::write(&own_part, "data").unwrap();
+        backdate(&own_part);
+        sweep(dir, SAFE_AGE, &AtomicBool::new(false));
+        assert_eq!(fs::read_to_string(dir.join("report.txt")).unwrap(), "data", "the old item got its name back");
+        assert!(!old.exists() && !part.exists(), "a pid with another start time is not the owner");
+        assert!(own_part.exists(), "the same pid with the same start time keeps its item");
     }
 }
