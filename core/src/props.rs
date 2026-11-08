@@ -43,7 +43,7 @@ pub struct SizeScan {
     pub bytes: AtomicU64,
     pub files: AtomicU64,
     pub folders: AtomicU64,
-    // folders the scan could not read, so the totals miss what they hold
+    // folders or items the scan could not read, so the totals miss what they hold
     pub skipped: AtomicU64,
     pub done: AtomicBool,
     pub cancel: AtomicBool,
@@ -90,13 +90,19 @@ fn scan_tree(scan: &SizeScan, root: &Path) {
             continue;
         };
         for entry in read.filter_map(Result::ok) {
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                scan.skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
             if kind.is_dir() {
                 scan.folders.fetch_add(1, Ordering::Relaxed);
                 pending.push(entry.path());
             } else {
                 scan.files.fetch_add(1, Ordering::Relaxed);
-                let Ok(meta) = entry.metadata() else { continue };
+                let Ok(meta) = entry.metadata() else {
+                    scan.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
                 if !is_second_name(&meta, &mut seen) {
                     scan.bytes.fetch_add(meta.len(), Ordering::Relaxed);
                 }
@@ -223,5 +229,21 @@ mod tests {
         assert_eq!(scan.skipped.load(Ordering::Relaxed), u64::from(!readable));
         assert_eq!(bytes, 1525 + if readable { 700 } else { 0 }, "the second name of a.bin adds no bytes");
         assert_eq!(scan.files.load(Ordering::Relaxed), if readable { 5 } else { 4 });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_lists_but_hides_sizes_counts_as_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tree();
+        let ro = tmp.path().join("d/ro");
+        fs::create_dir(&ro).unwrap();
+        fs::write(ro.join("a"), "0123456789").unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o444)).unwrap();
+        let hidden = fs::metadata(ro.join("a")).is_err();
+        let scan = SizeScan::default();
+        scan_tree(&scan, &tmp.path().join("d"));
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), u64::from(hidden));
     }
 }
