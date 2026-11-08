@@ -196,6 +196,7 @@ func _run() -> void:
 	await _properties()
 	await _sorting()
 	await _filtering()
+	_filter_selection()
 	await _images()
 	await _preview_replay()
 	await _opening()
@@ -601,6 +602,40 @@ func _settings_types() -> void:
 	check(unknown.sort_key == "name" and unknown.show_hidden, "an unknown sort key falls back to name")
 	var good := _load_settings('[view]\nsort_key="type"\nshow_hidden=true\nsort_desc=true\n')
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
+
+
+func menu_labels() -> Array:
+	return app.menu_items.map(func(i): return i[0])
+
+
+func _filter_selection() -> void:
+	var base := root_dir + "/hiding"
+	for n in ["photo_a.txt", "photo_b.txt", "doc1.txt", "doc2.txt", "doc3.txt", "doc4.txt"]:
+		write("%s/%s" % [base, n], "x")
+	app.navigate(base)
+	pick("Select all")
+	check(app.selected.size() == 6, "select all marks the six items")
+	app._set_filter("photo")
+	check(app.targets().size() == 2, "actions skip the selected items that the filter hides (%d)" % app.targets().size())
+	press("jf_menu")
+	check("Copy (2)" in menu_labels() and "Move to trash (2)" in menu_labels(), "the file menu counts only the visible selection: %s" % [menu_labels()])
+	press("jf_back")
+	_trash_text_of_filtered()
+	app._set_filter("")
+	check(app.targets().size() == 6, "clearing the filter brings the whole selection back (%d)" % app.targets().size())
+
+	app.selected.clear()
+	app.selected[base + "/doc1.txt"] = true
+	app._set_filter("photo")
+	check(app.targets() == PackedStringArray([app.entries[app.cursor]["path"]]), "a selection that the filter hides leaves the cursor item as the target")
+	app._set_filter("")
+	app.selected.clear()
+
+
+func _trash_text_of_filtered() -> void:
+	pick("Move to trash")
+	check(app.mode == app.Mode.CONFIRM and app._confirm_label.text == "Move 2 items to the trash?", "the trash question names the visible items (%s)" % app._confirm_label.text)
+	press("jf_back")
 
 
 func _bytes(n: int) -> PackedByteArray:
