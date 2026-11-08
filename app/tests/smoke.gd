@@ -235,6 +235,7 @@ func _run() -> void:
 	_contrast()
 	await _round3_layout()
 	await _round4_text()
+	await _round5_text()
 	app.queue_free()
 	await frames()
 	var input_suite: GDScript = load("res://tests/input.gd")
@@ -1294,6 +1295,7 @@ func _opaque_paths() -> void:
 	after_rename.sort()
 	before_rename.sort()
 	check(after_rename == before_rename, "OK on an unedited rename keeps the exact name: %s" % [after_rename])
+	check(not (app._toast_panel.visible and app._toast_label.text.contains("is hidden")) and app.entries[app.cursor]["name"] == "note\ufffd.txt", "an unedited rename of such a name gives no hidden notice and keeps the cursor (%s, %s)" % [app._toast_label.text, app.entries[app.cursor]["name"]])
 	cursor_to("note\ufffd.txt")
 	pick("Properties")
 	check(app.props_panel.shown["Name"] == "note\ufffd.txt" and app.props_panel.shown["Path"] == base + "/note\ufffd.txt", "properties show the name field and a path with U+FFFD: %s" % [app.props_panel.shown])
@@ -1547,3 +1549,100 @@ func _bytes(n: int) -> PackedByteArray:
 	b.resize(n)
 	b.fill(7)
 	return b
+
+
+func _listed(dir: String) -> Array:
+	var out: Array = []
+	for n in DirAccess.get_files_at(dir):
+		out.append(n)
+	return out
+
+
+# opens a rename on the file, sets the edited text and submits it
+func _rename_to(path: String, edit: Callable) -> void:
+	app.navigate(path.get_base_dir())
+	app.settings.show_hidden = true
+	app.refresh()
+	app._ask_rename(path)
+	var text: String = edit.call(app._keyboard.text)
+	app._keyboard.text = text
+	app._on_keyboard_submitted(text)
+
+
+func _round5_text() -> void:
+	var dir := root_dir + "/r5"
+	app.settings.show_hidden = true
+	for name: String in ["a\u202Eb.txt", "e" + "\u0301".repeat(8) + ".txt", "z\u200Bw.txt", "t\tab.txt", "\uFEFFbom.txt", "sp\u200Cj.txt"]:
+		write(dir + "/" + name, "x")
+		_rename_to(dir + "/" + name, func(t: String) -> String: return t + "x")
+		check(FileAccess.file_exists(dir + "/" + name + "x"), "an edited rename keeps the hidden parts of %s (%s)" % [JoyPathText.printable(name), _listed(dir).map(func(n: String) -> String: return JoyPathText.printable(n))])
+		check(not _listed(dir).any(func(n: String) -> bool: return n.contains("<U+") or n.contains("marks>")), "no marker text reaches a real name")
+		DirAccess.remove_absolute(dir + "/" + name + "x")
+	write(dir + "/lit<U+202E>.txt", "x")
+	_rename_to(dir + "/lit<U+202E>.txt", func(t: String) -> String: return t + "x")
+	check(FileAccess.file_exists(dir + "/lit<U+202E>.txtx"), "a literal marker in the original name stays literal")
+	var path := dir + "/a\u202Eb.txt"
+	write(path, "x")
+	_rename_to(path, func(t: String) -> String: return t.left(t.length() - 6) + "x")
+	check(FileAccess.file_exists(path) and app._toast_label.text.begins_with("Rename refused"), "an edit that cuts a mark in half is refused with a message (%s)" % app._toast_label.text)
+	_rename_to(path, func(_t: String) -> String: return "a")
+	check(FileAccess.file_exists(dir + "/a") and not FileAccess.file_exists(path), "deleting a whole mark removes the hidden character")
+	DirAccess.rename_absolute(dir + "/a", path)
+	app.navigate(dir)
+	app._ask_rename(path)
+	var full: String = app._keyboard.text
+	app._on_keyboard_changed("a")
+	app._keyboard.text = full
+	app._on_keyboard_submitted(full)
+	check(FileAccess.file_exists(dir + "/a<U+202E>b.txt") and not FileAccess.file_exists(path), "a mark that the user deleted and typed again stays literal")
+	for lone: String in ["\u200C", "\u200D", "\uFE0F", "\u180B", "\U0E0100"]:
+		check(JoyPathText.printable(lone) =="<U+%04X>" % lone.unicode_at(0), "a name of only U+%04X is visible (%s)" % [lone.unicode_at(0), JoyPathText.printable(lone)])
+
+	if OS.get_name() == "Linux":
+		shell("printf x > \"$JF_DIR/bad$(printf '\\377')byte\"", dir)
+		var bad := ""
+		for e: Dictionary in app.core.list_dir(dir, true, "name", false)["entries"]:
+			if JoyPathText.is_opaque(e["path"]):
+				bad = e["path"]
+		check(bad != "", "the folder holds a name with an invalid byte")
+		app.navigate(dir)
+		app._ask_rename(bad)
+		app._on_keyboard_submitted(app._keyboard.text + "x")
+		var kept: Array = app.core.list_dir(dir, true, "name", false)["entries"].filter(func(e: Dictionary) -> bool: return JoyPathText.is_opaque(e["path"]))
+		check(kept.size() == 1 and kept[0]["path"].ends_with("bytex"), "an edited name keeps the invalid byte")
+		check(not (app._toast_panel.visible and app._toast_label.text.contains("is hidden")) and app.entries[app.cursor]["path"] == kept[0]["path"], "a rename of such a name gives no hidden notice and keeps the cursor (%s)" % app._toast_label.text)
+
+	var long_text := JoyPathText.printable("ctl_" + "A".repeat(10) + "\u202E".repeat(30) + "B".repeat(10) + ".txt")
+	var font := ThemeDB.fallback_font
+	var split := 0
+	for room in range(120, 600, 7):
+		var cut := JoyFitLabel.cut_text(long_text, font, 24, float(room), JoyFitLabel.Cut.MIDDLE)
+		for piece in cut.split("\u2026"):
+			if piece.count("<") != piece.count(">"):
+				split += 1
+	check(split == 0, "a middle cut keeps every mark whole (%d split)" % split)
+
+	var big := root_dir + "/r5big"
+	write_size(big + "/src/big.bin", 8 * 1024 * 1024)
+	DirAccess.make_dir_recursive_absolute(big + "/dst")
+	app.navigate(big + "/src")
+	pick("Select all")
+	pick("Copy")
+	app.navigate(big + "/dst")
+	pick("Paste")
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	check(app.mode == app.Mode.CONFIRM and app._confirm_label.text.begins_with("A job is still running"), "the quit question names the running job")
+	await until(jobs_done, "the job ends under the quit question")
+	check(app.mode == app.Mode.CONFIRM and app._confirm_label.text == "Quit Joyfiles?", "the quit question stops naming a job that ended (%s)" % app._confirm_label.text)
+	press("jf_back")
+
+	var bare: Control = load("res://main.tscn").instantiate()
+	bare.settings_path = settings_file
+	bare.places_source = func() -> Array: return []
+	bare.opener = func(_path: String) -> int: return OK
+	bare.quitter = func(): pass
+	root.add_child(bare)
+	await frames(3)
+	check(bare.cwd == "/" and not bare.entries.is_empty() and bare._toast_label.text.begins_with("No home folder"), "no places at all still opens the root folder with a notice (%s)" % bare.cwd)
+	bare.queue_free()
+	await frames(2)

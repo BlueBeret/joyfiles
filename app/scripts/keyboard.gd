@@ -90,7 +90,7 @@ func _step_row(step: int) -> void:
 
 
 func handle_key(event: InputEventKey) -> void:
-	match event.keycode:
+	match JoyInput.key_of(event):
 		KEY_ENTER, KEY_KP_ENTER: _press("{done}")
 		KEY_ESCAPE: _press("{cancel}")
 		KEY_BACKSPACE: _press("{del}")

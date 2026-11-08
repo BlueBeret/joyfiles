@@ -68,7 +68,19 @@ static func _most_that_fit(count: int, fits: Callable) -> int:
 
 static func _cut_end(value: String, font: Font, font_size: int, room: float) -> String:
 	var kept := _most_that_fit(value.length(), func(n: int) -> bool: return _width(value.left(n) + ELLIPSIS, font, font_size) <= room)
-	return value.left(kept) + ELLIPSIS
+	return _whole_head(value.left(kept)) + ELLIPSIS
+
+
+# a cut inside a <U+XXXX> or <+N marks> token drops the rest of that token, so no half token shows
+static func _whole_head(head: String) -> String:
+	var open := head.rfind("<")
+	return head.left(open) if open >= 0 and head.find(">", open) < 0 else head
+
+
+static func _whole_tail(tail: String) -> String:
+	var close := tail.find(">")
+	var open := tail.find("<")
+	return tail.substr(close + 1) if close >= 0 and close <= 9 and (open < 0 or close < open) else tail
 
 
 static func _cut_start(value: String, font: Font, font_size: int, room: float, parts: String) -> String:
@@ -87,9 +99,9 @@ static func _cut_middle(value: String, font: Font, font_size: int, room: float) 
 	var dot := value.rfind(".")
 	if dot > 0 and value.length() - dot <= EXTENSION_CHARS and not value.substr(dot).contains(" "):
 		tail_length = mini(value.length() - dot + EXTENSION_KEEP, value.length() - 1)
-	var tail := value.right(tail_length)
+	var tail := _whole_tail(value.right(tail_length))
 	var head := value.left(value.length() - tail_length)
 	var kept := _most_that_fit(head.length(), func(n: int) -> bool: return _width(head.left(n) + ELLIPSIS + tail, font, font_size) <= room)
 	if kept == 0 and _width(ELLIPSIS + tail, font, font_size) > room:
 		return _cut_end(value, font, font_size, room)
-	return head.left(kept) + ELLIPSIS + tail
+	return _whole_head(head.left(kept)) + ELLIPSIS + tail

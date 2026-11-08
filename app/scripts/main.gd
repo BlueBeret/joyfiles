@@ -159,12 +159,17 @@ func _ready() -> void:
 		Mode.PREVIEW: preview.refresh,
 	}
 	places = places_source.call()
+	var no_places := places.is_empty()
+	if no_places:
+		places = [{"label": "Root", "path": "C:/" if OS.get_name() == "Windows" else "/", "kind": "folder"}]
 	var arg_path := _arg_path()
 	var home: String = places[0]["path"]
 	if not navigate(arg_path if arg_path != "" else (start_path if start_path != "" else home)) and not navigate(home):
 		cwd = home
 		_unreadable = true
 	_render()
+	if no_places:
+		toast("No home folder was found. Showing the root folder.", true)
 
 
 func _arg_path() -> String:
@@ -182,7 +187,7 @@ func _shell_open(path: String) -> int:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if mode == Mode.KEYBOARD and event is InputEventKey:
-		if event.pressed and _clock < _guard_until and event.keycode in GUARDED_KEYS:
+		if event.pressed and _clock < _guard_until and JoyInput.key_of(event) in GUARDED_KEYS:
 			get_viewport().set_input_as_handled()
 			return
 		if pad.typed(event):
@@ -647,10 +652,17 @@ func _ask_quit() -> void:
 	if jobs.is_empty():
 		quitter.call()
 		return
-	_set_confirm("A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size())
+	_set_confirm(_quit_text())
 	_on_confirm = quitter
 	if mode != Mode.CONFIRM:
 		_open(Mode.CONFIRM)
+
+
+# the quit question follows the job count, so it stays true while jobs end
+func _quit_text() -> String:
+	if jobs.is_empty():
+		return "Quit Joyfiles?"
+	return "A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size()
 
 
 func _set_confirm(text: String) -> void:
@@ -693,29 +705,36 @@ func paste() -> void:
 
 
 func _ask_rename(path: String) -> void:
-	var shown := _name_of(path)
+	var first := JoyPathText.scan(path.get_file())
+	var shown: String = first["shown"]
+	var kept := [shown.length()]
 	_ask_text("Rename", shown, func(new_name: String):
-		var r: Dictionary = core.rename(path, path.get_file() if new_name == shown else new_name)
+		var real: Variant = JoyPathText.restore(first, new_name, kept[0])
+		if real == null:
+			toast("Rename refused. The edit cut into a hidden character mark such as <U+202E>. Delete the whole mark or leave it.", true)
+			return
+		var r: Dictionary = core.rename(path, real)
 		if r["ok"]:
-			_refresh_to_new(r["path"].get_file())
+			_refresh_to_new(r["path"])
 		else:
-			toast(r["error"], true))
+			toast(r["error"], true),
+		func(text: String): kept[0] = mini(kept[0], JoyPathText.shared_start(shown, text)))
 
 
 func _ask_new_folder() -> void:
 	_ask_text("New folder name", "", func(new_name: String):
 		var r: Dictionary = core.make_dir(cwd, new_name)
 		if r["ok"]:
-			_refresh_to_new(r["path"].get_file())
+			_refresh_to_new(r["path"])
 		else:
 			toast(r["error"], true))
 
 
 # a new or renamed item that the hidden setting takes out of view would look like a failure, so say where it went
-func _refresh_to_new(item: String) -> void:
-	refresh(item)
-	if not entries.any(func(e: Dictionary) -> bool: return e["name"] == item) and filter == "":
-		toast("%s is hidden, because its name starts with a dot. Show hidden files to see it." % JoyPathText.printable(item))
+func _refresh_to_new(path: String) -> void:
+	refresh(_focus_of(path))
+	if not entries.any(func(e: Dictionary) -> bool: return e["path"] == path) and filter == "":
+		toast("%s is hidden, because its name starts with a dot. Show hidden files to see it." % JoyPathText.printable(path.get_file()))
 
 
 func _ask_filter() -> void:
@@ -812,6 +831,8 @@ func _poll_jobs() -> void:
 	if refreshed:
 		_render()
 	_ask_next_conflict()
+	if mode == Mode.CONFIRM and _on_confirm == quitter:
+		_set_confirm(_quit_text())
 	_render_status()
 	if mode == Mode.JOBS:
 		_render_overlay()

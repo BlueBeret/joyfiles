@@ -41,6 +41,7 @@ func run() -> void:
 	await _round3_close()
 	await _round3_missing_place()
 	await _round4_input()
+	await _round5_input()
 	app.queue_free()
 	await runner.process_frame
 
@@ -824,3 +825,26 @@ func _key_event(code: int, physical: bool) -> InputEventKey:
 	else:
 		e.keycode = code
 	return e
+
+
+func _round5_input() -> void:
+	await fresh(data + "/many")
+	app._ask_text("T", "", func(_t: String) -> void: pass)
+	await settle()
+	app._keyboard.text = "ab"
+	var e := InputEventKey.new()
+	e.physical_keycode = KEY_BACKSPACE
+	e.pressed = true
+	Input.parse_input_event(e)
+	await step(2)
+	e = e.duplicate()
+	e.pressed = false
+	Input.parse_input_event(e)
+	await step(2)
+	check(app._keyboard.text == "a", "a physical Backspace edits the keyboard text (%s)" % app._keyboard.text)
+	e = InputEventKey.new()
+	e.physical_keycode = KEY_ENTER
+	e.pressed = true
+	Input.parse_input_event(e)
+	await step(2)
+	check(app.mode == app.Mode.FILES, "a physical Enter submits the keyboard (mode %d)" % app.mode)
