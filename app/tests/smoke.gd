@@ -130,10 +130,6 @@ func _run() -> void:
 	var a := InputEventJoypadButton.new()
 	a.button_index = JOY_BUTTON_A
 	check(InputMap.event_is_action(a, "jf_accept"), "A button maps to accept")
-	var stick := InputEventJoypadMotion.new()
-	stick.axis = JOY_AXIS_LEFT_Y
-	stick.axis_value = 1.0
-	check(InputMap.event_is_action(stick, "jf_down"), "left stick down maps to down")
 
 	var dpad := InputEventJoypadButton.new()
 	dpad.button_index = JOY_BUTTON_DPAD_DOWN

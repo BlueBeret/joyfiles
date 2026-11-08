@@ -8,8 +8,6 @@ const THUMB_BOX := 42
 const TOAST_FONT := 22
 const TOAST_MAX_WIDTH := 880.0
 const TOAST_LIFT := 84
-const REPEAT_DELAY := 0.35
-const REPEAT_RATE := 0.06
 const PLACES_REFRESH_SECONDS := 3.0
 # a clash prompt never cuts into a menu, a keyboard or a confirm that the user is using
 const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
@@ -43,13 +41,11 @@ var conflict_panel: JoyConflict
 var jobs_panel: JoyJobs
 var props_panel: JoyProps
 var preview: JoyPreview
+var pad := JoyInput.new()
 
 var _handlers := {}
 var _panels := {}
 var _overlay_renderers := {}
-var _down := {}
-var _held := ""
-var _repeat_at := 0.0
 var _clock := 0.0
 var _on_submit: Callable
 var _on_change: Callable
@@ -143,24 +139,15 @@ func _unhandled_input(event: InputEvent) -> void:
 		_render()
 		get_viewport().set_input_as_handled()
 		return
-	for action: String in JoyInput.ACTIONS:
-		if event.is_action_pressed(action) and not _down.has(action):
-			_down[action] = true
-			_held = action if action in JoyInput.REPEATING else ""
-			_repeat_at = _clock + REPEAT_DELAY
-			fire(action)
-			get_viewport().set_input_as_handled()
-			return
+	var action := pad.press(event)
+	if action != "":
+		get_viewport().set_input_as_handled()
+		fire(action)
 
 
 func _process(delta: float) -> void:
 	_clock += delta
-	for action: String in _down.keys():
-		if not Input.is_action_pressed(action):
-			_down.erase(action)
-	if _held != "" and _down.has(_held) and _clock >= _repeat_at:
-		_repeat_at = _clock + REPEAT_RATE
-		fire(_held)
+	pad.tick(_clock, fire)
 	_poll_jobs()
 	if _clock >= _places_at:
 		refresh_places()
