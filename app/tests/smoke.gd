@@ -198,6 +198,8 @@ func _run() -> void:
 	await _filtering()
 	await _images()
 	await _opening()
+	_glyphs()
+	_keyboard_fallback()
 
 	DirAccess.remove_absolute(settings_file)
 	print("RESULT %s (%d failures)" % ["OK" if failures == 0 else "FAILED", failures])
@@ -488,6 +490,67 @@ func _opening() -> void:
 		return OK
 	press("jf_accept")
 	check(app.last_error == "" and app._toast_label.text.begins_with("Asked the system to open note.txt"), "a good open shows a plain toast: %s" % app._toast_label.text)
+
+
+func glyph_actions(node: Node) -> Array:
+	var found: Array = []
+	for child in node.get_children():
+		if child is JoyGlyph:
+			found.append(child.action)
+		found.append_array(glyph_actions(child))
+	return found
+
+
+func _glyphs() -> void:
+	var unglyphed := JoyInput.ACTIONS.keys().filter(func(a): return not JoyGlyph.SPECS.has(a))
+	check(unglyphed.is_empty(), "every input action has a glyph: %s" % [unglyphed])
+	var unbound := JoyGlyph.SPECS.keys().filter(func(a): return not JoyInput.ACTIONS.has(a))
+	check(unbound.is_empty(), "every glyph names a real action: %s" % [unbound])
+	var unknown: Array = []
+	for mode: int in app.HINTS:
+		for pair: Array in app.HINTS[mode]:
+			if not JoyGlyph.SPECS.has(pair[0]):
+				unknown.append(pair[0])
+	check(unknown.is_empty(), "every hint table entry is keyed by an action: %s" % [unknown])
+
+	app.navigate(root_dir)
+	app.mode = app.Mode.FILES
+	app._render()
+	var expected := ["jf_accept", "jf_back", "jf_menu", "jf_select", "jf_pane", "jf_start"]
+	check(glyph_actions(app._hints) == expected, "the footer draws one glyph per hint: %s" % [glyph_actions(app._hints)])
+	check(app._hints_for_mode().has(["jf_back", "Up"]), "back reads Up without a filter")
+	app._set_filter("ap")
+	check(app._hints_for_mode().has(["jf_back", "Clear filter"]), "back reads Clear filter while a filter is on")
+	app._set_filter("")
+	check(not app._hints_for_mode().any(func(p): return p[0] == "jf_jobs"), "no jobs hint while no job runs")
+	app.jobs[99] = {"dest": ""}
+	check(app._hints_for_mode().has(["jf_jobs", "Jobs"]), "the jobs hint shows while a job runs")
+	app.jobs.erase(99)
+	for panel in [app.conflict_panel, app.jobs_panel, app.props_panel, app.preview, app._keyboard]:
+		check(not glyph_actions(panel).is_empty(), "%s draws glyph hints" % panel.get_script().get_global_name())
+
+
+func _keyboard_fallback() -> void:
+	var enter := InputEventKey.new()
+	enter.physical_keycode = KEY_ENTER
+	check(InputMap.event_is_action(enter, "jf_accept"), "the Enter key still maps to accept")
+	var no_key := JoyInput.ACTIONS.keys().filter(func(a): return not JoyInput.ACTIONS[a].any(func(b): return b[0] == JoyInput.KEY))
+	check(no_key.is_empty(), "every action keeps a keyboard key: %s" % [no_key])
+	app.navigate(root_dir)
+	app.mode = app.Mode.FILES
+	press("jf_search")
+	var typed := InputEventKey.new()
+	typed.pressed = true
+	typed.keycode = KEY_Q
+	typed.unicode = 113
+	app._unhandled_input(typed)
+	check(app.mode == app.Mode.KEYBOARD and app.filter == "q", "a physical key types into the on-screen keyboard (filter=%s)" % app.filter)
+	var done := InputEventKey.new()
+	done.pressed = true
+	done.keycode = KEY_ENTER
+	app._unhandled_input(done)
+	check(app.mode == app.Mode.FILES, "the Enter key finishes the on-screen keyboard")
+	app._set_filter("")
 
 
 func _bytes(n: int) -> PackedByteArray:

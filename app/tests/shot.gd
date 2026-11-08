@@ -103,9 +103,30 @@ func copy_all_from(dir: String) -> void:
 	pick("Copy")
 
 
+func glyph_sheet(height: float) -> Control:
+	var sheet := ColorRect.new()
+	sheet.color = Theme_.PANEL
+	sheet.set_anchors_preset(Control.PRESET_FULL_RECT)
+	var grid := GridContainer.new()
+	grid.columns = 5
+	grid.add_theme_constant_override("h_separation", 48)
+	grid.add_theme_constant_override("v_separation", 36)
+	grid.position = Vector2(48, 40)
+	sheet.add_child(grid)
+	for action: String in JoyGlyph.SPECS:
+		var cell := VBoxContainer.new()
+		cell.add_child(JoyGlyph.of(action, height))
+		cell.add_child(Theme_.label(action, Theme_.MUTED, 18))
+		grid.add_child(cell)
+	return sheet
+
+
 func _run() -> void:
 	out = OS.get_environment("JF_SHOT_DIR")
 	base = OS.get_environment("JF_TEST_DIR")
+	root.mode = Window.MODE_WINDOWED
+	root.size = Vector2i(1280, 800)
+	await frames(5)
 	make_content()
 	app = load("res://main.tscn").instantiate()
 	app.start_path = base
@@ -113,6 +134,15 @@ func _run() -> void:
 	root.add_child(app)
 	await until(func(): return app.thumbs.cache.size() >= 3, 120)
 	await snap("files_with_thumbnails")
+
+	var sheet := glyph_sheet(96.0)
+	root.add_child(sheet)
+	await snap("glyph_sheet_large")
+	sheet.queue_free()
+	sheet = glyph_sheet(JoyGlyph.HEIGHT)
+	root.add_child(sheet)
+	await snap("glyph_sheet_actual")
+	sheet.queue_free()
 
 	press(["jf_menu"])
 	await snap("file_menu")
