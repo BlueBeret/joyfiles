@@ -131,6 +131,51 @@ func glyph_sheet(height: float) -> Control:
 	return sheet
 
 
+func _failure_shots() -> void:
+	var failing := base + "/failing"
+	for i in 12:
+		write_text("%s/src/holiday_photo_%02d.txt" % [failing, i], "x")
+	DirAccess.make_dir_recursive_absolute(failing + "/dst")
+	copy_all_from(failing + "/src")
+	for i in range(2, 10):
+		DirAccess.remove_absolute("%s/src/holiday_photo_%02d.txt" % [failing, i])
+	app.navigate(failing + "/dst")
+	pick("Paste")
+	await until(func(): return app.jobs.is_empty(), 300)
+	await snap("copy_failed_toast")
+	press(["jf_jobs"])
+	await snap("jobs_with_failure_report")
+	press(["jf_accept"])
+	await snap("failure_list")
+	press(["jf_page_down"])
+	await snap("failure_list_scrolled")
+	press(["jf_menu", "jf_back"])
+
+	var trashing := base + "/trashing"
+	for n in ["old_notes.txt", "draft.txt", "report.txt"]:
+		write_text("%s/%s" % [trashing, n], "x")
+	app.navigate(trashing)
+	pick("Select all")
+	DirAccess.remove_absolute(trashing + "/draft.txt")
+	pick("Move to trash")
+	press(["jf_accept"])
+	await snap("trash_partial_toast")
+	press(["jf_jobs", "jf_accept"])
+	await snap("trash_partial_list")
+	press(["jf_menu", "jf_back"])
+
+	var locked := base + "/locked"
+	var owner_all := FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER
+	write_text(locked + "/closed/inside.txt", "x")
+	FileAccess.set_unix_permissions(locked + "/closed", 0)
+	app.navigate(locked)
+	app._open_props(locked + "/closed")
+	app._render()
+	await snap("properties_unknown")
+	press(["jf_back"])
+	FileAccess.set_unix_permissions(locked + "/closed", owner_all)
+
+
 func _run() -> void:
 	out = OS.get_environment("JF_SHOT_DIR")
 	base = OS.get_environment("JF_TEST_DIR")
@@ -140,8 +185,8 @@ func _run() -> void:
 	make_content()
 	app = load("res://main.tscn").instantiate()
 	app.start_path = base
-	app.opener = func(_path: String) -> int: return OK
 	app.settings_path = base.get_base_dir() + "/jf_shot_settings.cfg"
+	app.opener = func(_path: String) -> int: return OK
 	root.add_child(app)
 	await until(func(): return app.thumbs.cache.size() >= 3, 120)
 	await snap("files_with_thumbnails")
@@ -252,4 +297,5 @@ func _run() -> void:
 	await until(func(): return app.mode == app.Mode.CONFLICT, 300)
 	press(["jf_back"])
 	await until(func(): return app.jobs.is_empty(), 300)
+	await _failure_shots()
 	quit()
