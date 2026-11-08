@@ -133,18 +133,63 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 
 pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     validate_name(new_name)?;
-    let dest = path.with_file_name(new_name.trim());
-    if dest.exists() {
-        return Err(format!("\"{}\" already exists.", new_name.trim()));
+    let new_name = new_name.trim();
+    let dest = path.with_file_name(new_name);
+    let failed = |e: io::Error| format!("Could not rename \"{}\": {}.", display_name(path), reason(&e));
+    if dest == path {
+        return Ok(dest);
     }
-    fs::rename(path, &dest).map_err(|e| e.to_string())?;
+    if exists_nofollow(&dest) {
+        if !is_case_variant(path, &dest) {
+            return Err(format!("\"{new_name}\" already exists."));
+        }
+        // a drive that ignores case treats a direct rename to the new case as a rename that changes nothing
+        let temp = temp_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default());
+        fs::rename(path, &temp).map_err(failed)?;
+        if let Err(e) = fs::rename(&temp, &dest) {
+            let _ = fs::rename(&temp, path);
+            return Err(failed(e));
+        }
+        return Ok(dest);
+    }
+    fs::rename(path, &dest).map_err(failed)?;
     Ok(dest)
+}
+
+// true when dest reaches the item at path only because the drive ignores case, and no entry has the exact new name
+fn is_case_variant(path: &Path, dest: &Path) -> bool {
+    let exact = dest.file_name();
+    let listed = path.parent().and_then(|dir| fs::read_dir(dir).ok()).is_none_or(|rd| rd.filter_map(Result::ok).any(|e| Some(e.file_name().as_os_str()) == exact));
+    !listed && same_item(path, dest)
+}
+
+#[cfg(unix)]
+fn same_item(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_item(a: &Path, b: &Path) -> bool {
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    a.parent().zip(b.parent()).is_some_and(|(x, y)| same_dir(x, y)) && name(a) == name(b)
+}
+
+fn display_name(path: &Path) -> String {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
 }
 
 pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     validate_name(name)?;
-    let dest = parent.join(name.trim());
-    fs::create_dir(&dest).map_err(|e| e.to_string())?;
+    let name = name.trim();
+    let dest = parent.join(name);
+    fs::create_dir(&dest).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => format!("\"{name}\" already exists."),
+        _ => format!("Could not make the folder \"{name}\": {}.", reason(&e)),
+    })?;
     Ok(dest)
 }
 
@@ -415,5 +460,47 @@ mod tests {
         assert!(rename(&a, "x/y").is_err());
         assert!(rename(&a, "b").is_err());
         assert_eq!(rename(&a, " c ").unwrap(), tmp.path().join("c"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_never_replaces_a_broken_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        fs::write(&a, "x").unwrap();
+        std::os::unix::fs::symlink("nowhere", tmp.path().join("dangling")).unwrap();
+        assert_eq!(rename(&a, "dangling"), Err("\"dangling\" already exists.".into()));
+        assert!(fs::symlink_metadata(tmp.path().join("dangling")).unwrap().file_type().is_symlink());
+        assert_eq!(read_to(&a), "x");
+    }
+
+    fn read_to(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn rename_to_the_same_name_or_a_new_case_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        fs::write(&a, "x").unwrap();
+        assert_eq!(rename(&a, "a.txt"), Ok(a.clone()));
+        let upper = rename(&a, "A.txt").unwrap();
+        assert_eq!(names(list_dir(tmp.path(), true, SortKey::Name, false).unwrap()), ["A.txt"]);
+        assert_eq!(read_to(&upper), "x");
+    }
+
+    // set JF_CASELESS_DIR to a folder on a drive that ignores case, such as exFAT, to run this
+    #[test]
+    fn a_case_only_rename_works_on_a_drive_that_ignores_case() {
+        let Ok(dir) = std::env::var("JF_CASELESS_DIR") else { return };
+        let tmp = tempfile::tempdir_in(dir).unwrap();
+        let a = tmp.path().join("a.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(tmp.path().join("b.txt"), "y").unwrap();
+        let upper = rename(&a, "A.txt").unwrap();
+        assert_eq!(names(list_dir(tmp.path(), true, SortKey::Name, false).unwrap()), ["A.txt", "b.txt"]);
+        assert_eq!(read_to(&upper), "x");
+        assert_eq!(rename(&upper, "B.txt"), Err("\"B.txt\" already exists.".into()), "another file that differs in case stays");
+        assert_eq!(read_to(&tmp.path().join("b.txt")), "y");
     }
 }
