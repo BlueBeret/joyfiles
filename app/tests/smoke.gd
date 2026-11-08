@@ -201,6 +201,7 @@ func _run() -> void:
 	await _opening()
 	_glyphs()
 	_keyboard_fallback()
+	_settings_types()
 
 	DirAccess.remove_absolute(settings_file)
 	print("RESULT %s (%d failures)" % ["OK" if failures == 0 else "FAILED", failures])
@@ -578,6 +579,28 @@ func _keyboard_fallback() -> void:
 	app._unhandled_input(done)
 	check(app.mode == app.Mode.FILES, "the Enter key finishes the on-screen keyboard")
 	app._set_filter("")
+
+
+func _load_settings(text: String) -> JoySettings:
+	var path := root_dir.get_base_dir() + "/jf_smoke_types.cfg"
+	write(path, text)
+	var loaded := JoySettings.new(path)
+	loaded.load_file()
+	DirAccess.remove_absolute(path)
+	return loaded
+
+
+func _settings_types() -> void:
+	var mixed := _load_settings('[view]\nsort_key="size"\nshow_hidden="false"\nsort_desc=true\n')
+	check(mixed.sort_key == "size" and mixed.sort_desc and not mixed.show_hidden, "a string where a bool belongs keeps the other settings (%s, %s, %s)" % [mixed.sort_key, mixed.sort_desc, mixed.show_hidden])
+	var listy := _load_settings('[view]\nsort_key="modified"\nshow_hidden=[1, 2]\nsort_desc=true\n')
+	check(listy.sort_key == "modified" and listy.sort_desc and not listy.show_hidden, "a list where a bool belongs keeps the other settings")
+	var numeric := _load_settings('[view]\nsort_key=5\nshow_hidden=true\nsort_desc=3\n')
+	check(numeric.sort_key == "name" and numeric.show_hidden and not numeric.sort_desc, "a number where a string or bool belongs falls back for that key only")
+	var unknown := _load_settings('[view]\nsort_key="colour"\nshow_hidden=true\n')
+	check(unknown.sort_key == "name" and unknown.show_hidden, "an unknown sort key falls back to name")
+	var good := _load_settings('[view]\nsort_key="type"\nshow_hidden=true\nsort_desc=true\n')
+	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
 
 
 func _bytes(n: int) -> PackedByteArray:
