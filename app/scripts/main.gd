@@ -86,6 +86,7 @@ var _keyboard: JoyKeyboard
 
 func _ready() -> void:
 	JoyInput.install()
+	Input.joy_connection_changed.connect(_on_joy_connection_changed)
 	settings = JoySettings.new(settings_path)
 	settings.load_file()
 	if not opener.is_valid():
@@ -149,6 +150,15 @@ func _unhandled_input(event: InputEvent) -> void:
 	if action != "":
 		get_viewport().set_input_as_handled()
 		_on_press(action)
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_OUT or what == NOTIFICATION_WM_WINDOW_FOCUS_OUT:
+		pad.release_all()
+
+
+func _on_joy_connection_changed(_device: int, _connected: bool) -> void:
+	pad.release_all()
 
 
 func _process(delta: float) -> void:

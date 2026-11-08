@@ -96,6 +96,14 @@ func press(e: InputEvent) -> String:
 	return _down(src, action_of(e))
 
 
+# a lost focus or an unplugged pad never sends the releases, so forget every held control
+func release_all() -> void:
+	_live.clear()
+	_stale.clear()
+	_dpads.clear()
+	_repeat = ""
+
+
 # a control that is down when the screen changes does nothing more until it is released
 func block() -> void:
 	_stale.merge(_live)
