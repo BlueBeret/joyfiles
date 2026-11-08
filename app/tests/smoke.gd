@@ -107,6 +107,7 @@ func start_app(path: String) -> Control:
 	instance.start_path = path
 	instance.settings_path = settings_file
 	instance.opener = func(_path: String) -> int: return OK
+	instance.opener = func(_path: String) -> int: return OK
 	root.add_child(instance)
 	return instance
 
@@ -213,6 +214,7 @@ func _run() -> void:
 	await _quit_with_job()
 	_missing_folder()
 	await _opening()
+	_part_files()
 	_glyphs()
 	_keyboard_fallback()
 	_settings_types()
@@ -737,6 +739,21 @@ func _settings_types() -> void:
 	check(unknown.sort_key == "name" and unknown.show_hidden, "an unknown sort key falls back to name")
 	var good := _load_settings('[view]\nsort_key="type"\nshow_hidden=true\nsort_desc=true\n')
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
+
+
+func _part_files() -> void:
+	var base := root_dir + "/leftovers"
+	write(base + "/doc.txt", "x")
+	write(base + "/.dotfile", "x")
+	write(base + "/.doc.txt.joyfiles-part", "x")
+	write(base + "/.doc.txt.2.joyfiles-part", "x")
+	app.navigate(base)
+	check(names() == ["doc.txt"], "a leftover part file stays out of the list: %s" % [names()])
+	app.settings.show_hidden = true
+	app.refresh()
+	check(names().has(".dotfile") and names().size() == 2, "hidden files show, but a leftover part file still does not: %s" % [names()])
+	app.settings.show_hidden = false
+	app.refresh()
 
 
 func menu_labels() -> Array:

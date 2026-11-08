@@ -38,6 +38,9 @@ impl SortKey {
 pub fn list_dir(dir: &Path, show_hidden: bool, key: SortKey, descending: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for item in fs::read_dir(dir)?.filter_map(Result::ok) {
+        if is_part_name(&item.file_name().to_string_lossy()) {
+            continue;
+        }
         match read_entry(&item.path()) {
             Ok(e) if show_hidden || !e.hidden => entries.push(e),
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
@@ -418,6 +421,11 @@ fn truncate(name: &OsStr, max: usize) -> OsString {
     cut
 }
 
+// a killed copy leaves such a file behind, and the user never sees it as an item, even with hidden files shown
+fn is_part_name(name: &str) -> bool {
+    name.strip_prefix('.').and_then(|rest| rest.strip_suffix(PART_SUFFIX)).is_some_and(|stem| !stem.is_empty())
+}
+
 // a hidden name in the same folder, so a rename puts the finished item in place in one step
 pub fn temp_path(dir: &Path, name: &OsStr) -> PathBuf {
     let stem = truncate(name, NAME_MAX - 1 - PART_SUFFIX.len() - 8);
@@ -503,6 +511,22 @@ mod tests {
         let listed = list_dir(tmp.path(), false, SortKey::Name, false).unwrap();
         assert_eq!(names(listed), ["zdir", "A.txt", "b.txt"]);
         assert_eq!(list_dir(tmp.path(), true, SortKey::Name, false).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_leftover_part_file_never_shows_in_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["real.txt", ".hidden", ".joyfiles-part", ".x.joyfiles-part-not", "..joyfiles-part"] {
+            fs::write(tmp.path().join(name), "x").unwrap();
+        }
+        let first = temp_path(tmp.path(), OsStr::new("a.txt"));
+        fs::write(&first, "x").unwrap();
+        fs::write(temp_path(tmp.path(), OsStr::new("a.txt")), "x").unwrap();
+        fs::create_dir(temp_path(tmp.path(), OsStr::new("dir"))).unwrap();
+        assert_eq!(first.file_name().unwrap(), ".a.txt.joyfiles-part");
+        let shown = names(list_dir(tmp.path(), true, SortKey::Name, false).unwrap());
+        assert_eq!(shown, ["..joyfiles-part", ".hidden", ".joyfiles-part", ".x.joyfiles-part-not", "real.txt"]);
+        assert_eq!(names(list_dir(tmp.path(), false, SortKey::Name, false).unwrap()), ["real.txt"]);
     }
 
     #[cfg(unix)]
