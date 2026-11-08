@@ -4,6 +4,8 @@ var app: Control
 var out := ""
 var base := ""
 var count := 0
+# the places are scratch folders, so a shot never lists a real folder
+var fake_places := func() -> Array: return []
 
 
 func _initialize() -> void:
@@ -198,7 +200,7 @@ func _odd_name_shots() -> void:
 	await snap("odd_names_jobs")
 	press(["jf_back"])
 	app.reports.clear()
-	app.places_source = app.core.places
+	app.places_source = fake_places
 	app.refresh_places()
 
 
@@ -214,6 +216,9 @@ func _run() -> void:
 	app.start_path = base
 	app.settings_path = base.get_base_dir() + "/jf_shot_settings.cfg"
 	app.opener = func(_path: String) -> int: return OK
+	app.quitter = func() -> void: pass
+	fake_places = func() -> Array: return [{"label": "Home", "path": base, "kind": "home"}, {"label": "Documents", "path": base + "/Documents", "kind": "folder"}, {"label": "Music", "path": base + "/Music", "kind": "folder"}]
+	app.places_source = fake_places
 	root.add_child(app)
 	await until(func(): return app.thumbs.cache.size() >= 3, 120)
 	await snap("files_with_thumbnails")
@@ -306,7 +311,7 @@ func _run() -> void:
 	press(["jf_pane"])
 	await snap("places_new_card")
 	press(["jf_back"])
-	app.places_source = app.core.places
+	app.places_source = fake_places
 	app.refresh_places()
 
 	write_text(base + "/gone/inner/f.txt", "x")
