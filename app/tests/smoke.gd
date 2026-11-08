@@ -216,6 +216,7 @@ func _run() -> void:
 	await _job_failures()
 	await _finish_toasts()
 	await _trash_partial()
+	_props_unknown()
 	_part_files()
 	_glyphs()
 	_keyboard_fallback()
@@ -872,6 +873,24 @@ func _trash_partial() -> void:
 	check(app.last_error == "Nothing was moved to the trash. 1 item could not be moved. Open Jobs to see it.", "a trash that moved nothing says so: %s" % app.last_error)
 	app.reports.clear()
 	app.refresh()
+
+
+func _props_unknown() -> void:
+	var base := root_dir + "/locked"
+	var owner_only := FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER
+	write(base + "/closed/inside.txt", "x")
+	FileAccess.set_unix_permissions(base + "/closed", 0)
+	app.navigate(base)
+	cursor_to("closed")
+	pick("Properties")
+	var shown: Dictionary = app.props_panel.shown
+	if app.core.props(base + "/closed")["items"] >= 0:
+		print("SKIP this account can read a folder without permission")
+	else:
+		check(shown["Contains"] == "Unknown (permission denied)", "a folder that cannot be read shows Unknown, not -1 items (%s)" % shown["Contains"])
+		check(shown["Size"] == "Unknown (permission denied)" and app.props_panel.scan_done, "its size is unknown too, and no scan runs (%s)" % shown["Size"])
+	press("jf_back")
+	FileAccess.set_unix_permissions(base + "/closed", owner_only)
 
 
 func _part_files() -> void:

@@ -55,7 +55,11 @@ func open(core: JoyCore, path: String) -> void:
 	_put("Path", info["path"])
 	_put("Type", info["type"] + (" (link)" if info["is_symlink"] else ""))
 	_put("Modified", Theme_.human_date(info["modified"]))
-	if info["is_dir"]:
+	if info["is_dir"] and info["items"] < 0:
+		var unknown := _unknown(info["items_error"])
+		_put("Contains", unknown)
+		_put("Size", unknown)
+	elif info["is_dir"]:
 		_put("Contains", Theme_.count(info["items"], "item"))
 		_put("Size", "Calculating...")
 		scan_done = false
@@ -89,6 +93,10 @@ func close() -> void:
 		_core.cancel_size_scan(_scan)
 		_scan = -1
 	scan_done = true
+
+
+func _unknown(reason: String) -> String:
+	return "Unknown (%s)" % reason if reason != "" else "Unknown"
 
 
 func _exact_size(bytes: int) -> String:
