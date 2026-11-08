@@ -215,6 +215,7 @@ func _run() -> void:
 	await _opening()
 	await _job_failures()
 	await _finish_toasts()
+	await _trash_partial()
 	_part_files()
 	_glyphs()
 	_keyboard_fallback()
@@ -843,6 +844,34 @@ func _finish_toasts() -> void:
 	pick("Paste")
 	await until(jobs_done, "the one item move ends")
 	check(app._toast_label.text == "Moved f1.txt.", "the toast names a single moved item: %s" % app._toast_label.text)
+
+
+func _trash_partial() -> void:
+	var base := root_dir + "/trashing"
+	for n in ["t1.txt", "t2.txt", "t3.txt"]:
+		write("%s/%s" % [base, n], "x")
+	app.navigate(base)
+	pick("Select all")
+	DirAccess.remove_absolute(base + "/t2.txt")
+	pick("Move to trash")
+	press("jf_accept")
+	check(not FileAccess.file_exists(base + "/t1.txt") and not FileAccess.file_exists(base + "/t3.txt"), "the two items that exist went to the trash")
+	check(app.last_error == "Moved 2 items to the trash. 1 item could not be moved. Open Jobs to see it.", "the toast says how many went to the trash and how many failed: %s" % app.last_error)
+	check(app.reports.size() == 1 and app.reports.values()[0]["title"] == "Move to trash: 1 item failed", "the partial result leaves a report")
+	open_jobs_report()
+	press("jf_accept")
+	check(app.jobs_panel.failure_texts.size() == 1 and app.jobs_panel.failure_texts[0].contains("t2.txt"), "the list names what failed: %s" % [app.jobs_panel.failure_texts])
+	press("jf_menu")
+	press("jf_back")
+
+	write(base + "/u1.txt", "x")
+	app.navigate(base)
+	DirAccess.remove_absolute(base + "/u1.txt")
+	pick("Move to trash")
+	press("jf_accept")
+	check(app.last_error == "Nothing was moved to the trash. 1 item could not be moved. Open Jobs to see it.", "a trash that moved nothing says so: %s" % app.last_error)
+	app.reports.clear()
+	app.refresh()
 
 
 func _part_files() -> void:

@@ -570,13 +570,19 @@ func _ask_trash(paths: PackedStringArray) -> void:
 	var what := _label_of(paths)
 	_confirm_label.text = "Move %s to the trash?" % what
 	_on_confirm = func():
-		var r: Dictionary = core.trash(paths)
-		if r["ok"]:
-			toast("Moved %s to the trash." % what)
-		else:
-			toast(r["error"], true)
+		_announce_trash(core.trash(paths), what)
 		refresh()
 	mode = Mode.CONFIRM
+
+
+func _announce_trash(r: Dictionary, what: String) -> void:
+	var failures: Array = r["failures"]
+	if failures.is_empty():
+		toast("Moved %s to the trash." % what)
+		return
+	_add_report("Move to trash: %s failed" % Theme_.count(failures.size(), "item"), failures)
+	var head := "Moved %s to the trash." % Theme_.count(r["trashed"], "item") if r["trashed"] > 0 else "Nothing was moved to the trash."
+	toast("%s %s could not be moved. %s" % [head, Theme_.count(failures.size(), "item"), _see_jobs(failures.size())], true)
 
 
 func _add_report(title: String, failures: Array) -> void:
