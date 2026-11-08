@@ -495,6 +495,12 @@ func _preview_replay() -> void:
 	press("jf_back")
 	check(app.mode == app.Mode.FILES and app.entries[app.cursor]["name"] == "c.png", "B closes the preview on c.png after a refresh moved it (cursor on %s)" % app.entries[app.cursor]["name"])
 
+	press("jf_accept")
+	DirAccess.remove_absolute(base + "/dest/c.png")
+	app.refresh()
+	press("jf_back")
+	check(app.mode == app.Mode.FILES and app.cursor < app.entries.size(), "B closes the preview of a file that vanished (cursor %d of %d)" % [app.cursor, app.entries.size()])
+
 
 func _opening() -> void:
 	var path := root_dir + "/pics/note.txt"

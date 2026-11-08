@@ -581,7 +581,12 @@ func _on_answer_requested(id: int) -> void:
 
 
 func _on_preview_closed() -> void:
-	cursor = preview.index
+	var path: String = preview.current()["path"]
+	for i in entries.size():
+		if entries[i]["path"] == path:
+			cursor = i
+			break
+	cursor = clampi(cursor, 0, maxi(entries.size() - 1, 0))
 	_clamp_view()
 	mode = Mode.FILES
 
