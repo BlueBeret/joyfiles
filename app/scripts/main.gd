@@ -533,6 +533,8 @@ func _poll_jobs() -> void:
 	var ended := false
 	for job: Dictionary in core.poll_jobs():
 		var id: int = job["id"]
+		if not jobs.has(id):
+			continue
 		jobs[id].merge(job, true)
 		match job["state"]:
 			"done":
