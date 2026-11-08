@@ -4,6 +4,9 @@ extends PanelContainer
 signal closed
 
 const FIELDS := ["Name", "Path", "Type", "Size", "Modified", "Contains"]
+# the values scroll past this height, so the title and the hints always fit in an 800 pixel window
+const SCROLL_MAX_HEIGHT := 500.0
+const SCROLL_STEP := 72
 
 # one text per field, so the labels and the tests read the same data
 var shown := {}
@@ -13,38 +16,54 @@ var _core: JoyCore
 var _scan := -1
 var _labels := {}
 var _grid: GridContainer
+var _scroll: JoyScrollBox
 var _title: Label
+var _hints_box: VBoxContainer
 
 
 func _init() -> void:
 	var close := func() -> void: closed.emit()
-	commands = [["jf_back", "Close", close], ["jf_accept", "", close], ["jf_menu", "", close]]
+	var overflows := func() -> bool: return _scroll.is_scrollable()
+	commands = [
+		["jf_up", "Scroll", func() -> void: _scroll.scroll_vertical -= SCROLL_STEP, overflows],
+		["jf_down", "", func() -> void: _scroll.scroll_vertical += SCROLL_STEP, overflows],
+		["jf_page_up", "", func() -> void: _scroll.scroll_vertical -= int(_scroll.size.y), overflows],
+		["jf_page_down", "", func() -> void: _scroll.scroll_vertical += int(_scroll.size.y), overflows],
+		["jf_back", "Close", close],
+		["jf_accept", "", close],
+		["jf_menu", "", close],
+	]
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 16)
 	add_child(box)
-	_title = Theme_.label("Properties", Theme_.TEXT, 28)
+	_title = Theme_.label("Properties", Theme_.TEXT, Theme_.SIZE_HEAD)
 	box.add_child(_title)
 	_grid = GridContainer.new()
 	_grid.columns = 2
 	_grid.add_theme_constant_override("h_separation", 24)
 	_grid.add_theme_constant_override("v_separation", 10)
-	box.add_child(_grid)
+	_scroll = JoyScrollBox.new(_grid, SCROLL_MAX_HEIGHT)
+	box.add_child(_scroll)
 	for field: String in FIELDS:
-		_grid.add_child(Theme_.label(field, Theme_.MUTED, 22))
-		var value := Theme_.label("", Theme_.TEXT, 22)
-		value.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
+		_grid.add_child(Theme_.label(field, Theme_.MUTED, Theme_.SIZE_BODY))
+		var value := Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
+		value.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		value.custom_minimum_size.x = 560
 		value.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		_grid.add_child(value)
 		_labels[field] = value
-	box.add_child(Theme_.hints(JoyCommands.hints(commands)))
+	_hints_box = VBoxContainer.new()
+	box.add_child(_hints_box)
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
+	_set_hints()
 
 
-func open(core: JoyCore, path: String) -> void:
+# hidden_note tells the user that the count includes the items that the list hides
+func open(core: JoyCore, path: String, hidden_note := false) -> void:
 	close()
 	_core = core
 	shown.clear()
+	_scroll.scroll_vertical = 0
 	var info: Dictionary = core.props(path)
 	if not info["ok"]:
 		_put("Name", JoyPathText.printable(path.get_file()))
@@ -63,7 +82,7 @@ func open(core: JoyCore, path: String) -> void:
 		_put("Contains", unknown)
 		_put("Size", unknown)
 	elif info["is_dir"]:
-		_put("Contains", Theme_.count(info["items"], "item"))
+		_put("Contains", Theme_.count(info["items"], "item") + (" (hidden items included)" if hidden_note else ""))
 		_put("Size", "Calculating...")
 		scan_done = false
 		_scan = core.start_size_scan(path)
@@ -77,7 +96,12 @@ func handle(action: String) -> void:
 	JoyCommands.run(action, commands)
 
 
+func _set_hints() -> void:
+	Theme_.update_hints(_hints_box, JoyCommands.hints(commands))
+
+
 func poll() -> void:
+	_set_hints()
 	if _scan < 0:
 		return
 	var s: Dictionary = _core.poll_size_scan(_scan)

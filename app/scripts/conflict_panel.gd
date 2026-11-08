@@ -71,7 +71,7 @@ func _choose() -> void:
 
 func _describe(is_dir: bool, size: int, modified: int) -> String:
 	var what := "Folder" if is_dir else Theme_.human_size(size)
-	return "%s, changed %s" % [what, Theme_.human_date(modified)]
+	return "%s, changed %s" % [what, Theme_.human_date(modified)] if modified > 0 else "%s, change date unknown" % what
 
 
 func _render() -> void:
