@@ -1,43 +1,69 @@
 extends Control
 
-enum Mode { FILES, PLACES, MENU, KEYBOARD, CONFIRM }
+enum Mode { FILES, PLACES, MENU, KEYBOARD, CONFIRM, CONFLICT, JOBS, PROPS, PREVIEW }
 
 const VISIBLE_ROWS := 12
 const ROW_HEIGHT := 50
+const THUMB_BOX := 42
+const TOAST_FONT := 22
+const TOAST_MAX_WIDTH := 880.0
+const TOAST_LIFT := 84
 const REPEAT_DELAY := 0.35
 const REPEAT_RATE := 0.06
+# a clash prompt never cuts into a menu, a keyboard or a confirm that the user is using
+const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
 
 var start_path := ""
+var settings_path := "user://settings.cfg"
+var opener := Callable()
 var core := JoyCore.new()
+var settings: JoySettings
+var thumbs := JoyThumbs.new()
 var mode := Mode.FILES
 var cwd := ""
+var all_entries: Array = []
 var entries: Array = []
+var filter := ""
 var cursor := 0
 var top := 0
 var selected := {}
 var clipboard := {"move": false, "paths": PackedStringArray()}
-var show_hidden := false
 var places: Array = []
 var place_cursor := 0
 var menu_items: Array = []
 var menu_cursor := 0
 var jobs := {}
 var last_error := ""
+var conflict_panel: JoyConflict
+var jobs_panel: JoyJobs
+var props_panel: JoyProps
+var preview: JoyPreview
 
 var _handlers := {}
+var _panels := {}
+var _overlay_renderers := {}
 var _down := {}
 var _held := ""
 var _repeat_at := 0.0
 var _clock := 0.0
 var _on_submit: Callable
+var _on_change: Callable
+var _on_cancel: Callable
 var _on_confirm: Callable
 var _toast_until := 0.0
+var _conflict_job := -1
+var _conflict_return := Mode.FILES
 
 var _path_label: Label
+var _filter_label: Label
+var _sort_label: Label
 var _count_label: Label
 var _rows: Array[PanelContainer] = []
+var _row_parts: Array[Dictionary] = []
 var _places_box: VBoxContainer
 var _status: Label
+var _toast_panel: PanelContainer
+var _toast_label: Label
 var _hints: Control
 var _footer: HBoxContainer
 var _overlay: CenterContainer
@@ -51,6 +77,10 @@ var _keyboard: JoyKeyboard
 
 func _ready() -> void:
 	JoyInput.install()
+	settings = JoySettings.new(settings_path)
+	settings.load_file()
+	if not opener.is_valid():
+		opener = _shell_open
 	_build_ui()
 	_handlers = {
 		Mode.FILES: _files_action,
@@ -58,6 +88,24 @@ func _ready() -> void:
 		Mode.MENU: _menu_action,
 		Mode.KEYBOARD: _keyboard.handle,
 		Mode.CONFIRM: _confirm_action,
+		Mode.CONFLICT: conflict_panel.handle,
+		Mode.JOBS: jobs_panel.handle,
+		Mode.PROPS: props_panel.handle,
+		Mode.PREVIEW: preview.handle,
+	}
+	_panels = {
+		Mode.MENU: _menu_panel,
+		Mode.CONFIRM: _confirm_panel,
+		Mode.KEYBOARD: _keyboard,
+		Mode.CONFLICT: conflict_panel,
+		Mode.JOBS: jobs_panel,
+		Mode.PROPS: props_panel,
+		Mode.PREVIEW: preview,
+	}
+	_overlay_renderers = {
+		Mode.MENU: _render_menu,
+		Mode.JOBS: func(): jobs_panel.update(jobs),
+		Mode.PREVIEW: preview.refresh,
 	}
 	places = core.places()
 	var arg_path := _arg_path()
@@ -72,11 +120,16 @@ func _arg_path() -> String:
 	return ""
 
 
+func _shell_open(path: String) -> int:
+	return OS.shell_open(path)
+
+
 # input
 
 func _unhandled_input(event: InputEvent) -> void:
 	if mode == Mode.KEYBOARD and event is InputEventKey and event.pressed:
 		_keyboard.handle_key(event)
+		_render()
 		get_viewport().set_input_as_handled()
 		return
 	for action: String in JoyInput.ACTIONS:
@@ -98,9 +151,13 @@ func _process(delta: float) -> void:
 		_repeat_at = _clock + REPEAT_RATE
 		fire(_held)
 	_poll_jobs()
+	if thumbs.poll():
+		_render()
+	if mode == Mode.PROPS:
+		props_panel.poll()
 	if _toast_until > 0.0 and _clock > _toast_until:
 		_toast_until = 0.0
-		_render_status()
+		_toast_panel.visible = false
 
 
 func fire(action: String) -> void:
@@ -117,12 +174,14 @@ func _files_action(action: String) -> void:
 		"jf_page_up": _move(-VISIBLE_ROWS)
 		"jf_page_down": _move(VISIBLE_ROWS)
 		"jf_accept", "jf_right": _open_current()
-		"jf_back": go_up()
+		"jf_back": _back()
 		"jf_left", "jf_pane": mode = Mode.PLACES
 		"jf_select": _toggle_select()
 		"jf_menu": _open_menu(_file_menu())
 		"jf_start": _open_menu(_app_menu())
 		"jf_view": _toggle_hidden()
+		"jf_search": _ask_filter()
+		"jf_jobs": _open_jobs()
 
 
 func _places_action(action: String) -> void:
@@ -134,6 +193,7 @@ func _places_action(action: String) -> void:
 			mode = Mode.FILES
 		"jf_back", "jf_pane": mode = Mode.FILES
 		"jf_start": _open_menu(_app_menu())
+		"jf_jobs": _open_jobs()
 
 
 func _menu_action(action: String) -> void:
@@ -157,35 +217,82 @@ func _confirm_action(action: String) -> void:
 
 # navigation
 
-func navigate(path: String, focus_name := "") -> void:
-	var result: Dictionary = core.list_dir(path, show_hidden, "name", false)
+func _list(path: String) -> Variant:
+	var result: Dictionary = core.list_dir(path, settings.show_hidden, settings.sort_key, settings.sort_desc)
 	if not result["ok"]:
 		toast(result["error"], true)
+		return null
+	return result["entries"]
+
+
+func navigate(path: String, focus_name := "") -> void:
+	var listed: Variant = _list(path)
+	if listed == null:
 		return
 	cwd = path
-	entries = result["entries"]
+	all_entries = listed
+	filter = ""
 	selected.clear()
-	cursor = 0
-	for i in entries.size():
-		if entries[i]["name"] == focus_name:
-			cursor = i
-	top = 0
-	_clamp_view()
+	_apply_filter(focus_name)
 
 
-func refresh() -> void:
-	var keep: String = entries[cursor]["name"] if not entries.is_empty() else ""
-	var keep_selected := selected.duplicate()
-	navigate(cwd, keep)
-	for path: String in keep_selected:
-		if entries.any(func(e): return e["path"] == path):
-			selected[path] = true
+func refresh(focus_name := "") -> void:
+	var keep := focus_name if focus_name != "" else _cursor_name()
+	var listed: Variant = _list(cwd)
+	if listed == null:
+		return
+	all_entries = listed
+	if not selected.is_empty():
+		var present := {}
+		for e: Dictionary in all_entries:
+			present[e["path"]] = true
+		for path: String in selected.keys():
+			if not present.has(path):
+				selected.erase(path)
+	_apply_filter(keep)
 
 
 func go_up() -> void:
 	var parent: String = core.parent_dir(cwd)
 	if parent != "":
 		navigate(parent, cwd.get_file() if cwd.get_file() != "" else cwd)
+
+
+func _back() -> void:
+	if filter != "":
+		_set_filter("")
+	else:
+		go_up()
+
+
+func _cursor_name() -> String:
+	return entries[cursor]["name"] if not entries.is_empty() else ""
+
+
+func _apply_filter(focus_name := "") -> void:
+	if filter == "":
+		entries = all_entries
+	else:
+		entries = all_entries.filter(func(e: Dictionary) -> bool: return e["name"].containsn(filter))
+	cursor = 0
+	if focus_name != "":
+		for i in entries.size():
+			if entries[i]["name"] == focus_name:
+				cursor = i
+				break
+	top = 0
+	_clamp_view()
+
+
+func _set_filter(text: String) -> void:
+	filter = text
+	_apply_filter()
+	if mode == Mode.KEYBOARD:
+		_keyboard.set_title(_filter_title())
+
+
+func _filter_title() -> String:
+	return "Filter this folder (%d of %d)" % [entries.size(), all_entries.size()]
 
 
 func _move(step: int) -> void:
@@ -202,15 +309,30 @@ func _clamp_view() -> void:
 		top = cursor - VISIBLE_ROWS + 1
 
 
+func _previewable(e: Dictionary) -> bool:
+	return not e["is_dir"] and JoyThumbs.is_image(e["name"]) and e["size"] <= JoyThumbs.MAX_FILE_BYTES
+
+
 func _open_current() -> void:
 	if entries.is_empty():
 		return
 	var e: Dictionary = entries[cursor]
 	if e["is_dir"]:
 		navigate(e["path"])
+	elif _previewable(e):
+		preview.open(thumbs, entries, cursor)
+		mode = Mode.PREVIEW
 	else:
-		OS.shell_open(e["path"])
-		toast("Opened %s in the default app." % e["name"])
+		_open_file(e)
+
+
+# a good result is no proof, because Game Mode can accept the call and show nothing
+func _open_file(e: Dictionary) -> void:
+	var err: int = opener.call(e["path"])
+	if err == OK:
+		toast("Asked the system to open %s. If nothing happens, open it in Desktop Mode." % e["name"])
+	else:
+		toast("Could not open %s. This system has no app for that file type." % e["name"], true)
 
 
 func _toggle_select() -> void:
@@ -225,9 +347,23 @@ func _toggle_select() -> void:
 
 
 func _toggle_hidden() -> void:
-	show_hidden = not show_hidden
+	settings.show_hidden = not settings.show_hidden
 	refresh()
-	toast("Hidden files are shown." if show_hidden else "Hidden files are not shown.")
+	toast("Hidden files are shown." if settings.show_hidden else "Hidden files are not shown.")
+	_save_settings()
+
+
+func _set_sort(key: String, desc: bool) -> void:
+	settings.sort_key = key
+	settings.sort_desc = desc
+	refresh()
+	toast("Sorted by %s, %s." % [JoySettings.SORTS[key][0].to_lower(), JoySettings.order_text(key, desc)])
+	_save_settings()
+
+
+func _save_settings() -> void:
+	if settings.save() != OK:
+		toast("Could not save your settings.", true)
 
 
 func targets() -> PackedStringArray:
@@ -250,6 +386,7 @@ func _file_menu() -> Array:
 		items.append(["Paste %d here" % clipboard["paths"].size(), paste])
 	if t.size() == 1:
 		items.append(["Rename", func(): _ask_rename(t[0])])
+		items.append(["Properties", func(): _open_props(t[0])])
 	items.append(["New folder", _ask_new_folder])
 	if not t.is_empty():
 		items.append(["Move to trash (%d)" % t.size(), func(): _ask_trash(t)])
@@ -267,10 +404,23 @@ func select_all() -> void:
 
 func _app_menu() -> Array:
 	return [
-		["Hide hidden files" if show_hidden else "Show hidden files", _toggle_hidden],
+		["Jobs (%d)" % jobs.size() if not jobs.is_empty() else "Jobs", _open_jobs],
+		["Filter this folder", _ask_filter],
+		["Sort...", _open_sort_menu],
+		["Hide hidden files" if settings.show_hidden else "Show hidden files", _toggle_hidden],
 		["Refresh", refresh],
 		["Quit Joyfiles", func(): get_tree().quit()],
 	]
+
+
+func _open_sort_menu() -> void:
+	var items: Array = []
+	for key: String in JoySettings.SORTS:
+		var mark := " ✓" if key == settings.sort_key else ""
+		items.append([JoySettings.SORTS[key][0] + mark, _set_sort.bind(key, settings.sort_desc)])
+	var order := JoySettings.order_text(settings.sort_key, settings.sort_desc)
+	items.append(["Order: " + order, _set_sort.bind(settings.sort_key, not settings.sort_desc)])
+	_open_menu(items)
 
 
 func _open_menu(items: Array) -> void:
@@ -296,7 +446,7 @@ func _ask_rename(path: String) -> void:
 	_ask_text("Rename", path.get_file(), func(new_name: String):
 		var r: Dictionary = core.rename(path, new_name)
 		if r["ok"]:
-			navigate(cwd, r["path"].get_file())
+			refresh(r["path"].get_file())
 		else:
 			toast(r["error"], true))
 
@@ -305,9 +455,15 @@ func _ask_new_folder() -> void:
 	_ask_text("New folder name", "", func(new_name: String):
 		var r: Dictionary = core.make_dir(cwd, new_name)
 		if r["ok"]:
-			navigate(cwd, r["path"].get_file())
+			refresh(r["path"].get_file())
 		else:
 			toast(r["error"], true))
+
+
+func _ask_filter() -> void:
+	var before := filter
+	_ask_text("Filter this folder", filter, _set_filter, _set_filter, func(): _set_filter(before))
+	_keyboard.set_title(_filter_title())
 
 
 func _ask_trash(paths: PackedStringArray) -> void:
@@ -323,8 +479,10 @@ func _ask_trash(paths: PackedStringArray) -> void:
 	mode = Mode.CONFIRM
 
 
-func _ask_text(title: String, initial: String, on_submit: Callable) -> void:
+func _ask_text(title: String, initial: String, on_submit: Callable, on_change := Callable(), on_cancel := Callable()) -> void:
 	_on_submit = on_submit
+	_on_change = on_change
+	_on_cancel = on_cancel
 	_keyboard.open(title, initial)
 	mode = Mode.KEYBOARD
 
@@ -335,14 +493,31 @@ func _on_keyboard_submitted(text: String) -> void:
 	_render()
 
 
+func _on_keyboard_changed(text: String) -> void:
+	if _on_change.is_valid():
+		_on_change.call(text)
+
+
 func _on_keyboard_cancelled() -> void:
 	mode = Mode.FILES
+	if _on_cancel.is_valid():
+		_on_cancel.call()
 	_render()
+
+
+func _open_props(path: String) -> void:
+	props_panel.open(core, path)
+	mode = Mode.PROPS
+
+
+func _open_jobs() -> void:
+	mode = Mode.JOBS
 
 
 func _poll_jobs() -> void:
 	if jobs.is_empty():
 		return
+	var ended := false
 	for job: Dictionary in core.poll_jobs():
 		var id: int = job["id"]
 		jobs[id].merge(job, true)
@@ -354,17 +529,76 @@ func _poll_jobs() -> void:
 			"cancelled":
 				toast("The job was cancelled.")
 		if job["state"] != "running":
+			ended = true
 			if jobs[id]["dest"] == cwd:
 				refresh()
 			jobs.erase(id)
+	_ask_next_conflict()
 	_render_status()
+	if ended:
+		_render_hints()
+	if mode == Mode.JOBS:
+		_render_overlay()
+
+
+func _ask_next_conflict() -> void:
+	if mode not in PROMPT_MODES:
+		return
+	for id: int in jobs:
+		if not jobs[id].get("conflict", {}).is_empty():
+			_open_conflict(id)
+			return
+
+
+func _open_conflict(id: int) -> void:
+	_conflict_job = id
+	_conflict_return = mode
+	conflict_panel.open(jobs[id]["conflict"])
+	mode = Mode.CONFLICT
+	_render()
+
+
+func _on_conflict_answered(choice: String, apply_all: bool) -> void:
+	core.answer_conflict(_conflict_job, choice, apply_all)
+	_close_conflict()
+
+
+func _on_conflict_cancelled() -> void:
+	core.cancel_job(_conflict_job)
+	_close_conflict()
+
+
+func _close_conflict() -> void:
+	if jobs.has(_conflict_job):
+		jobs[_conflict_job]["conflict"] = {}
+	_conflict_job = -1
+	mode = _conflict_return
+
+
+func _on_answer_requested(id: int) -> void:
+	if jobs_panel.is_waiting(id, jobs):
+		_open_conflict(id)
+
+
+func _on_preview_closed() -> void:
+	cursor = preview.index
+	_clamp_view()
+	mode = Mode.FILES
+
+
+func _on_props_closed() -> void:
+	props_panel.close()
+	mode = Mode.FILES
 
 
 func toast(text: String, is_error := false) -> void:
 	last_error = text if is_error else ""
-	_status.text = text
-	_status.add_theme_color_override("font_color", Theme_.DANGER if is_error else Theme_.TEXT)
-	_toast_until = _clock + 4.0
+	_toast_label.text = text
+	_toast_label.add_theme_color_override("font_color", Theme_.DANGER if is_error else Theme_.TEXT)
+	var width := _toast_label.get_theme_font("font").get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, TOAST_FONT).x
+	_toast_label.custom_minimum_size.x = minf(width + 8.0, TOAST_MAX_WIDTH)
+	_toast_panel.visible = true
+	_toast_until = _clock + (6.0 if is_error else 4.0)
 
 
 # rendering
@@ -382,10 +616,15 @@ func _build_ui() -> void:
 	var header := PanelContainer.new()
 	header.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 0, 16))
 	var header_row := HBoxContainer.new()
+	header_row.add_theme_constant_override("separation", 20)
 	header.add_child(header_row)
 	_path_label = Theme_.label("", Theme_.TEXT, 26, true)
 	_path_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	header_row.add_child(_path_label)
+	_filter_label = Theme_.label("", Theme_.WARN, 22)
+	header_row.add_child(_filter_label)
+	_sort_label = Theme_.label("", Theme_.MUTED, 22)
+	header_row.add_child(_sort_label)
 	_count_label = Theme_.label("", Theme_.MUTED, 22)
 	header_row.add_child(_count_label)
 	root.add_child(header)
@@ -409,13 +648,28 @@ func _build_ui() -> void:
 		var hb := HBoxContainer.new()
 		hb.add_theme_constant_override("separation", 14)
 		row.add_child(hb)
-		hb.add_child(Theme_.label("", Theme_.ACCENT, 22))
+		var slot := Control.new()
+		slot.custom_minimum_size = Vector2(THUMB_BOX, THUMB_BOX)
+		hb.add_child(slot)
+		var thumb := TextureRect.new()
+		thumb.set_anchors_preset(Control.PRESET_FULL_RECT)
+		thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		thumb.visible = false
+		slot.add_child(thumb)
+		var glyph := Theme_.label("", Theme_.ACCENT, 22)
+		glyph.set_anchors_preset(Control.PRESET_FULL_RECT)
+		glyph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		glyph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		slot.add_child(glyph)
 		var name_label := Theme_.label("", Theme_.TEXT, 24, true)
 		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		hb.add_child(name_label)
-		hb.add_child(Theme_.label("", Theme_.MUTED, 20))
+		var size_label := Theme_.label("", Theme_.MUTED, 20)
+		hb.add_child(size_label)
 		list.add_child(row)
 		_rows.append(row)
+		_row_parts.append({"glyph": glyph, "thumb": thumb, "name": name_label, "size": size_label})
 
 	_footer = HBoxContainer.new()
 	var footer_panel := PanelContainer.new()
@@ -450,39 +704,92 @@ func _build_ui() -> void:
 	_overlay.add_child(_confirm_panel)
 	_keyboard = JoyKeyboard.new()
 	_keyboard.submitted.connect(_on_keyboard_submitted)
+	_keyboard.changed.connect(_on_keyboard_changed)
 	_keyboard.cancelled.connect(_on_keyboard_cancelled)
 	_overlay.add_child(_keyboard)
+	conflict_panel = JoyConflict.new()
+	conflict_panel.answered.connect(_on_conflict_answered)
+	conflict_panel.cancelled.connect(_on_conflict_cancelled)
+	_overlay.add_child(conflict_panel)
+	jobs_panel = JoyJobs.new()
+	jobs_panel.closed.connect(func(): mode = Mode.FILES)
+	jobs_panel.cancel_requested.connect(core.cancel_job)
+	jobs_panel.answer_requested.connect(_on_answer_requested)
+	_overlay.add_child(jobs_panel)
+	props_panel = JoyProps.new()
+	props_panel.closed.connect(_on_props_closed)
+	_overlay.add_child(props_panel)
+	preview = JoyPreview.new()
+	preview.closed.connect(_on_preview_closed)
+	_overlay.add_child(preview)
+	var toast_holder := VBoxContainer.new()
+	toast_holder.set_anchors_preset(Control.PRESET_FULL_RECT)
+	toast_holder.alignment = BoxContainer.ALIGNMENT_END
+	toast_holder.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(toast_holder)
+	var toast_row := CenterContainer.new()
+	toast_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	toast_holder.add_child(toast_row)
+	var toast_gap := Control.new()
+	toast_gap.custom_minimum_size.y = TOAST_LIFT
+	toast_holder.add_child(toast_gap)
+	_toast_panel = PanelContainer.new()
+	_toast_panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL, 12, 16))
+	_toast_panel.visible = false
+	_toast_label = Theme_.label("", Theme_.TEXT, TOAST_FONT)
+	_toast_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_toast_panel.add_child(_toast_label)
+	toast_row.add_child(_toast_panel)
 
 
 func _render() -> void:
 	var home: String = places[0]["path"]
 	_path_label.text = ("~" + cwd.trim_prefix(home)) if cwd.begins_with(home) else cwd
+	_filter_label.visible = filter != ""
+	_filter_label.text = "Filter: " + filter
+	_sort_label.text = "%s %s" % [JoySettings.SORTS[settings.sort_key][0], "▼" if settings.sort_desc else "▲"]
 	_count_label.text = "%d / %d" % [cursor + 1 if not entries.is_empty() else 0, entries.size()]
+	_render_rows()
+	_render_places()
+	_render_overlay()
+	_render_hints()
+
+
+func _render_rows() -> void:
+	var wanted: Array = []
 	for i in VISIBLE_ROWS:
 		var row := _rows[i]
+		var part: Dictionary = _row_parts[i]
 		var idx := top + i
-		var labels := row.get_child(0).get_children()
+		part["thumb"].visible = false
 		if idx >= entries.size():
-			row.add_theme_stylebox_override("panel", Theme_.box(Color.TRANSPARENT, 0, 8))
-			for l: Label in labels:
-				l.text = ""
+			row.add_theme_stylebox_override("panel", Theme_.box_xy(Color.TRANSPARENT, 8, 8, 4))
+			part["glyph"].text = ""
+			part["name"].text = ""
+			part["size"].text = ""
 			if idx == 0:
-				labels[1].text = "This folder is empty."
-				labels[1].add_theme_color_override("font_color", Theme_.MUTED)
+				part["name"].text = "No items match the filter." if filter != "" else "This folder is empty."
+				part["name"].add_theme_color_override("font_color", Theme_.MUTED)
 			continue
 		var e: Dictionary = entries[idx]
 		var is_cursor: bool = idx == cursor and mode != Mode.PLACES
 		var is_selected: bool = selected.has(e["path"])
 		var bg := Theme_.ACCENT if is_cursor else (Theme_.ROW_SEL if is_selected else Color.TRANSPARENT)
-		row.add_theme_stylebox_override("panel", Theme_.box(bg, 8, 8))
-		labels[0].text = ("✓" if is_selected else "") + ("▰" if e["is_dir"] else "▫")
-		labels[0].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
-		labels[1].text = e["name"]
-		labels[1].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
-		labels[2].text = "" if e["is_dir"] else Theme_.human_size(e["size"])
-	_render_places()
-	_render_overlay()
-	_render_hints()
+		row.add_theme_stylebox_override("panel", Theme_.box_xy(bg, 8, 8, 4))
+		var tex: Texture2D = null
+		if _previewable(e):
+			wanted.append(e["path"])
+			tex = thumbs.texture(e["path"], JoyThumbs.THUMB_SIDE)
+		part["thumb"].texture = tex
+		part["thumb"].visible = tex != null
+		part["thumb"].modulate.a = 0.45 if is_selected else 1.0
+		var shape := "" if tex != null else ("▰" if e["is_dir"] else "▫")
+		part["glyph"].text = ("✓" if is_selected else "") + shape
+		part["glyph"].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
+		part["name"].text = e["name"]
+		part["name"].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
+		part["size"].text = "" if e["is_dir"] else Theme_.human_size(e["size"])
+	thumbs.want(wanted, JoyThumbs.THUMB_SIDE)
 
 
 func _render_places() -> void:
@@ -499,12 +806,14 @@ func _render_places() -> void:
 
 
 func _render_overlay() -> void:
-	_dim.visible = mode in [Mode.MENU, Mode.CONFIRM, Mode.KEYBOARD]
-	_menu_panel.visible = mode == Mode.MENU
-	_confirm_panel.visible = mode == Mode.CONFIRM
-	_keyboard.visible = mode == Mode.KEYBOARD
-	if mode != Mode.MENU:
-		return
+	_dim.visible = _panels.has(mode)
+	for panel_mode: int in _panels:
+		_panels[panel_mode].visible = panel_mode == mode
+	if _overlay_renderers.has(mode):
+		_overlay_renderers[mode].call()
+
+
+func _render_menu() -> void:
 	for child in _menu_box.get_children():
 		child.queue_free()
 	for i in menu_items.size():
@@ -519,24 +828,39 @@ const HINTS := {
 	Mode.MENU: [["A", "Choose"], ["B", "Close"]],
 	Mode.KEYBOARD: [],
 	Mode.CONFIRM: [["A", "Yes"], ["B", "No"]],
+	Mode.CONFLICT: [["A", "Choose"], ["Y", "All"], ["B", "Cancel job"]],
+	Mode.JOBS: [["X", "Cancel job"], ["B", "Close"]],
+	Mode.PROPS: [["B", "Close"]],
+	Mode.PREVIEW: [["Left", "Previous"], ["Right", "Next"], ["B", "Close"]],
 }
+
+
+func _hints_for_mode() -> Array:
+	var pairs: Array = HINTS[mode].duplicate()
+	if mode in PROMPT_MODES and not jobs.is_empty():
+		pairs.append(["L3", "Jobs"])
+	if mode == Mode.FILES and filter != "":
+		pairs = pairs.map(func(p: Array) -> Array: return ["B", "Clear filter"] if p[1] == "Up" else p)
+	return pairs
 
 
 func _render_hints() -> void:
 	if _hints:
 		_hints.queue_free()
-	_hints = Theme_.hints(HINTS[mode])
+	_hints = Theme_.hints(_hints_for_mode())
 	_footer.add_child(_hints)
 
 
 func _render_status() -> void:
-	if _toast_until > 0.0:
-		return
 	var running := jobs.values().filter(func(j): return j.get("state", "running") == "running")
 	if running.is_empty():
 		_status.text = ""
 		return
 	var j: Dictionary = running[0]
-	var pct: int = 0 if j.get("total_bytes", 0) == 0 else int(100.0 * j["done_bytes"] / j["total_bytes"])
 	_status.add_theme_color_override("font_color", Theme_.TEXT)
-	_status.text = "%s %s  %d%%" % ["Moving" if j.get("kind") == "move" else "Copying", j.get("current", ""), pct]
+	var verb := "Moving" if j.get("kind") == "move" else "Copying"
+	if not j.get("conflict", {}).is_empty():
+		_status.text = "%s paused: %s already exists." % [verb, j["conflict"]["name"]]
+		return
+	var pct: int = 0 if j.get("total_bytes", 0) == 0 else int(100.0 * j["done_bytes"] / j["total_bytes"])
+	_status.text = "%s %s  %d%%" % [verb, j.get("current", ""), pct]
