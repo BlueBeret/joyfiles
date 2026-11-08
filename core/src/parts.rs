@@ -172,14 +172,17 @@ pub fn sweep(dir: &Path, min_age: Duration, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs::File;
 
+    #[cfg(unix)]
     fn names_in(dir: &Path) -> Vec<String> {
         let mut out: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         out.sort();
         out
     }
 
+    #[cfg(unix)]
     fn backdate(path: &Path) {
         File::open(path).unwrap().set_modified(SystemTime::now() - 2 * SAFE_AGE).unwrap();
     }

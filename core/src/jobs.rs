@@ -608,9 +608,10 @@ fn mount_point_error() -> io::Error {
     io::Error::other("it is a drive or a mount point, so it cannot be moved")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const SYNC_FAILS: &str = "sync-fails-here";
 
+#[cfg(unix)]
 fn refused_in_tests(_dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     if _dir.components().any(|c| c.as_os_str() == SYNC_FAILS) {
