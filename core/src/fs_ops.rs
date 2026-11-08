@@ -413,6 +413,34 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+// a plain rename replaces an item that took the name a moment ago, so this one fails with AlreadyExists instead
+#[cfg(target_os = "linux")]
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let text = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput));
+    let (a, b) = (text(from)?, text(to)?);
+    if unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_NOREPLACE) } == 0 {
+        return Ok(());
+    }
+    match io::Error::last_os_error() {
+        // a drive that does not know the flag gets the check and the rename as two steps
+        e if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => checked_rename(from, to),
+        e => Err(e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    checked_rename(from, to)
+}
+
+fn checked_rename(from: &Path, to: &Path) -> io::Result<()> {
+    if exists_nofollow(to) {
+        return Err(io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(from, to)
+}
+
 // removes one item that is not a real folder, and on Windows a folder link needs the folder call
 pub fn remove_item(path: &Path) -> io::Result<()> {
     #[cfg(windows)]

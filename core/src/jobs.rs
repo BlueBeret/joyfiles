@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::fs_ops::{Entry, Failure, display_name, exists_nofollow, holds_mount_point, is_mount_point, is_within, reason, remove_item, remove_temp_tree, remove_tree, same_dir, stat_entry, summary, unique_dest};
+use crate::fs_ops::{Entry, Failure, display_name, exists_nofollow, holds_mount_point, is_mount_point, is_within, reason, remove_item, remove_temp_tree, remove_tree, rename_noreplace, same_dir, stat_entry, summary, unique_dest};
 use crate::parts::{self, LiveJob, Owner, Role, SAFE_AGE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +177,26 @@ struct Worker<'a> {
     tasks: Vec<Task>,
     unsettled: Vec<Unsettled>,
     unsettled_bytes: u64,
+    // what this job placed, so a later item with a name that clashes on a drive that ignores case never replaces it
+    created: HashSet<ItemKey>,
+}
+
+#[cfg(unix)]
+type ItemKey = (u64, u64);
+
+#[cfg(unix)]
+fn item_key(path: &Path) -> Option<ItemKey> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+// every path of a job starts at its destination, and Windows ignores case, so the lower case path names one item
+#[cfg(not(unix))]
+type ItemKey = String;
+
+#[cfg(not(unix))]
+fn item_key(path: &Path) -> Option<ItemKey> {
+    Some(path.to_string_lossy().to_lowercase())
 }
 
 // a plain copy promises nothing on power loss, a durable copy is on the drive before an old item goes, and a move removes each source only after that
@@ -230,7 +250,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0 };
+    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, created: HashSet::new() };
     while let Some(task) = worker.tasks.pop() {
         match task {
             Task::Transfer { src, dest_dir } => {
@@ -287,8 +307,10 @@ impl Worker<'_> {
         let mut leaving = Vec::new();
         for item in batch {
             match item {
-                Unsettled::File { src, part, dest } => match commit_part(&part, &dest) {
-                    Ok(()) => leaving.push(src),
+                Unsettled::File { src, part, dest } => match self.commit(&src, &part, &dest) {
+                    Ok(Some(_)) => leaving.push(src),
+                    Ok(None) => {}
+                    Err(_) if self.p.cancel.load(Ordering::Relaxed) => {}
                     Err(e) => self.note(&src, &e),
                 },
                 Unsettled::Link { src, .. } => leaving.push(src),
@@ -333,6 +355,8 @@ impl Worker<'_> {
                 target = unique_dest(dest_dir, name, is_real_dir(src));
             } else if is_real_dir(src) && is_real_dir(&target) {
                 return self.merge(src, &target);
+            } else if self.made_here(&target) {
+                target = unique_dest(dest_dir, name, is_real_dir(src));
             } else {
                 match self.resolve(src, &target)? {
                     Resolution::Skip => {
@@ -367,16 +391,13 @@ impl Worker<'_> {
             return Err(io::Error::other("it holds a drive or a mount point, so it cannot be replaced"));
         }
         if self.p.kind == JobKind::Move {
-            let aside = temp_beside(target, self.owner, Role::Old);
-            fs::rename(target, &aside)?;
-            match fs::rename(src, target) {
+            match self.swap_in(src, target) {
                 Ok(()) => {
                     self.p.add_done(tree_size(target));
-                    self.discard(&aside, target);
+                    self.record(target);
                     return Ok(());
                 }
                 Err(e) => {
-                    fs::rename(&aside, target)?;
                     copy_instead_of_rename(src, e)?;
                     if is_real_dir(src) && holds_mount_point(src) {
                         return Err(mount_point_error());
@@ -392,32 +413,79 @@ impl Worker<'_> {
             copied?;
             return Err(io::Error::other("part of it could not be copied, so the old item stays"));
         }
-        let aside = temp_beside(target, self.owner, Role::Old);
-        if let Err(e) = fs::rename(target, &aside) {
+        if let Err(e) = self.swap_in(&staging, target) {
             let _ = remove_temp_tree(&staging);
             return Err(e);
         }
-        if let Err(e) = fs::rename(&staging, target) {
-            let _ = fs::rename(&aside, target);
-            let _ = remove_temp_tree(&staging);
-            return Err(e);
-        }
-        self.discard(&aside, target);
+        self.record(target);
         if self.p.kind == JobKind::Move {
             remove_tree(src)?;
         }
         Ok(())
     }
 
-    // the old item goes only once the new name is on the drive, and what cannot go comes back under a visible name
-    fn discard(&self, aside: &Path, target: &Path) {
+    // the old item moves aside, the new one takes its name, and the old one goes only once that name is on the drive
+    fn swap_in(&self, new: &Path, target: &Path) -> io::Result<()> {
+        let aside = temp_beside(target, self.owner, Role::Old);
+        fs::rename(target, &aside)?;
+        if let Err(e) = rename_noreplace(new, target) {
+            if let Err(back) = rename_noreplace(&aside, target) {
+                self.surface(&aside, target, "Could not put back the old", &back);
+            }
+            return Err(e);
+        }
         let dir = target.parent().unwrap_or(Path::new("."));
-        let Err(e) = sync_dir(dir).and_then(|()| remove_temp_tree(aside)) else { return };
-        let name = display_name(target);
-        let rest = unique_dest(dir, target.file_name().unwrap_or_default(), is_real_dir(aside));
-        let left = if fs::rename(aside, &rest).is_ok() { rest } else { aside.to_path_buf() };
-        let message = format!("Could not remove all of the old \"{name}\": {}. What is left of it is \"{}\".", reason(&e), display_name(&left));
+        if let Err(e) = sync_dir(dir).and_then(|()| remove_temp_tree(&aside)) {
+            self.surface(&aside, target, "Could not remove all of the old", &e);
+        }
+        Ok(())
+    }
+
+    // an old item that can neither go back nor go away comes back under a visible name, so it never hides on the drive
+    fn surface(&self, aside: &Path, target: &Path, what: &str, err: &io::Error) {
+        let rest = unique_dest(target.parent().unwrap_or(Path::new(".")), target.file_name().unwrap_or_default(), is_real_dir(aside));
+        let left = if rename_noreplace(aside, &rest).is_ok() { rest } else { aside.to_path_buf() };
+        let message = format!("{what} \"{}\": {}. It is now \"{}\".", display_name(target), reason(err), display_name(&left));
         self.p.failures.lock().unwrap().push(Failure { path: left, message });
+    }
+
+    // an item counts as placed by this job when it or a folder above it was, so a merge into such a folder never replaces either
+    fn made_here(&self, path: &Path) -> bool {
+        !self.created.is_empty() && path.ancestors().filter_map(item_key).any(|key| self.created.contains(&key))
+    }
+
+    fn record(&mut self, path: &Path) {
+        if let Some(key) = item_key(path) {
+            self.created.insert(key);
+        }
+    }
+
+    // the finished part takes its name, and a name that something else took meanwhile raises the usual question
+    fn commit(&mut self, src: &Path, part: &Path, dest: &Path) -> io::Result<Option<PathBuf>> {
+        let placed = self.place_part(src, part, dest);
+        match &placed {
+            Ok(Some(path)) => self.record(path),
+            _ => {
+                let _ = fs::remove_file(part);
+            }
+        }
+        placed
+    }
+
+    fn place_part(&mut self, src: &Path, part: &Path, dest: &Path) -> io::Result<Option<PathBuf>> {
+        match rename_noreplace(part, dest) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            done => return done.map(|()| Some(dest.to_path_buf())),
+        }
+        let choice = if self.made_here(dest) { Resolution::KeepBoth } else { self.resolve(src, dest)? };
+        match choice {
+            Resolution::Skip => Ok(None),
+            Resolution::KeepBoth => {
+                let other = unique_dest(dest.parent().unwrap_or(Path::new(".")), dest.file_name().unwrap_or_default(), false);
+                rename_noreplace(part, &other).map(|()| Some(other))
+            }
+            Resolution::Replace => self.swap_in(part, dest).map(|()| Some(dest.to_path_buf())),
+        }
     }
 
     fn resolve(&mut self, src: &Path, target: &Path) -> io::Result<Resolution> {
@@ -437,9 +505,16 @@ impl Worker<'_> {
 
     fn place(&mut self, src: &Path, target: &Path) -> io::Result<()> {
         if self.p.kind == JobKind::Move {
-            match fs::rename(src, target) {
+            match rename_noreplace(src, target) {
                 Ok(()) => {
                     self.p.add_done(tree_size(target));
+                    self.record(target);
+                    return Ok(());
+                }
+                // something took the name since the check, so the item meets the clash question again
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let dest_dir = target.parent().unwrap_or(Path::new(".")).to_path_buf();
+                    self.tasks.push(Task::Transfer { src: src.to_path_buf(), dest_dir });
                     return Ok(());
                 }
                 Err(e) => copy_instead_of_rename(src, e)?,
@@ -489,6 +564,7 @@ impl Worker<'_> {
                 return Err(mount_point_error());
             }
             create_private_dir(dest, &meta)?;
+            self.record(dest);
             pending.push(Step::Close { src: src.to_path_buf(), dest: dest.to_path_buf(), meta });
             let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
             for entry in children.into_iter().rev() {
@@ -496,6 +572,7 @@ impl Worker<'_> {
             }
         } else if meta.file_type().is_symlink() {
             copy_symlink(src, dest)?;
+            self.record(dest);
             self.p.add_done(meta.len());
             if how != Copying::Plain {
                 self.unsettled.push(Unsettled::Link { src: src.to_path_buf(), dest: dest.to_path_buf() });
@@ -503,7 +580,7 @@ impl Worker<'_> {
         } else if meta.is_file() {
             let part = write_copy(self.p, src, dest, self.owner, how != Copying::Plain)?;
             if how == Copying::Plain {
-                commit_part(&part, dest)?;
+                self.commit(src, &part, dest)?;
             } else {
                 self.unsettled_bytes += meta.len();
                 self.unsettled.push(Unsettled::File { src: src.to_path_buf(), part, dest: dest.to_path_buf() });
@@ -712,14 +789,6 @@ fn write_copy(p: &Progress, src: &Path, dest: &Path, owner: Owner, durable: bool
             Err(e)
         }
     }
-}
-
-fn commit_part(part: &Path, dest: &Path) -> io::Result<()> {
-    let placed = if exists_nofollow(dest) { Err(io::ErrorKind::AlreadyExists.into()) } else { fs::rename(part, dest) };
-    if placed.is_err() {
-        let _ = fs::remove_file(part);
-    }
-    placed
 }
 
 fn write_part(p: &Progress, input: &mut File, part: &Path, durable: bool) -> io::Result<()> {
@@ -1075,6 +1144,48 @@ mod tests {
         assert_eq!(read(here.path().join("d/sub/b.txt")), "b");
         assert_eq!(names_in(&dest), ["d"], "an unconfirmed copy never takes its name and leaves no part");
         assert!(names_in(&dest.join("d/sub")).is_empty());
+    }
+
+    // on a drive that ignores case, Case.txt and case.txt clash the same way
+    #[test]
+    fn a_job_never_replaces_an_item_it_placed_itself() {
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("out");
+            for (dir, text) in [("one", "first"), ("two", "second")] {
+                fs::create_dir(tmp.path().join(dir)).unwrap();
+                fs::write(tmp.path().join(dir).join("a.txt"), text).unwrap();
+            }
+            fs::create_dir(&out).unwrap();
+            let list = vec![tmp.path().join("one/a.txt"), tmp.path().join("two/a.txt")];
+            let p = spawn(kind, list, out.clone(), Policy::Always(Resolution::Replace));
+            assert_eq!(wait(&p), JobState::Done);
+            assert_eq!((read(out.join("a.txt")), read(out.join("a (2).txt"))), ("first".into(), "second".into()), "{kind:?} kept both");
+        }
+    }
+
+    #[test]
+    fn a_name_taken_by_another_job_while_the_copy_runs_raises_the_question() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&out).unwrap();
+        fs::write(src.join("big.bin"), vec![7u8; 256 << 20]).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join("big.bin")], out.clone(), ASK);
+        while p.done_bytes.load(Ordering::Relaxed) == 0 && p.state() == JobState::Running {
+            thread::yield_now();
+        }
+        fs::write(out.join("big.bin"), "theirs").unwrap();
+        if p.state() != JobState::Running || fs::metadata(out.join("big.bin")).unwrap().len() != 6 {
+            eprintln!("skipped: the copy ended before the other item came");
+            return;
+        }
+        assert_eq!(wait_for_conflict(&p).name, "big.bin");
+        p.answer(Resolution::KeepBoth, false);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(read(out.join("big.bin")), "theirs");
+        assert_eq!(fs::metadata(out.join("big (2).bin")).unwrap().len(), 256 << 20);
+        assert_eq!(names_in(&out), ["big (2).bin", "big.bin"], "no part file stays");
     }
 
     #[test]

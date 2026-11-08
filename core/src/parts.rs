@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use crate::fs_ops::{NAME_MAX, exists_nofollow, holds_mount_point, remove_temp_tree, truncate};
+use crate::fs_ops::{NAME_MAX, exists_nofollow, holds_mount_point, remove_temp_tree, rename_noreplace, truncate};
 
 // an item nobody changed for this long and that no live job of this process owns is a leftover of a crash
 pub const SAFE_AGE: Duration = Duration::from_secs(60 * 60);
@@ -162,9 +162,8 @@ pub fn sweep(dir: &Path, min_age: Duration, stop: &AtomicBool) {
             continue;
         }
         let home = dir.join(&temp.stem);
-        if temp.role == Role::Old && !exists_nofollow(&home) {
-            let _ = fs::rename(&path, &home);
-        } else {
+        let restored = temp.role == Role::Old && rename_noreplace(&path, &home).is_ok();
+        if !restored {
             let _ = remove_temp_tree(&path);
         }
     }
