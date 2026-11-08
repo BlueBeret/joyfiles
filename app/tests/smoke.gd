@@ -233,6 +233,7 @@ func _run() -> void:
 	_preview_math()
 	await _fitting()
 	_contrast()
+	await _round3_layout()
 	app.queue_free()
 	await frames()
 	var input_suite: GDScript = load("res://tests/input.gd")
@@ -745,6 +746,7 @@ func _keyboard_fallback() -> void:
 	var done := InputEventKey.new()
 	done.pressed = true
 	done.keycode = KEY_ENTER
+	app._guard_until = 0.0
 	app._unhandled_input(done)
 	check(app.mode == app.Mode.FILES, "the Enter key finishes the on-screen keyboard")
 	app._set_filter("")
@@ -1355,6 +1357,92 @@ func _trash_text_of_filtered() -> void:
 	pick("Move to trash")
 	check(app.mode == app.Mode.CONFIRM and app._confirm_label.text == "Move 2 items to the trash?", "the trash question names the visible items (%s)" % app._confirm_label.text)
 	press("jf_back")
+
+
+func _round3_layout() -> void:
+	for pair: Array in [[1023, "1023 B"], [1024, "1.0 KB"], [1048575, "1.0 MB"], [1073741823, "1.0 GB"], [1099511627775, "1.0 TB"], [1536, "1.5 KB"]]:
+		check(Theme_.human_size(pair[0]) == pair[1], "%d bytes read as %s (%s)" % [pair[0], pair[1], Theme_.human_size(pair[0])])
+	check(JoyPathText.printable("evil\u202Etxt.exe") == "evil<U+202E>txt.exe", "a right to left override shows as a mark (%s)" % JoyPathText.printable("evil\u202Etxt.exe"))
+	check(JoyPathText.printable("a\nb\u0007") == "a<U+000A>b<U+0007>", "line break and bell show as marks")
+	check(JoyPathText.printable(" ") == "<U+0020>", "a name of one space is visible (%s)" % JoyPathText.printable(" "))
+	check(JoyPathText.printable("ok \u0e01\U0001F468\u200D\U0001F469.txt") == "ok \u0e01\U0001F468\u200D\U0001F469.txt", "joiners and normal text stay as they are")
+
+	var dots := root_dir + "/dots3"
+	write(dots + "/a.txt", "x")
+	app.settings.show_hidden = false
+	app.navigate(dots)
+	app._ask_new_folder()
+	app._on_keyboard_submitted(".hid")
+	check(DirAccess.dir_exists_absolute(dots + "/.hid") and app._toast_panel.visible and app._toast_label.text.contains("is hidden"), "a new folder with a dot name tells the user it is hidden (%s)" % app._toast_label.text)
+	app.toast("")
+	app._ask_rename(dots + "/a.txt")
+	app._on_keyboard_submitted(".a.txt")
+	check(FileAccess.file_exists(dots + "/.a.txt") and app._toast_label.text.contains("is hidden"), "a rename to a dot name tells the user it is hidden (%s)" % app._toast_label.text)
+	app.toast("")
+	app._ask_new_folder()
+	app._on_keyboard_submitted("shown")
+	check(not app._toast_label.text.contains("is hidden"), "a normal new folder gets no hidden notice")
+
+	var weird := root_dir + "/weird3"
+	write(weird + "/evil\u202Etxt.exe", "x")
+	write(weird + "/line1\nline2.txt", "x")
+	write(weird + "/combining_" + "\u0301".repeat(40) + ".txt", "x")
+	write(weird + "/zz_last.txt", "x")
+	app.navigate(weird)
+	app.cursor = app.entries.size() - 1
+	app._clamp_view()
+	app._render()
+	await frames(4)
+	var tall: Array = app._rows.filter(func(r: Control) -> bool: return r.size.y > 51.0)
+	check(tall.is_empty(), "every row keeps its height with odd names (%d tall rows)" % tall.size())
+	var host_rect: Rect2 = app._list_host.get_global_rect()
+	var row_rect: Rect2 = app._rows[app.cursor - app.top].get_global_rect()
+	check(host_rect.encloses(row_rect), "the cursor row stays inside the list (%s in %s)" % [row_rect, host_rect])
+	var shown_names: Array = app._row_parts.map(func(p: Dictionary) -> String: return p["name"].text)
+	check(shown_names.any(func(n: String) -> bool: return n.contains("<U+202E>")), "the list shows the override as a mark: %s" % [shown_names])
+	check(shown_names.any(func(n: String) -> bool: return n.contains("<U+000A>")), "the list shows the line break as a mark")
+
+	app._open_props(root_dir + "/no_such_item")
+	var props: Dictionary = app.props_panel.shown
+	check(props.get("Size", "") == "" and props.get("Modified", "") == "" and props["Error"] != "", "properties of a missing item show one error line: %s" % [props])
+	check(not app.props_panel._labels["Size"].visible and not app.props_panel._labels["Modified"].visible and app.props_panel._labels["Error"].visible, "no empty row shows with the error")
+	app.mode = app.Mode.FILES
+	app.props_panel.close()
+
+	var closed := root_dir + "/closed3"
+	write(closed + "/inside.txt", "x")
+	var all := FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER
+	FileAccess.set_unix_permissions(closed, 0)
+	var locked: Control = load("res://main.tscn").instantiate()
+	locked.start_path = closed
+	locked.settings_path = settings_file
+	locked.opener = func(_path: String) -> int: return OK
+	locked.places_source = func() -> Array: return [{"label": "Data", "path": root_dir, "kind": "home"}]
+	root.add_child(locked)
+	await frames(2)
+	check(locked.cwd == root_dir, "a start folder that cannot be read falls back to the first place (%s)" % locked.cwd)
+	locked.queue_free()
+	FileAccess.set_unix_permissions(closed, all)
+
+	var hebrew := [{"label": "Home", "path": root_dir, "kind": "home"}, {"label": "\u05E9\u05DC\u05D5\u05DD", "path": weird, "kind": "folder"}]
+	app.places = hebrew
+	app._render()
+	check(app._places_box.get_child(2).text_direction == Control.TEXT_DIRECTION_LTR, "a place with Hebrew text keeps its mark on the left")
+
+	var long_error := "Could not copy the file because the destination said no. ".repeat(8)
+	app._add_report("Copy: 1 item failed", [{"path": root_dir + "/x", "error": long_error}])
+	app.fire("jf_jobs")
+	app.jobs_panel.cursor = 0
+	app.fire("jf_accept")
+	var message: Label = app.jobs_panel._detail_rows[0]["message"]
+	check(message.text_overrun_behavior == TextServer.OVERRUN_TRIM_ELLIPSIS, "a long failure message ends in an ellipsis")
+	app.fire("jf_back")
+	app.fire("jf_back")
+	app.mode = app.Mode.FILES
+	app.reports.clear()
+	app.places = [{"label": "Home", "path": root_dir, "kind": "home"}]
+	app.navigate(root_dir)
+	app._render()
 
 
 func _bytes(n: int) -> PackedByteArray:

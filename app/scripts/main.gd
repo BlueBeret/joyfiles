@@ -23,6 +23,8 @@ const PLACES_REFRESH_SECONDS := 3.0
 const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
 # a press this soon after a screen change was aimed at the old screen, and only time tells a double tap apart
 const GUARD_SECONDS := 0.15
+# on the keyboard, these keys end or undo the work, so the guard holds them back while a letter still types
+const GUARDED_KEYS := [KEY_ENTER, KEY_KP_ENTER, KEY_ESCAPE, KEY_BACKSPACE]
 # these panels draw their own hint row, so the footer does not repeat it
 const PANEL_HINT_MODES := [Mode.KEYBOARD, Mode.CONFIRM, Mode.CONFLICT, Mode.JOBS, Mode.PROPS, Mode.PREVIEW]
 
@@ -156,7 +158,9 @@ func _ready() -> void:
 	}
 	places = places_source.call()
 	var arg_path := _arg_path()
-	navigate(arg_path if arg_path != "" else (start_path if start_path != "" else places[0]["path"]))
+	var home: String = places[0]["path"]
+	if not navigate(arg_path if arg_path != "" else (start_path if start_path != "" else home)):
+		navigate(home)
 	_render()
 
 
@@ -175,6 +179,9 @@ func _shell_open(path: String) -> int:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if mode == Mode.KEYBOARD and event is InputEventKey:
+		if event.pressed and _clock < _guard_until and event.keycode in GUARDED_KEYS:
+			get_viewport().set_input_as_handled()
+			return
 		if pad.typed(event):
 			_keyboard.handle_key(event)
 			_render()
@@ -189,6 +196,8 @@ func _unhandled_input(event: InputEvent) -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT or what == NOTIFICATION_WM_WINDOW_FOCUS_OUT:
 		pad.release_all()
+	elif what == NOTIFICATION_WM_CLOSE_REQUEST:
+		_ask_quit()
 
 
 func _on_joy_connection_changed(_device: int, _connected: bool) -> void:
@@ -308,8 +317,8 @@ func _jobs_hint() -> String:
 
 
 func _go_place() -> void:
-	navigate(places[place_cursor]["path"])
-	_set_mode(Mode.FILES)
+	if navigate(places[place_cursor]["path"]):
+		_set_mode(Mode.FILES)
 
 
 func _choose_menu_item() -> void:
@@ -356,11 +365,12 @@ func _list(path: String, quiet := false) -> Variant:
 	return listed
 
 
-func navigate(path: String, focus_name := "") -> void:
+func navigate(path: String, focus_name := "") -> bool:
 	var listed: Variant = _list(path)
 	if listed == null:
-		return
+		return false
 	_enter(path, listed, focus_name)
+	return true
 
 
 func _enter(path: String, listed: Array, focus_name := "") -> void:
@@ -629,7 +639,8 @@ func _ask_quit() -> void:
 		return
 	_confirm_label.text = "A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size()
 	_on_confirm = quitter
-	_open(Mode.CONFIRM)
+	if mode != Mode.CONFIRM:
+		_open(Mode.CONFIRM)
 
 
 func _open_sort_menu() -> void:
@@ -672,7 +683,7 @@ func _ask_rename(path: String) -> void:
 	_ask_text("Rename", shown, func(new_name: String):
 		var r: Dictionary = core.rename(path, path.get_file() if new_name == shown else new_name)
 		if r["ok"]:
-			refresh(r["path"].get_file())
+			_refresh_to_new(r["path"].get_file())
 		else:
 			toast(r["error"], true))
 
@@ -681,9 +692,16 @@ func _ask_new_folder() -> void:
 	_ask_text("New folder name", "", func(new_name: String):
 		var r: Dictionary = core.make_dir(cwd, new_name)
 		if r["ok"]:
-			refresh(r["path"].get_file())
+			_refresh_to_new(r["path"].get_file())
 		else:
 			toast(r["error"], true))
+
+
+# a new or renamed item that the hidden setting takes out of view would look like a failure, so say where it went
+func _refresh_to_new(item: String) -> void:
+	refresh(item)
+	if not entries.any(func(e: Dictionary) -> bool: return e["name"] == item) and filter == "":
+		toast("%s is hidden, because its name starts with a dot. Show hidden files to see it." % JoyPathText.printable(item))
 
 
 func _ask_filter() -> void:
@@ -1104,9 +1122,15 @@ func _add_row() -> void:
 	glyph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	glyph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	slot.add_child(glyph)
+	# the name sits in a clipped slot, so tall glyph stacks never make the row taller
+	var name_slot := Control.new()
+	name_slot.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	name_slot.clip_contents = true
+	hb.add_child(name_slot)
 	var name_label := Theme_.fit("", Theme_.TEXT, Theme_.SIZE_LIST, JoyFitLabel.Cut.MIDDLE)
-	name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb.add_child(name_label)
+	name_label.set_anchors_preset(Control.PRESET_FULL_RECT)
+	name_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	name_slot.add_child(name_label)
 	var size_label := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	hb.add_child(size_label)
 	_rows_box.add_child(row)
@@ -1163,7 +1187,7 @@ func _render_rows() -> void:
 		part["mark"].text = "✓" if is_selected else ""
 		part["glyph"].text = "" if tex != null else ("▰" if e["is_dir"] else "▫")
 		part["glyph"].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
-		part["name"].set_full(e["name"])
+		part["name"].set_full(JoyPathText.printable(e["name"]))
 		part["name"].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
 		part["size"].text = "" if e["is_dir"] else Theme_.human_size(e["size"])
 	thumbs.want(wanted, JoyThumbs.THUMB_SIDE)
@@ -1194,7 +1218,9 @@ func _build_places() -> void:
 		child.queue_free()
 	_places_box.add_child(Theme_.label("PLACES", Theme_.MUTED, Theme_.SIZE_SMALL))
 	for p: Dictionary in places:
-		_places_box.add_child(Theme_.fit(("◉ " if p["kind"] == "drive" else "• ") + p["label"], Theme_.TEXT, Theme_.SIZE_BODY))
+		var place_label := Theme_.fit(("◉ " if p["kind"] == "drive" else "• ") + p["label"], Theme_.TEXT, Theme_.SIZE_BODY)
+		place_label.text_direction = Control.TEXT_DIRECTION_LTR
+		_places_box.add_child(place_label)
 
 
 # the first place scrolls to the top so the title shows too, and any other place scrolls just into view

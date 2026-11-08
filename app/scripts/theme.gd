@@ -194,7 +194,8 @@ static func human_size(bytes: int) -> String:
 	var units := ["B", "KB", "MB", "GB", "TB"]
 	var value := float(bytes)
 	var i := 0
-	while value >= 1024.0 and i < units.size() - 1:
+	# a value that rounds to 1024.0 moves up a unit, so no text shows 1024.0 KB
+	while value >= 1023.95 and i < units.size() - 1:
 		value /= 1024.0
 		i += 1
 	return ("%d %s" % [value, units[i]]) if i == 0 else ("%.1f %s" % [value, units[i]])

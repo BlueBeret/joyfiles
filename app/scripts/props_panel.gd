@@ -3,7 +3,7 @@ extends PanelContainer
 
 signal closed
 
-const FIELDS := ["Name", "Path", "Type", "Size", "Modified", "Contains"]
+const FIELDS := ["Name", "Path", "Type", "Size", "Modified", "Contains", "Error"]
 # the values scroll past this height, so the title and the hints always fit in an 800 pixel window
 const SCROLL_MAX_HEIGHT := 500.0
 const SCROLL_STEP := 72
@@ -69,11 +69,9 @@ func open(core: JoyCore, path: String, hidden_note := false) -> void:
 		_put("Name", JoyPathText.printable(path.get_file()))
 		_put("Path", JoyPathText.printable(path))
 		_put("Type", "Unknown")
-		_put("Size", info["error"])
-		_put("Modified", "")
-		_put("Contains", "")
+		_put("Error", info["error"])
 		return
-	_put("Name", info["name"])
+	_put("Name", JoyPathText.printable(info["name"]))
 	_put("Path", JoyPathText.printable(info["path"]))
 	_put("Type", info["type"] + (" (link)" if info["is_symlink"] else ""))
 	_put("Modified", Theme_.human_date(info["modified"]))
@@ -140,6 +138,7 @@ func _put(field: String, text: String) -> void:
 
 
 func _show_rows() -> void:
-	var folder_fields: bool = shown.get("Contains", "") != ""
-	_labels["Contains"].visible = folder_fields
-	_grid.get_child(FIELDS.find("Contains") * 2).visible = folder_fields
+	for field: String in FIELDS:
+		var filled: bool = shown.get(field, "") != ""
+		_labels[field].visible = filled
+		_grid.get_child(FIELDS.find(field) * 2).visible = filled

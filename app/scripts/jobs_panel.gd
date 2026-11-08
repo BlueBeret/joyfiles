@@ -100,6 +100,7 @@ func _build_detail(box: VBoxContainer) -> void:
 		var message := Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
 		message.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		message.max_lines_visible = 2
+		message.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 		lines.add_child(message)
 		var where := Theme_.fit("", Theme_.MUTED, Theme_.SIZE_SMALL, JoyFitLabel.Cut.START, "/")
 		lines.add_child(where)
