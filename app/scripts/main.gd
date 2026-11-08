@@ -2,19 +2,29 @@ extends Control
 
 enum Mode { FILES, PLACES, MENU, KEYBOARD, CONFIRM, CONFLICT, JOBS, PROPS, PREVIEW }
 
-const VISIBLE_ROWS := 12
+const INITIAL_ROWS := 12
+const MIN_ROWS := 6
+const MAX_ROWS := 40
 const ROW_HEIGHT := 50
+const ROW_GAP := 2
+const SIDE_WIDTH := 280
+const CONFIRM_WIDTH := 640
 const THUMB_BOX := 42
+const THUMB_MIN_SIDE := 3.0
 const MARK_WIDTH := 30
 const FILTER_MAX_WIDTH := 380.0
 const TOAST_FONT := 22
 const TOAST_MAX_WIDTH := 880.0
-const TOAST_LIFT := 84
+const TOAST_LIFT := 20
+const TOAST_QUEUE_MAX := 4
+const QUEUED_TOAST_SECONDS := 2.5
 const PLACES_REFRESH_SECONDS := 3.0
 # a clash prompt never cuts into a menu, a keyboard or a confirm that the user is using
 const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
 # a press this soon after a screen change was aimed at the old screen, and only time tells a double tap apart
 const GUARD_SECONDS := 0.15
+# these panels draw their own hint row, so the footer does not repeat it
+const PANEL_HINT_MODES := [Mode.KEYBOARD, Mode.CONFIRM, Mode.CONFLICT, Mode.JOBS, Mode.PROPS, Mode.PREVIEW]
 
 var start_path := ""
 var settings_path := "user://settings.cfg"
@@ -31,6 +41,7 @@ var entries: Array = []
 var filter := ""
 var cursor := 0
 var top := 0
+var visible_rows := INITIAL_ROWS
 var selected := {}
 var clipboard := {"move": false, "paths": PackedStringArray()}
 var places: Array = []
@@ -63,6 +74,10 @@ var _on_change: Callable
 var _on_cancel: Callable
 var _on_confirm: Callable
 var _toast_until := 0.0
+var _toast_error := false
+# the toasts that came while a dialog was open, as [text, is_error]
+var _toast_queue: Array = []
+var _places_shown: Array = []
 var _places_at := 0.0
 var _conflict_job := -1
 var _report_seq := 0
@@ -73,6 +88,11 @@ var _sort_label: Label
 var _count_label: Label
 var _rows: Array[PanelContainer] = []
 var _row_parts: Array[Dictionary] = []
+var _stage: Control
+var _shell: VBoxContainer
+var _list_host: Control
+var _rows_box: VBoxContainer
+var _places_scroll: JoyScrollBox
 var _places_box: VBoxContainer
 var _status: JoyFitLabel
 var _status_tail: Label
@@ -185,9 +205,7 @@ func _process(delta: float) -> void:
 		_render()
 	if mode == Mode.PROPS:
 		props_panel.poll()
-	if _toast_until > 0.0 and _clock > _toast_until:
-		_toast_until = 0.0
-		_toast_panel.visible = false
+	_sync_toast()
 
 
 func _on_press(action: String) -> void:
@@ -236,8 +254,8 @@ func _main_commands() -> Dictionary:
 			["jf_jobs", _jobs_hint, _open_jobs],
 			["jf_up", "", _move.bind(-1)],
 			["jf_down", "", _move.bind(1)],
-			["jf_page_up", "", _move.bind(-VISIBLE_ROWS)],
-			["jf_page_down", "", _move.bind(VISIBLE_ROWS)],
+			["jf_page_up", "", func() -> void: _move(-visible_rows)],
+			["jf_page_down", "", func() -> void: _move(visible_rows)],
 			["jf_right", "", _open_current, _on_folder],
 			["jf_left", "", _open_places],
 			["jf_view", "", _toggle_hidden],
@@ -451,7 +469,7 @@ func _apply_filter(focus_name := "") -> void:
 				cursor = i
 				break
 	# a refresh keeps the scroll position, so the cursor stays on the same screen row
-	top = clampi(top, 0, maxi(entries.size() - VISIBLE_ROWS, 0))
+	top = clampi(top, 0, maxi(entries.size() - visible_rows, 0))
 	_clamp_view()
 	if mode == Mode.PREVIEW and not preview.relist(entries):
 		_close()
@@ -465,7 +483,7 @@ func _set_filter(text: String) -> void:
 
 
 func _filter_title() -> String:
-	return "Filter this folder (%d of %d)" % [entries.size(), all_entries.size()]
+	return "Filter this folder (%s of %s)" % [Theme_.with_commas(entries.size()), Theme_.with_commas(all_entries.size())]
 
 
 func _move(step: int) -> void:
@@ -478,8 +496,9 @@ func _move(step: int) -> void:
 func _clamp_view() -> void:
 	if cursor < top:
 		top = cursor
-	elif cursor >= top + VISIBLE_ROWS:
-		top = cursor - VISIBLE_ROWS + 1
+	elif cursor >= top + visible_rows:
+		top = cursor - visible_rows + 1
+	top = clampi(top, 0, maxi(entries.size() - visible_rows, 0))
 
 
 func _previewable(e: Dictionary) -> bool:
@@ -564,16 +583,16 @@ func _file_menu() -> Array:
 	var t := targets()
 	var items: Array = []
 	if not t.is_empty():
-		items.append(["Copy (%d)" % t.size(), func(): _set_clipboard(t, false)])
-		items.append(["Cut (%d)" % t.size(), func(): _set_clipboard(t, true)])
+		items.append(["Copy (%s)" % Theme_.with_commas(t.size()), func(): _set_clipboard(t, false)])
+		items.append(["Cut (%s)" % Theme_.with_commas(t.size()), func(): _set_clipboard(t, true)])
 	if not clipboard["paths"].is_empty():
-		items.append(["Paste %d here" % clipboard["paths"].size(), paste])
+		items.append(["Paste %s here" % Theme_.with_commas(clipboard["paths"].size()), paste])
 	if t.size() == 1:
 		items.append(["Rename", func(): _ask_rename(t[0])])
 		items.append(["Properties", func(): _open_props(t[0])])
 	items.append(["New folder", _ask_new_folder])
 	if not t.is_empty():
-		items.append(["Move to trash (%d)" % t.size(), func(): _ask_trash(t)])
+		items.append(["Move to trash (%s)" % Theme_.with_commas(t.size()), func(): _ask_trash(t)])
 	if not _visible_selection().is_empty():
 		items.append(["Clear selection", func(): selected.clear()])
 	elif _has_entries():
@@ -632,7 +651,7 @@ func _open_menu(items: Array) -> void:
 func _set_clipboard(paths: PackedStringArray, is_move: bool) -> void:
 	clipboard = {"move": is_move, "paths": paths, "label": _label_of(paths)}
 	selected.clear()
-	toast("%d item(s) ready to %s. Open a folder and pick Paste." % [paths.size(), "move" if is_move else "copy"])
+	toast("%s item(s) ready to %s. Open a folder and pick Paste." % [Theme_.with_commas(paths.size()), "move" if is_move else "copy"])
 
 
 func paste() -> void:
@@ -732,7 +751,7 @@ func _on_keyboard_cancelled() -> void:
 
 
 func _open_props(path: String) -> void:
-	props_panel.open(core, path)
+	props_panel.open(core, path, not settings.show_hidden)
 	_open(Mode.PROPS)
 
 
@@ -842,12 +861,42 @@ func _on_props_closed() -> void:
 
 func toast(text: String, is_error := false) -> void:
 	last_error = text if is_error else ""
+	if _toast_blocked():
+		_toast_queue.append([text, is_error])
+		while _toast_queue.size() > TOAST_QUEUE_MAX:
+			_toast_queue.pop_front()
+		return
+	_show_toast(text, is_error)
+
+
+func _show_toast(text: String, is_error: bool) -> void:
 	_toast_label.text = text
 	_toast_label.add_theme_color_override("font_color", Theme_.DANGER if is_error else Theme_.TEXT)
-	var width := _toast_label.get_theme_font("font").get_string_size(text, HORIZONTAL_ALIGNMENT_LEFT, -1, TOAST_FONT).x
-	_toast_label.custom_minimum_size.x = minf(width + 8.0, TOAST_MAX_WIDTH)
+	_toast_label.custom_minimum_size.x = minf(Theme_.text_width(text, TOAST_FONT) + 8.0, TOAST_MAX_WIDTH)
 	_toast_panel.visible = true
-	_toast_until = _clock + (6.0 if is_error else 4.0)
+	_toast_error = is_error
+	var seconds := QUEUED_TOAST_SECONDS if not _toast_queue.is_empty() else (6.0 if is_error else 4.0)
+	_toast_until = _clock + seconds
+
+
+# a dialog owns the screen, so the toast waits for it
+func _toast_blocked() -> bool:
+	return _panels.has(mode)
+
+
+func _sync_toast() -> void:
+	if _toast_blocked():
+		if _toast_until > 0.0:
+			_toast_queue.push_front([_toast_label.text, _toast_error])
+			_toast_until = 0.0
+			_toast_panel.visible = false
+		return
+	if _toast_until > 0.0 and _clock > _toast_until:
+		_toast_until = 0.0
+		_toast_panel.visible = false
+	if _toast_until == 0.0 and not _toast_queue.is_empty():
+		var next: Array = _toast_queue.pop_front()
+		_show_toast(next[0], next[1])
 
 
 # rendering
@@ -861,88 +910,114 @@ func _build_ui() -> void:
 	root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	root.add_theme_constant_override("separation", 0)
 	add_child(root)
+	# the stage holds the header, the list and every overlay, so the dim never reaches the footer below it
+	_stage = Control.new()
+	_stage.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	root.add_child(_stage)
+	_shell = VBoxContainer.new()
+	_shell.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_shell.add_theme_constant_override("separation", 0)
+	_stage.add_child(_shell)
+	_shell.add_child(_build_header())
+	_shell.add_child(_build_body())
+	root.add_child(_build_footer())
+	_build_toast()
+	_dim = ColorRect.new()
+	_dim.color = Color(0, 0, 0, 0.55)
+	_dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_stage.add_child(_dim)
+	_build_overlay()
 
+
+func _build_header() -> Control:
 	var header := PanelContainer.new()
 	header.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 0, 16))
-	var header_row := HBoxContainer.new()
-	header_row.add_theme_constant_override("separation", 20)
-	header.add_child(header_row)
+	var column := JoyColumn.new()
+	header.add_child(column)
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 20)
+	column.add_child(row)
 	_path_label = Theme_.fit("", Theme_.TEXT, Theme_.SIZE_TITLE, JoyFitLabel.Cut.START, "/")
 	_path_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	header_row.add_child(_path_label)
+	row.add_child(_path_label)
 	_filter_label = Theme_.fit("", Theme_.WARN, Theme_.SIZE_BODY)
-	header_row.add_child(_filter_label)
+	row.add_child(_filter_label)
 	_sort_label = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
-	header_row.add_child(_sort_label)
+	row.add_child(_sort_label)
 	_count_label = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
-	header_row.add_child(_count_label)
-	root.add_child(header)
+	row.add_child(_count_label)
+	return header
 
+
+func _build_body() -> Control:
+	var column := JoyColumn.new()
+	column.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	var body := HBoxContainer.new()
-	body.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	root.add_child(body)
+	column.add_child(body)
 	var side := PanelContainer.new()
-	side.custom_minimum_size.x = 280
+	side.custom_minimum_size.x = SIDE_WIDTH
 	side.add_theme_stylebox_override("panel", Theme_.box(Theme_.SIDE, 0, 8))
 	_places_box = VBoxContainer.new()
-	side.add_child(_places_box)
+	_places_scroll = JoyScrollBox.new(_places_box)
+	side.add_child(_places_scroll)
 	body.add_child(side)
-	var list := VBoxContainer.new()
-	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	list.add_theme_constant_override("separation", 2)
-	body.add_child(list)
-	for i in VISIBLE_ROWS:
-		var row := PanelContainer.new()
-		row.custom_minimum_size.y = ROW_HEIGHT
-		var hb := HBoxContainer.new()
-		hb.add_theme_constant_override("separation", 14)
-		row.add_child(hb)
-		var mark := Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
-		mark.custom_minimum_size.x = MARK_WIDTH
-		mark.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		hb.add_child(mark)
-		var slot := Control.new()
-		slot.custom_minimum_size = Vector2(THUMB_BOX, THUMB_BOX)
-		hb.add_child(slot)
-		var thumb := TextureRect.new()
-		thumb.set_anchors_preset(Control.PRESET_FULL_RECT)
-		thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-		thumb.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-		thumb.visible = false
-		slot.add_child(thumb)
-		var glyph := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
-		glyph.set_anchors_preset(Control.PRESET_FULL_RECT)
-		glyph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		glyph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		slot.add_child(glyph)
-		var name_label := Theme_.fit("", Theme_.TEXT, Theme_.SIZE_LIST, JoyFitLabel.Cut.MIDDLE)
-		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		hb.add_child(name_label)
-		var size_label := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
-		hb.add_child(size_label)
-		list.add_child(row)
-		_rows.append(row)
-		_row_parts.append({"mark": mark, "glyph": glyph, "thumb": thumb, "name": name_label, "size": size_label})
+	# the host takes the room that is left and no more, so the rows never push the footer off the screen
+	_list_host = Control.new()
+	_list_host.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_list_host.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_list_host.clip_contents = true
+	_list_host.resized.connect(_fit_rows)
+	body.add_child(_list_host)
+	_rows_box = VBoxContainer.new()
+	_rows_box.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_rows_box.add_theme_constant_override("separation", ROW_GAP)
+	_list_host.add_child(_rows_box)
+	_set_rows(visible_rows)
+	return column
 
+
+func _build_footer() -> Control:
+	var panel := PanelContainer.new()
+	panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 0, 12))
+	var column := JoyColumn.new()
+	panel.add_child(column)
 	_footer = HBoxContainer.new()
 	_footer.add_theme_constant_override("separation", 16)
-	var footer_panel := PanelContainer.new()
-	footer_panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 0, 12))
-	footer_panel.add_child(_footer)
-	root.add_child(footer_panel)
+	column.add_child(_footer)
 	_status = Theme_.fit("", Theme_.TEXT, Theme_.SIZE_BODY, JoyFitLabel.Cut.MIDDLE)
 	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_footer.add_child(_status)
 	_status_tail = Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
 	_footer.add_child(_status_tail)
+	return panel
 
-	_dim = ColorRect.new()
-	_dim.color = Color(0, 0, 0, 0.55)
-	_dim.set_anchors_preset(Control.PRESET_FULL_RECT)
-	add_child(_dim)
+
+# the toast sits under the dim in the draw order, and it waits in a queue while a dialog is open
+func _build_toast() -> void:
+	var holder := VBoxContainer.new()
+	holder.set_anchors_preset(Control.PRESET_FULL_RECT)
+	holder.alignment = BoxContainer.ALIGNMENT_END
+	holder.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_stage.add_child(holder)
+	var row := CenterContainer.new()
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	holder.add_child(row)
+	var gap := Control.new()
+	gap.custom_minimum_size.y = TOAST_LIFT
+	holder.add_child(gap)
+	_toast_panel = PanelContainer.new()
+	_toast_panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL, 12, 16))
+	_toast_panel.visible = false
+	_toast_label = Theme_.label("", Theme_.TEXT, TOAST_FONT)
+	_toast_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_toast_panel.add_child(_toast_label)
+	row.add_child(_toast_panel)
+
+
+func _build_overlay() -> void:
 	_overlay = CenterContainer.new()
 	_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
-	add_child(_overlay)
+	_stage.add_child(_overlay)
 	_menu_panel = PanelContainer.new()
 	_menu_panel.custom_minimum_size.x = 460
 	_menu_panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 16))
@@ -954,7 +1029,9 @@ func _build_ui() -> void:
 	var confirm_box := VBoxContainer.new()
 	confirm_box.add_theme_constant_override("separation", 20)
 	_confirm_panel.add_child(confirm_box)
-	_confirm_label = Theme_.label("", Theme_.TEXT, 26)
+	_confirm_label = Theme_.label("", Theme_.TEXT, Theme_.SIZE_TITLE)
+	_confirm_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_confirm_label.custom_minimum_size.x = CONFIRM_WIDTH
 	confirm_box.add_child(_confirm_label)
 	confirm_box.add_child(Theme_.hints(JoyCommands.hints(_commands[Mode.CONFIRM])))
 	_overlay.add_child(_confirm_panel)
@@ -979,24 +1056,61 @@ func _build_ui() -> void:
 	preview = JoyPreview.new()
 	preview.closed.connect(_on_preview_closed)
 	_overlay.add_child(preview)
-	var toast_holder := VBoxContainer.new()
-	toast_holder.set_anchors_preset(Control.PRESET_FULL_RECT)
-	toast_holder.alignment = BoxContainer.ALIGNMENT_END
-	toast_holder.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(toast_holder)
-	var toast_row := CenterContainer.new()
-	toast_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	toast_holder.add_child(toast_row)
-	var toast_gap := Control.new()
-	toast_gap.custom_minimum_size.y = TOAST_LIFT
-	toast_holder.add_child(toast_gap)
-	_toast_panel = PanelContainer.new()
-	_toast_panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL, 12, 16))
-	_toast_panel.visible = false
-	_toast_label = Theme_.label("", Theme_.TEXT, TOAST_FONT)
-	_toast_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_toast_panel.add_child(_toast_label)
-	toast_row.add_child(_toast_panel)
+
+
+# the list shows as many rows as the stage can hold, because the logical height depends on the screen
+func _fit_rows() -> void:
+	var room := _list_host.size.y + ROW_GAP
+	var fit := clampi(floori(room / float(ROW_HEIGHT + ROW_GAP)), MIN_ROWS, MAX_ROWS)
+	if fit == visible_rows:
+		return
+	_set_rows(fit)
+	_clamp_view()
+	_render_rows()
+
+
+func _set_rows(count: int) -> void:
+	while _rows.size() > count:
+		var gone: PanelContainer = _rows.pop_back()
+		_row_parts.pop_back()
+		_rows_box.remove_child(gone)
+		gone.queue_free()
+	while _rows.size() < count:
+		_add_row()
+	visible_rows = count
+
+
+func _add_row() -> void:
+	var row := PanelContainer.new()
+	row.custom_minimum_size.y = ROW_HEIGHT
+	var hb := HBoxContainer.new()
+	hb.add_theme_constant_override("separation", 14)
+	row.add_child(hb)
+	var mark := Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
+	mark.custom_minimum_size.x = MARK_WIDTH
+	mark.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hb.add_child(mark)
+	var slot := Control.new()
+	slot.custom_minimum_size = Vector2(THUMB_BOX, THUMB_BOX)
+	hb.add_child(slot)
+	var thumb := TextureRect.new()
+	thumb.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	thumb.stretch_mode = TextureRect.STRETCH_SCALE
+	thumb.visible = false
+	slot.add_child(thumb)
+	var glyph := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
+	glyph.set_anchors_preset(Control.PRESET_FULL_RECT)
+	glyph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	glyph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	slot.add_child(glyph)
+	var name_label := Theme_.fit("", Theme_.TEXT, Theme_.SIZE_LIST, JoyFitLabel.Cut.MIDDLE)
+	name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	hb.add_child(name_label)
+	var size_label := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
+	hb.add_child(size_label)
+	_rows_box.add_child(row)
+	_rows.append(row)
+	_row_parts.append({"mark": mark, "glyph": glyph, "thumb": thumb, "name": name_label, "size": size_label})
 
 
 func _render() -> void:
@@ -1015,7 +1129,7 @@ func _render() -> void:
 
 func _render_rows() -> void:
 	var wanted: Array = []
-	for i in VISIBLE_ROWS:
+	for i in _rows.size():
 		var row := _rows[i]
 		var part: Dictionary = _row_parts[i]
 		var idx := top + i
@@ -1040,6 +1154,11 @@ func _render_rows() -> void:
 			tex = thumbs.texture(e["path"], JoyThumbs.THUMB_SIDE)
 		part["thumb"].texture = tex
 		part["thumb"].visible = tex != null
+		if tex != null:
+			var rect := Theme_.fit_rect(tex.get_size(), Vector2(THUMB_BOX, THUMB_BOX), THUMB_MIN_SIDE)
+			part["thumb"].position = rect.position
+			part["thumb"].size = rect.size
+			part["thumb"].texture_filter = Theme_.filter_for(tex.get_size(), rect.size)
 		part["mark"].text = "✓" if is_selected else ""
 		part["glyph"].text = "" if tex != null else ("▰" if e["is_dir"] else "▫")
 		part["glyph"].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
@@ -1056,16 +1175,33 @@ func _empty_text() -> String:
 
 
 func _render_places() -> void:
+	if places != _places_shown:
+		_build_places()
+	for i in places.size():
+		var l: Label = _places_box.get_child(i + 1)
+		var focused: bool = mode == Mode.PLACES and i == place_cursor
+		var current: bool = cwd == places[i]["path"]
+		l.add_theme_stylebox_override("normal", Theme_.focus_box(focused, Theme_.ROW_SEL if current else Color.TRANSPARENT, 8, 8, 8))
+	if mode == Mode.PLACES:
+		_keep_place_visible()
+
+
+func _build_places() -> void:
+	_places_shown = places.duplicate(true)
 	for child in _places_box.get_children():
+		_places_box.remove_child(child)
 		child.queue_free()
 	_places_box.add_child(Theme_.label("PLACES", Theme_.MUTED, Theme_.SIZE_SMALL))
-	for i in places.size():
-		var p: Dictionary = places[i]
-		var l := Theme_.label(("◉ " if p["kind"] == "drive" else "• ") + p["label"], Theme_.TEXT, Theme_.SIZE_BODY, true)
-		var focused: bool = mode == Mode.PLACES and i == place_cursor
-		var current: bool = cwd == p["path"]
-		l.add_theme_stylebox_override("normal", Theme_.focus_box(focused, Theme_.ROW_SEL if current else Color.TRANSPARENT, 8, 8, 8))
-		_places_box.add_child(l)
+	for p: Dictionary in places:
+		_places_box.add_child(Theme_.fit(("◉ " if p["kind"] == "drive" else "• ") + p["label"], Theme_.TEXT, Theme_.SIZE_BODY))
+
+
+# the first place scrolls to the top so the title shows too, and any other place scrolls just into view
+func _keep_place_visible() -> void:
+	if place_cursor == 0:
+		_places_scroll.scroll_vertical = 0
+	else:
+		_places_scroll.reveal(_places_box.get_child(place_cursor + 1))
 
 
 func _render_overlay() -> void:
@@ -1074,6 +1210,7 @@ func _render_overlay() -> void:
 		_panels[panel_mode].visible = panel_mode == mode
 	if _overlay_renderers.has(mode):
 		_overlay_renderers[mode].call()
+	_sync_toast()
 
 
 func _render_menu() -> void:
@@ -1085,15 +1222,14 @@ func _render_menu() -> void:
 		_menu_box.add_child(l)
 
 
-# the keyboard draws its own hint row next to the keys
 func _hints_for_mode() -> Array:
-	return [] if mode == Mode.KEYBOARD else JoyCommands.hints(_commands[mode])
+	return JoyCommands.hints(_commands[mode])
 
 
 func _render_hints() -> void:
 	if _hints:
 		_hints.queue_free()
-	_hints = Theme_.hints(_hints_for_mode())
+	_hints = Theme_.hints([] if mode in PANEL_HINT_MODES else _hints_for_mode())
 	_footer.add_child(_hints)
 
 

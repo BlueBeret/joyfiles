@@ -121,6 +121,7 @@ func _run() -> void:
 	root_dir = OS.get_environment("JF_TEST_DIR")
 	settings_file = root_dir.get_base_dir() + "/jf_smoke_settings.cfg"
 	DirAccess.remove_absolute(settings_file)
+	root.size = Vector2i(1280, 800)
 	DirAccess.make_dir_recursive_absolute(root_dir + "/beta")
 	FileAccess.open(root_dir + "/alpha.txt", FileAccess.WRITE).store_string("hello")
 	var big := FileAccess.open(root_dir + "/gamma.bin", FileAccess.WRITE)
@@ -224,6 +225,12 @@ func _run() -> void:
 	_glyphs()
 	_keyboard_fallback()
 	_settings_types()
+	app.mode = app.Mode.FILES
+	await _keyboard_layout()
+	await _list_layout()
+	await _modal_layout()
+	_fonts()
+	_preview_math()
 	await _fitting()
 	_contrast()
 	app.queue_free()
@@ -366,7 +373,7 @@ func _properties() -> void:
 	app.navigate(root_dir)
 	cursor_to("props")
 	pick("Properties")
-	check(shown["Type"] == "Folder" and shown["Contains"] == "2 items", "a folder shows its item count (%s)" % shown["Contains"])
+	check(shown["Type"] == "Folder" and shown["Contains"] == "2 items (hidden items included)", "a folder shows its item count (%s)" % shown["Contains"])
 	await until(func(): return app.props_panel.scan_done, "the folder size scan finishes")
 	check(shown["Size"] == "1.5 KB (2 files, 1 folder)", "the scan totals every file below (%s)" % shown["Size"])
 	press("jf_back")
@@ -494,9 +501,9 @@ func _images() -> void:
 		_png("%s/img_%02d.png" % [many, i], 8, 8, Color.WHITE)
 	var cached_before: int = app.thumbs.cache.size()
 	show(many)
-	await until(func(): return app.thumbs.cache.size() >= cached_before + app.VISIBLE_ROWS, "thumbnails of the first rows load")
+	await until(func(): return app.thumbs.cache.size() >= cached_before + app.visible_rows, "thumbnails of the first rows load")
 	await frames(30)
-	check(app.thumbs.cache.size() == cached_before + app.VISIBLE_ROWS, "a folder of 40 images decodes one screenful (%d new)" % (app.thumbs.cache.size() - cached_before))
+	check(app.thumbs.cache.size() == cached_before + app.visible_rows, "a folder of 40 images decodes one screenful (%d new)" % (app.thumbs.cache.size() - cached_before))
 	check(not app.thumbs.cache.has(JoyThumbs.key_of(many + "/img_39.png", side)), "rows below the screen are not decoded yet")
 	press("jf_page_down")
 	press("jf_page_down")
@@ -768,6 +775,177 @@ func _settings_types() -> void:
 func _fits(label: JoyFitLabel) -> bool:
 	var width := Theme_.text_width(label.text, label.get_theme_font_size("font_size"))
 	return width <= label.size.x
+
+
+func _inside(node: Control) -> bool:
+	return Rect2(Vector2.ZERO, app.get_viewport_rect().size).grow(0.5).encloses(node.get_global_rect())
+
+
+func _fake_places(count: int) -> Array:
+	var made: Array = [{"label": "Home", "path": root_dir, "kind": "home"}]
+	for i in count - 1:
+		made.append({"label": "Drive %d with a long label" % i, "path": "%s/drive%d" % [root_dir, i], "kind": "drive"})
+	return made
+
+
+func _keyboard_layout() -> void:
+	var before_width := 0.0
+	app._ask_text("Rename", "short", func(_text: String): pass)
+	app._render()
+	await frames(3)
+	before_width = app._keyboard.size.x
+	check(_inside(app._keyboard), "the keyboard fits the window with a short text")
+	for length in [62, 200, 600]:
+		app._keyboard.open("Rename", "n".repeat(length))
+		app._render()
+		await frames(3)
+		check(is_equal_approx(app._keyboard.size.x, before_width) and _inside(app._keyboard), "the keyboard keeps its width with %d characters (%.0f, was %.0f)" % [length, app._keyboard.size.x, before_width])
+		check(app._keyboard._field.text.begins_with("…") and app._keyboard._field.text.ends_with("|") and _fits(app._keyboard._field), "the field shows the end of the text and the caret (%d characters)" % length)
+	var small: bool = app._keyboard._title.get_theme_font_size("font_size") < 22
+	for line: Node in app._keyboard._grid.get_children():
+		for cap: Label in line.get_children():
+			small = small or cap.get_theme_font_size("font_size") < 22
+	check(not small, "the title and the keys use at least 22 pixels")
+	press("jf_view")
+
+
+func _list_layout() -> void:
+	var viewport_height := app.get_viewport_rect().size.y
+	check(viewport_height == 800.0, "the test window is the Deck size (%.0f)" % viewport_height)
+	check(app.visible_rows >= 12 and app.visible_rows == app._rows.size(), "the list fills the window height with %d rows" % app.visible_rows)
+	var used: float = app.visible_rows * (app.ROW_HEIGHT + app.ROW_GAP) - app.ROW_GAP
+	check(used <= app._list_host.size.y + 0.5 and app._list_host.size.y - used < app.ROW_HEIGHT + app.ROW_GAP, "the rows fill the list area (%.0f of %.0f)" % [used, app._list_host.size.y])
+	check(app._footer.get_global_rect().end.y <= viewport_height + 0.5, "the footer stays in the window")
+	var small_rows: int = app.visible_rows
+	root.size = Vector2i(1280, 1200)
+	await frames(4)
+	check(app.visible_rows > small_rows, "a taller window shows more rows (%d, was %d)" % [app.visible_rows, small_rows])
+	root.size = Vector2i(2560, 1080)
+	await frames(4)
+	check(app._rows[0].size.x + app.SIDE_WIDTH <= JoyColumn.MAX_WIDTH + 1.0, "a very wide window caps the list width (%.0f)" % app._rows[0].size.x)
+	root.size = Vector2i(1280, 800)
+	await frames(4)
+	check(app.visible_rows == small_rows, "the rows return with the window (%d)" % app.visible_rows)
+	app.places_source = func() -> Array: return _fake_places(19)
+	app.refresh_places()
+	app.mode = app.Mode.PLACES
+	app.place_cursor = 18
+	app._render()
+	await frames(4)
+	var focused: Control = app._places_box.get_child(19)
+	var pane: Rect2 = app._places_scroll.get_global_rect()
+	check(app._footer.get_global_rect().end.y <= viewport_height + 0.5 and _inside(app._hints), "19 places keep the footer in the window")
+	check(pane.encloses(focused.get_global_rect()) and app._places_scroll.scroll_vertical > 0, "the last place scrolls into view (%s in %s)" % [focused.get_global_rect(), pane])
+	app.place_cursor = 0
+	app._render()
+	await frames(3)
+	check(app._places_scroll.scroll_vertical == 0, "the first place scrolls back to the top")
+	app.places_source = app.core.places
+	app.refresh_places()
+	app.mode = app.Mode.FILES
+	app._render()
+
+
+func _modal_layout() -> void:
+	var base := root_dir + "/modals"
+	var long_name := "A".repeat(196) + ".txt"
+	app._toast_queue.clear()
+	app._toast_until = 0.0
+	app._toast_panel.visible = false
+	write(base + "/" + long_name, "x")
+	for i in 1100:
+		write("%s/many/f%04d.txt" % [base, i], "")
+	show(base)
+	app._ask_trash(PackedStringArray([base + "/" + long_name]))
+	app._render()
+	await frames(4)
+	check(_inside(app._confirm_panel) and app._confirm_label.size.x <= app.CONFIRM_WIDTH + 1.0, "a long name wraps in the trash question and fits the window")
+	check(app._confirm_label.size.y > 2.0 * app._confirm_label.get_theme_font_size("font_size"), "the whole question shows on several lines (%.0f)" % app._confirm_label.size.y)
+	check(glyph_actions(app._hints).is_empty() and app._dim.get_global_rect().end.y <= app._footer.get_global_rect().position.y + 1.0, "a panel with its own hints leaves no footer hints, and the dim stops above the footer")
+	press("jf_back")
+	press("jf_start")
+	await frames(3)
+	check(glyph_actions(app._hints) == ["jf_accept", "jf_back"] and app._dim.visible and app._dim.get_global_rect().end.y <= app._footer.get_global_rect().position.y + 1.0, "the menu shows its hints in the footer under no dim")
+	press("jf_back")
+	app.toast("First toast.")
+	check(app._toast_panel.visible, "a toast shows over the list")
+	press("jf_start")
+	check(not app._toast_panel.visible, "a toast hides when a dialog opens")
+	app.toast("Second toast.")
+	check(not app._toast_panel.visible, "a toast waits while a dialog is open")
+	press("jf_back")
+	check(app._toast_panel.visible and app._toast_label.text == "First toast.", "the waiting toasts show after the dialog (%s)" % app._toast_label.text)
+	app._toast_until = 0.0001
+	app._clock += 1.0
+	app._sync_toast()
+	check(app._toast_label.text == "Second toast.", "the next waiting toast follows (%s)" % app._toast_label.text)
+	app._toast_until = 0.0001
+	app._clock += 1.0
+	app._sync_toast()
+	check(not app._toast_panel.visible, "no toast stays after the queue ends")
+
+	show(base + "/many")
+	check(app._count_label.text == "1 / 1,100", "the count has a thousands separator (%s)" % app._count_label.text)
+	pick("Select all")
+	press("jf_menu")
+	check("Copy (1,100)" in menu_labels(), "the menu counts with a thousands separator: %s" % [menu_labels()])
+	press("jf_back")
+	app.selected.clear()
+	show(base)
+
+	var deep := base + "/deep"
+	for i in 35:
+		deep += "/level_%02d_%s" % [i, "n".repeat(18)]
+	write(deep + "/leaf.txt", "x")
+	app._open_props(deep + "/leaf.txt")
+	app._render()
+	await frames(4)
+	check(_inside(app.props_panel) and app.props_panel._scroll.is_scrollable(), "a very long path scrolls inside a panel that fits the window")
+	check(app.props_panel.hint_pairs()[0] == ["jf_up", "Scroll"], "the properties show a scroll hint when the values overflow")
+	press("jf_down")
+	await frames(2)
+	check(app.props_panel._scroll.scroll_vertical > 0, "the down key scrolls the properties")
+	press("jf_back")
+
+	app.jobs.clear()
+	for i in 10:
+		app.jobs[800 + i] = {"watch": [], "kind": "copy", "current": "file_%d.bin" % i, "total_bytes": 1000, "done_bytes": 100 * i, "state": "running", "conflict": {}}
+	app.mode = app.Mode.JOBS
+	app._render()
+	await frames(4)
+	check(_inside(app.jobs_panel), "ten jobs fit the window (%s)" % app.jobs_panel.get_global_rect())
+	for i in 9:
+		press("jf_down")
+	await frames(4)
+	var row: Control = app.jobs_panel._rows[809]["row"]
+	check(app.jobs_panel._scroll.get_global_rect().encloses(row.get_global_rect()), "the cursor job scrolls into view")
+	press("jf_back")
+	app.jobs.clear()
+	app.mode = app.Mode.JOBS
+	app._render()
+	await frames(2)
+	check(app.jobs_panel.hint_pairs({}) == [["jf_back", "Close"]], "the jobs hints offer only Close when no job runs: %s" % [app.jobs_panel.hint_pairs({})])
+	press("jf_back")
+
+
+func _fonts() -> void:
+	var font: FontVariation = Theme_.theme().default_font
+	var missing: Array = []
+	for pair: Array in [["Thai", 0x0E2A], ["Arabic", 0x0645], ["Hebrew", 0x05E9], ["check mark", 0x2713], ["folder shape", 0x25B0], ["drive dot", 0x25C9], ["sort arrow", 0x25B2]]:
+		if not font.has_char(pair[1]):
+			missing.append(pair[0])
+	check(missing.is_empty(), "the bundled fonts draw every script and symbol the list needs: %s" % [missing])
+	var tall: Array = Theme_.TYPE_SCALE.filter(func(size: int) -> bool: return not is_equal_approx(font.get_height(size), font.base_font.get_height(size)))
+	check(tall.is_empty(), "no fallback font makes a line taller than the base font at sizes %s" % [tall])
+
+
+func _preview_math() -> void:
+	var thin := Theme_.fit_rect(Vector2(1, 3000), Vector2(1080, 520), 4.0)
+	check(thin.size.x >= 4.0 and thin.size.y <= 520.0, "a thin image keeps a visible line (%s)" % thin.size)
+	check(Theme_.filter_for(Vector2(8, 8), Vector2(520, 520)) == CanvasItem.TEXTURE_FILTER_NEAREST, "a tiny image grows with sharp pixels")
+	check(Theme_.filter_for(Vector2(1280, 720), Vector2(924, 520)) == CanvasItem.TEXTURE_FILTER_LINEAR, "a large image is smoothed when it shrinks")
+	app.conflict_panel.open({"name": "x", "dest_is_dir": true, "dest_size": 0, "dest_modified": 0, "src_is_dir": true, "src_size": 0, "src_modified": 1700000000})
+	check(app.conflict_panel._existing.text == "In this folder: Folder, change date unknown", "a clash with no date says so (%s)" % app.conflict_panel._existing.text)
 
 
 func _fitting() -> void:
