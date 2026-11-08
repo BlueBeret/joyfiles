@@ -106,6 +106,8 @@ func poll() -> void:
 		return
 	var s: Dictionary = _core.poll_size_scan(_scan)
 	var text := "%s (%s, %s)" % [Theme_.human_size(s["bytes"]), Theme_.count(s["files"], "file"), Theme_.count(s["folders"], "folder")]
+	if s.get("skipped", 0) > 0:
+		text += ", %s could not be read" % Theme_.count(s["skipped"], "folder")
 	if s["done"]:
 		_scan = -1
 		scan_done = true

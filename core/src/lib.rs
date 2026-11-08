@@ -242,7 +242,7 @@ impl JoyCore {
     #[func]
     fn poll_size_scan(&mut self, id: i64) -> VarDictionary {
         let Some(scan) = self.scans.get(&id) else {
-            return vdict! { "known" => false, "done" => true, "bytes" => 0, "files" => 0, "folders" => 0 };
+            return vdict! { "known" => false, "done" => true, "bytes" => 0, "files" => 0, "folders" => 0, "skipped" => 0 };
         };
         let done = scan.done.load(Ordering::Relaxed);
         let out = vdict! {
@@ -251,6 +251,7 @@ impl JoyCore {
             "bytes" => scan.bytes.load(Ordering::Relaxed) as i64,
             "files" => scan.files.load(Ordering::Relaxed) as i64,
             "folders" => scan.folders.load(Ordering::Relaxed) as i64,
+            "skipped" => scan.skipped.load(Ordering::Relaxed) as i64,
         };
         if done {
             self.scans.remove(&id);

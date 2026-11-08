@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,8 @@ pub struct SizeScan {
     pub bytes: AtomicU64,
     pub files: AtomicU64,
     pub folders: AtomicU64,
+    // folders the scan could not read, so the totals miss what they hold
+    pub skipped: AtomicU64,
     pub done: AtomicBool,
     pub cancel: AtomicBool,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -74,14 +77,18 @@ pub fn spawn_size_scan(path: PathBuf) -> Arc<SizeScan> {
     scan
 }
 
-// links count as one small file, so a link cycle cannot loop
+// links count as one small file so a link cycle cannot loop, and the bytes of a file with several names count once
 fn scan_tree(scan: &SizeScan, root: &Path) {
     let mut pending = vec![root.to_path_buf()];
+    let mut seen = HashSet::new();
     while let Some(dir) = pending.pop() {
         if scan.cancel.load(Ordering::Relaxed) {
             return;
         }
-        let Ok(read) = fs::read_dir(&dir) else { continue };
+        let Ok(read) = fs::read_dir(&dir) else {
+            scan.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
         for entry in read.filter_map(Result::ok) {
             let Ok(kind) = entry.file_type() else { continue };
             if kind.is_dir() {
@@ -89,11 +96,26 @@ fn scan_tree(scan: &SizeScan, root: &Path) {
                 pending.push(entry.path());
             } else {
                 scan.files.fetch_add(1, Ordering::Relaxed);
-                let len = entry.metadata().map_or(0, |m| m.len());
-                scan.bytes.fetch_add(len, Ordering::Relaxed);
+                let Ok(meta) = entry.metadata() else { continue };
+                if !is_second_name(&meta, &mut seen) {
+                    scan.bytes.fetch_add(meta.len(), Ordering::Relaxed);
+                }
             }
         }
     }
+}
+
+// true when an earlier name of the same file already counted its bytes
+#[cfg(unix)]
+fn is_second_name(meta: &fs::Metadata, seen: &mut HashSet<(u64, u64)>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.file_type().is_file() && meta.nlink() > 1 && !seen.insert((meta.dev(), meta.ino()))
+}
+
+// Windows gives no cheap file identity through the folder listing
+#[cfg(not(unix))]
+fn is_second_name(_meta: &fs::Metadata, _seen: &mut HashSet<(u64, u64)>) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -181,5 +203,25 @@ mod tests {
         scan.cancel.store(true, Ordering::Relaxed);
         scan_tree(&scan, &tmp.path().join("d"));
         assert_eq!(scan.files.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_counts_its_bytes_once_and_a_locked_folder_counts_as_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tree();
+        let d = tmp.path().join("d");
+        fs::hard_link(d.join("a.bin"), d.join("a_again.bin")).unwrap();
+        fs::create_dir(d.join("locked")).unwrap();
+        fs::write(d.join("locked/big.bin"), vec![0u8; 700]).unwrap();
+        fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(d.join("locked")).is_ok();
+        let scan = SizeScan::default();
+        scan_tree(&scan, &d);
+        fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        let bytes = scan.bytes.load(Ordering::Relaxed);
+        assert_eq!(scan.skipped.load(Ordering::Relaxed), u64::from(!readable));
+        assert_eq!(bytes, 1525 + if readable { 700 } else { 0 }, "the second name of a.bin adds no bytes");
+        assert_eq!(scan.files.load(Ordering::Relaxed), if readable { 5 } else { 4 });
     }
 }
