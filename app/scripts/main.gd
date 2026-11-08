@@ -158,7 +158,7 @@ func _confirm_action(action: String) -> void:
 # navigation
 
 func navigate(path: String, focus_name := "") -> void:
-	var result: Dictionary = core.list_dir(path, show_hidden)
+	var result: Dictionary = core.list_dir(path, show_hidden, "name", false)
 	if not result["ok"]:
 		toast(result["error"], true)
 		return

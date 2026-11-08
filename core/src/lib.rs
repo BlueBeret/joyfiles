@@ -1,6 +1,7 @@
 pub mod fs_ops;
 pub mod jobs;
 pub mod places;
+pub mod props;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,9 @@ use std::sync::atomic::Ordering;
 
 use godot::prelude::*;
 
-use jobs::{JobKind, JobState, Progress};
+use fs_ops::SortKey;
+use jobs::{Conflict, JobKind, JobState, Policy, Progress, Resolution};
+use props::SizeScan;
 
 struct JoyfilesExtension;
 
@@ -21,6 +24,8 @@ unsafe impl ExtensionLibrary for JoyfilesExtension {}
 pub struct JoyCore {
     jobs: HashMap<i64, Arc<Progress>>,
     next_job: i64,
+    scans: HashMap<i64, Arc<SizeScan>>,
+    next_scan: i64,
 }
 
 fn path_of(p: &GString) -> PathBuf {
@@ -38,11 +43,23 @@ fn result_dict(r: Result<PathBuf, String>) -> VarDictionary {
     }
 }
 
+fn conflict_dict(c: &Conflict) -> VarDictionary {
+    vdict! {
+        "name" => c.name.as_str(),
+        "src_is_dir" => c.src.is_dir,
+        "dest_is_dir" => c.dest.is_dir,
+        "src_size" => c.src.size as i64,
+        "dest_size" => c.dest.size as i64,
+        "src_modified" => c.src.modified,
+        "dest_modified" => c.dest.modified,
+    }
+}
+
 #[godot_api]
 impl JoyCore {
     #[func]
-    fn list_dir(&self, path: GString, show_hidden: bool) -> VarDictionary {
-        match fs_ops::list_dir(&path_of(&path), show_hidden) {
+    fn list_dir(&self, path: GString, show_hidden: bool, sort: GString, descending: bool) -> VarDictionary {
+        match fs_ops::list_dir(&path_of(&path), show_hidden, SortKey::parse(&sort.to_string()), descending) {
             Ok(entries) => {
                 let mut arr = VarArray::new();
                 for e in entries {
@@ -101,14 +118,74 @@ impl JoyCore {
         let kind = if is_move { JobKind::Move } else { JobKind::Copy };
         let list = sources.as_slice().iter().map(path_of).collect();
         self.next_job += 1;
-        self.jobs.insert(self.next_job, jobs::spawn(kind, list, path_of(&dest_dir)));
+        self.jobs.insert(self.next_job, jobs::spawn(kind, list, path_of(&dest_dir), Policy::Ask));
         self.next_job
     }
 
     #[func]
     fn cancel_job(&self, id: i64) {
         if let Some(p) = self.jobs.get(&id) {
-            p.cancel.store(true, Ordering::Relaxed);
+            p.request_cancel();
+        }
+    }
+
+    // choice is "replace", "keep_both" or "skip", and the result says whether a question was waiting
+    #[func]
+    fn answer_conflict(&self, id: i64, choice: GString, apply_all: bool) -> bool {
+        let Some(choice) = Resolution::parse(&choice.to_string()) else { return false };
+        self.jobs.get(&id).is_some_and(|p| p.answer(choice, apply_all))
+    }
+
+    #[func]
+    fn props(&self, path: GString) -> VarDictionary {
+        match props::props(&path_of(&path)) {
+            Ok(p) => vdict! {
+                "ok" => true,
+                "error" => "",
+                "name" => p.name.as_str(),
+                "path" => &gstr(&p.path),
+                "type" => p.type_label.as_str(),
+                "is_dir" => p.is_dir,
+                "is_symlink" => p.is_symlink,
+                "size" => p.size as i64,
+                "modified" => p.modified,
+                "items" => p.items.map_or(-1, |n| n as i64),
+            },
+            Err(e) => vdict! { "ok" => false, "error" => e.to_string().as_str() },
+        }
+    }
+
+    #[func]
+    fn start_size_scan(&mut self, path: GString) -> i64 {
+        self.next_scan += 1;
+        self.scans.insert(self.next_scan, props::spawn_size_scan(path_of(&path)));
+        self.next_scan
+    }
+
+    // a scan leaves the table once the poll has reported it done
+    #[func]
+    fn poll_size_scan(&mut self, id: i64) -> VarDictionary {
+        let Some(scan) = self.scans.get(&id) else {
+            return vdict! { "known" => false, "done" => true, "bytes" => 0, "files" => 0, "folders" => 0 };
+        };
+        let done = scan.done.load(Ordering::Relaxed);
+        let out = vdict! {
+            "known" => true,
+            "done" => done,
+            "bytes" => scan.bytes.load(Ordering::Relaxed) as i64,
+            "files" => scan.files.load(Ordering::Relaxed) as i64,
+            "folders" => scan.folders.load(Ordering::Relaxed) as i64,
+        };
+        if done {
+            self.scans.remove(&id);
+        }
+        out
+    }
+
+    #[func]
+    fn cancel_size_scan(&self, id: i64) {
+        if let Some(scan) = self.scans.get(&id) {
+            scan.cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -133,6 +210,7 @@ impl JoyCore {
                 "state" => state,
                 "error" => error.as_str(),
                 "current" => p.current.lock().unwrap().as_str(),
+                "conflict" => &p.pending_conflict().map_or_else(VarDictionary::new, |c| conflict_dict(&c)),
                 "done_bytes" => p.done_bytes.load(Ordering::Relaxed) as i64,
                 "total_bytes" => p.total_bytes.load(Ordering::Relaxed) as i64,
             }.to_variant());

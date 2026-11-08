@@ -14,21 +14,78 @@ pub struct Entry {
     pub hidden: bool,
 }
 
-pub fn list_dir(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKey {
+    #[default]
+    Name,
+    Size,
+    Modified,
+    Type,
+}
+
+impl SortKey {
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "size" => SortKey::Size,
+            "modified" => SortKey::Modified,
+            "type" => SortKey::Type,
+            _ => SortKey::Name,
+        }
+    }
+}
+
+pub fn list_dir(dir: &Path, show_hidden: bool, key: SortKey, descending: bool) -> io::Result<Vec<Entry>> {
     let mut entries: Vec<Entry> = fs::read_dir(dir)?
         .filter_map(Result::ok)
-        .filter_map(|e| entry_from(&e.path()))
+        .filter_map(|e| stat_entry(&e.path()))
         .filter(|e| show_hidden || !e.hidden)
         .collect();
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    sort_entries(&mut entries, key, descending);
     Ok(entries)
 }
 
-fn entry_from(path: &Path) -> Option<Entry> {
+// folders always come first, so descending order flips each group on its own
+pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
+    entries.sort_by_cached_key(|e| sort_key(e, key));
+    if descending {
+        let folders = entries.partition_point(|e| e.is_dir);
+        let (dirs, files) = entries.split_at_mut(folders);
+        if matches!(key, SortKey::Name | SortKey::Modified) {
+            dirs.reverse();
+        }
+        files.reverse();
+    }
+}
+
+fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String) {
+    let (number, kind) = match key {
+        SortKey::Name => (0, String::new()),
+        SortKey::Size => (e.size as i64, String::new()),
+        SortKey::Modified => (e.modified, String::new()),
+        SortKey::Type if e.is_dir => (0, String::new()),
+        SortKey::Type => (0, extension_of(&e.name)),
+    };
+    (!e.is_dir, number, kind, e.name.to_lowercase())
+}
+
+pub fn extension_of(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+pub fn type_label(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return "Folder".into();
+    }
+    match extension_of(name).as_str() {
+        "" => "File".into(),
+        ext => format!("{} file", ext.to_uppercase()),
+    }
+}
+
+pub fn stat_entry(path: &Path) -> Option<Entry> {
     // fs::metadata follows symlinks so a link to a folder opens like a folder
     let meta = fs::metadata(path).or_else(|_| fs::symlink_metadata(path)).ok()?;
     let name = path.file_name()?.to_string_lossy().into_owned();
@@ -91,9 +148,14 @@ pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+// a broken link still occupies its name, so this check never follows links
+pub fn exists_nofollow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
     let first = dir.join(name);
-    if !first.exists() {
+    if !exists_nofollow(&first) {
         return first;
     }
     let as_path = Path::new(name);
@@ -104,13 +166,26 @@ pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
         .unwrap_or_default();
     (2..)
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
+        .find(|p| !exists_nofollow(p))
         .expect("an unused name exists")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::time::{Duration, SystemTime};
+
+    fn names(entries: Vec<Entry>) -> Vec<String> {
+        entries.into_iter().map(|e| e.name).collect()
+    }
+
+    fn write_sized(dir: &Path, name: &str, size: usize, age_secs: u64) {
+        let path = dir.join(name);
+        fs::write(&path, vec![b'x'; size]).unwrap();
+        let when = SystemTime::now() - Duration::from_secs(age_secs);
+        File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+    }
 
     #[test]
     fn lists_folders_first_then_case_insensitive_names() {
@@ -119,9 +194,72 @@ mod tests {
         fs::write(tmp.path().join("A.txt"), "x").unwrap();
         fs::create_dir(tmp.path().join("zdir")).unwrap();
         fs::write(tmp.path().join(".secret"), "x").unwrap();
-        let names: Vec<_> = list_dir(tmp.path(), false).unwrap().into_iter().map(|e| e.name).collect();
-        assert_eq!(names, ["zdir", "A.txt", "b.txt"]);
-        assert_eq!(list_dir(tmp.path(), true).unwrap().len(), 4);
+        let listed = list_dir(tmp.path(), false, SortKey::Name, false).unwrap();
+        assert_eq!(names(listed), ["zdir", "A.txt", "b.txt"]);
+        assert_eq!(list_dir(tmp.path(), true, SortKey::Name, false).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn name_sort_descending_keeps_folders_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("a_dir")).unwrap();
+        fs::create_dir(tmp.path().join("z_dir")).unwrap();
+        write_sized(tmp.path(), "a.txt", 1, 0);
+        write_sized(tmp.path(), "b.txt", 1, 0);
+        let listed = list_dir(tmp.path(), false, SortKey::Name, true).unwrap();
+        assert_eq!(names(listed), ["z_dir", "a_dir", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn size_sort_orders_files_and_breaks_ties_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("folder")).unwrap();
+        write_sized(tmp.path(), "big.bin", 900, 0);
+        write_sized(tmp.path(), "small.bin", 10, 0);
+        write_sized(tmp.path(), "mid_b.bin", 100, 0);
+        write_sized(tmp.path(), "mid_a.bin", 100, 0);
+        let up = names(list_dir(tmp.path(), false, SortKey::Size, false).unwrap());
+        assert_eq!(up, ["folder", "small.bin", "mid_a.bin", "mid_b.bin", "big.bin"]);
+        let down = names(list_dir(tmp.path(), false, SortKey::Size, true).unwrap());
+        assert_eq!(down, ["folder", "big.bin", "mid_b.bin", "mid_a.bin", "small.bin"]);
+    }
+
+    #[test]
+    fn modified_sort_puts_oldest_first_when_ascending() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_sized(tmp.path(), "new.txt", 1, 10);
+        write_sized(tmp.path(), "old.txt", 1, 5000);
+        write_sized(tmp.path(), "mid.txt", 1, 600);
+        let up = names(list_dir(tmp.path(), false, SortKey::Modified, false).unwrap());
+        assert_eq!(up, ["old.txt", "mid.txt", "new.txt"]);
+        let down = names(list_dir(tmp.path(), false, SortKey::Modified, true).unwrap());
+        assert_eq!(down, ["new.txt", "mid.txt", "old.txt"]);
+    }
+
+    #[test]
+    fn type_sort_groups_by_extension_then_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["b.png", "a.txt", "c.PNG", "a.png", "readme"] {
+            write_sized(tmp.path(), name, 1, 0);
+        }
+        let up = names(list_dir(tmp.path(), false, SortKey::Type, false).unwrap());
+        assert_eq!(up, ["readme", "a.png", "b.png", "c.PNG", "a.txt"]);
+    }
+
+    #[test]
+    fn sort_key_parse_falls_back_to_name() {
+        assert_eq!(SortKey::parse("size"), SortKey::Size);
+        assert_eq!(SortKey::parse("modified"), SortKey::Modified);
+        assert_eq!(SortKey::parse("type"), SortKey::Type);
+        assert_eq!(SortKey::parse("nonsense"), SortKey::Name);
+    }
+
+    #[test]
+    fn type_label_names_folders_and_extensions() {
+        assert_eq!(type_label("x", true), "Folder");
+        assert_eq!(type_label("photo.JPG", false), "JPG file");
+        assert_eq!(type_label("Makefile", false), "File");
+        assert_eq!(type_label(".bashrc", false), "File");
     }
 
     #[test]
