@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -174,7 +175,21 @@ struct Worker<'a> {
     sticky: Option<Resolution>,
     // an explicit stack, so a deep merge cannot overflow the thread stack
     tasks: Vec<Task>,
+    // folders that got new names, and sources of a move that go once those folders are synced
+    to_sync: BTreeSet<PathBuf>,
+    to_remove: Vec<PathBuf>,
 }
+
+// a plain copy promises nothing on power loss, a durable copy is on the drive before an old item goes, and a move removes each source only after that
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Copying {
+    Plain,
+    Durable,
+    Moving,
+}
+
+// the sources of a move go in batches, so a big move needs few folder syncs and little extra space
+const SETTLE_BATCH: usize = 256;
 
 enum Task {
     Transfer { src: PathBuf, dest_dir: PathBuf },
@@ -199,7 +214,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks };
+    let mut worker = Worker { p, owner, sticky, tasks, to_sync: BTreeSet::new(), to_remove: Vec::new() };
     while let Some(task) = worker.tasks.pop() {
         match task {
             Task::Transfer { src, dest_dir } => {
@@ -225,11 +240,34 @@ impl Worker<'_> {
         if self.p.cancel.load(Ordering::Relaxed) {
             return Err(io::Error::other("Cancelled."));
         }
-        let verb = if self.p.kind == JobKind::Move { "move" } else { "copy" };
-        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-        let message = format!("Could not {verb} \"{name}\": {}.", reason(err));
-        self.p.failures.lock().unwrap().push(Failure { path: path.to_path_buf(), message });
+        self.note(path, err);
         Ok(())
+    }
+
+    fn note(&self, path: &Path, err: &io::Error) {
+        let verb = if self.p.kind == JobKind::Move { "move" } else { "copy" };
+        let message = format!("Could not {verb} \"{}\": {}.", display_name(path), reason(err));
+        self.p.failures.lock().unwrap().push(Failure { path: path.to_path_buf(), message });
+    }
+
+    // the folders of the copies go to the drive first, and only then do the sources of a move go
+    fn settle(&mut self) {
+        let dirs = std::mem::take(&mut self.to_sync);
+        let sources = std::mem::take(&mut self.to_remove);
+        if let Some(err) = dirs.iter().find_map(|dir| sync_dir(dir).err()) {
+            for src in &sources {
+                self.note(src, &err);
+            }
+            return;
+        }
+        for src in sources {
+            // a source folder stays when a child of it was skipped or failed
+            let removed = if is_real_dir(&src) { fs::remove_dir(&src) } else { remove_item(&src) };
+            match removed {
+                Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.note(&src, &e),
+                _ => {}
+            }
+        }
     }
 
     fn transfer(&mut self, src: &Path, dest_dir: &Path) -> io::Result<()> {
@@ -301,7 +339,7 @@ impl Worker<'_> {
         }
         let staging = temp_beside(target, self.owner, Role::Part);
         let failed_before = self.p.failures.lock().unwrap().len();
-        let copied = self.copy_tree(src, &staging, false);
+        let copied = self.copy_tree(src, &staging, Copying::Durable);
         if copied.is_err() || self.p.failures.lock().unwrap().len() > failed_before {
             let _ = remove_temp_tree(&staging);
             copied?;
@@ -324,10 +362,10 @@ impl Worker<'_> {
         Ok(())
     }
 
-    // what cannot be removed of the old item comes back under a visible name, so it never hides on the drive
+    // the old item goes only once the new name is on the drive, and what cannot go comes back under a visible name
     fn discard(&self, aside: &Path, target: &Path) {
-        let Err(e) = remove_temp_tree(aside) else { return };
         let dir = target.parent().unwrap_or(Path::new("."));
+        let Err(e) = sync_dir(dir).and_then(|()| remove_temp_tree(aside)) else { return };
         let name = display_name(target);
         let rest = unique_dest(dir, target.file_name().unwrap_or_default(), is_real_dir(aside));
         let left = if fs::rename(aside, &rest).is_ok() { rest } else { aside.to_path_buf() };
@@ -360,48 +398,50 @@ impl Worker<'_> {
                 Err(e) => copy_instead_of_rename(src, e)?,
             }
         }
-        self.copy_tree(src, target, self.p.kind == JobKind::Move)
+        self.copy_tree(src, target, if self.p.kind == JobKind::Move { Copying::Moving } else { Copying::Plain })
     }
 
-    // a move deletes each source item right after its copy, so an item that failed keeps its source
-    fn copy_tree(&mut self, src: &Path, dest: &Path, delete_source: bool) -> io::Result<()> {
+    // a move removes each source item only after its copy is on the drive, so an item that failed keeps its source
+    fn copy_tree(&mut self, src: &Path, dest: &Path, how: Copying) -> io::Result<()> {
         let mut pending = vec![Step::Copy(src.to_path_buf(), dest.to_path_buf())];
-        let result = self.run_steps(&mut pending, delete_source);
+        let result = self.run_steps(&mut pending, how);
         // a cancel still gives each folder made so far the rights and times of its source
         for step in pending.into_iter().rev() {
             if let Step::Close { dest, meta, .. } = step {
                 keep_metadata(&dest, &meta);
             }
         }
+        self.settle();
         result
     }
 
-    fn run_steps(&mut self, pending: &mut Vec<Step>, delete_source: bool) -> io::Result<()> {
+    fn run_steps(&mut self, pending: &mut Vec<Step>, how: Copying) -> io::Result<()> {
         while let Some(step) = pending.pop() {
             match step {
                 Step::Copy(src, dest) => {
-                    if let Err(e) = self.copy_one(&src, &dest, delete_source, pending) {
+                    if let Err(e) = self.copy_one(&src, &dest, how, pending) {
                         self.fail(&src, &e)?;
                     }
                 }
                 Step::Close { src, dest, meta } => {
                     keep_metadata(&dest, &meta);
-                    if delete_source {
-                        match fs::remove_dir(&src) {
-                            Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.fail(&src, &e)?,
-                            _ => {}
-                        }
+                    if how == Copying::Moving {
+                        self.to_remove.push(src);
                     }
                 }
+            }
+            if self.to_remove.len() >= SETTLE_BATCH {
+                self.settle();
             }
         }
         Ok(())
     }
 
-    fn copy_one(&mut self, src: &Path, dest: &Path, delete_source: bool, pending: &mut Vec<Step>) -> io::Result<()> {
+    fn copy_one(&mut self, src: &Path, dest: &Path, how: Copying, pending: &mut Vec<Step>) -> io::Result<()> {
         let meta = fs::symlink_metadata(src)?;
-        if meta.is_dir() {
-            if delete_source && is_mount_point(src) {
+        let is_dir = meta.is_dir();
+        if is_dir {
+            if how == Copying::Moving && is_mount_point(src) {
                 return Err(mount_point_error());
             }
             create_private_dir(dest, &meta)?;
@@ -410,19 +450,20 @@ impl Worker<'_> {
             for entry in children.into_iter().rev() {
                 pending.push(Step::Copy(entry.path(), dest.join(entry.file_name())));
             }
-            return Ok(());
-        }
-        if meta.file_type().is_symlink() {
+        } else if meta.file_type().is_symlink() {
             copy_symlink(src, dest)?;
             self.p.add_done(meta.len());
         } else if meta.is_file() {
-            copy_file(self.p, src, dest, self.owner)?;
+            copy_file(self.p, src, dest, self.owner, how != Copying::Plain)?;
         } else {
             // opening a pipe for reading blocks until a writer comes, so pipes, sockets and devices are skipped
             return Err(io::Error::new(io::ErrorKind::Unsupported, "it is not a regular file"));
         }
-        if delete_source {
-            remove_item(src)?;
+        if how != Copying::Plain {
+            self.to_sync.insert(dest.parent().unwrap_or(Path::new(".")).to_path_buf());
+        }
+        if how == Copying::Moving && !is_dir {
+            self.to_remove.push(src.to_path_buf());
         }
         Ok(())
     }
@@ -441,6 +482,28 @@ fn copy_instead_of_rename(src: &Path, err: io::Error) -> io::Result<()> {
 
 fn mount_point_error() -> io::Error {
     io::Error::other("it is a drive or a mount point, so it cannot be moved")
+}
+
+#[cfg(test)]
+const SYNC_FAILS: &str = "sync-fails-here";
+
+// a new name is on the drive only once its folder is synced, and a drive that cannot sync a folder answers EINVAL
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if dir.components().any(|c| c.as_os_str() == SYNC_FAILS) {
+        return Err(io::Error::other("the drive did not confirm the write"));
+    }
+    match File::open(dir).and_then(|f| f.sync_all()) {
+        Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
+        done => done,
+    }
+}
+
+// Windows keeps folder entries in the drive journal and cannot open a folder for a sync
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 enum Step {
@@ -560,10 +623,10 @@ fn temp_beside(item: &Path, owner: Owner, role: Role) -> PathBuf {
 }
 
 // the bytes go to a temporary name first, so a crash or an error never leaves a short file under the real name
-fn copy_file(p: &Progress, src: &Path, dest: &Path, owner: Owner) -> io::Result<()> {
+fn copy_file(p: &Progress, src: &Path, dest: &Path, owner: Owner, durable: bool) -> io::Result<()> {
     let mut input = File::open(src)?;
     let part = temp_beside(dest, owner, Role::Part);
-    let result = write_part(p, &mut input, &part).and_then(|()| {
+    let result = write_part(p, &mut input, &part, durable).and_then(|()| {
         if exists_nofollow(dest) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
         }
@@ -575,7 +638,7 @@ fn copy_file(p: &Progress, src: &Path, dest: &Path, owner: Owner) -> io::Result<
     result
 }
 
-fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
+fn write_part(p: &Progress, input: &mut File, part: &Path, durable: bool) -> io::Result<()> {
     let meta = input.metadata()?;
     let mut output = create_private_file(part, &meta)?;
     if !copy_sparse(p, input, &mut output, &meta)? {
@@ -585,6 +648,9 @@ fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
         let _ = output.set_times(times);
     }
     let _ = output.set_permissions(copy_permissions(&meta));
+    if durable {
+        output.sync_all()?;
+    }
     Ok(())
 }
 
@@ -906,6 +972,24 @@ mod tests {
         }
         assert_eq!(dir_mode, 0o700, "the new folder is private from the start");
         assert!(part_modes.iter().all(|m| m & 0o077 == 0), "the unfinished file is private: {part_modes:?}");
+    }
+
+    // in tests a folder sync fails inside a folder named SYNC_FAILS, which stands in for a drive that did not confirm the write
+    #[cfg(unix)]
+    #[test]
+    fn a_move_keeps_each_source_until_its_copy_is_on_the_drive() {
+        let here = tempfile::tempdir().unwrap();
+        let Some(there) = other_drive(here.path()) else { return };
+        let dest = there.path().join(SYNC_FAILS);
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir_all(here.path().join("d/sub")).unwrap();
+        fs::write(here.path().join("f.txt"), "f").unwrap();
+        fs::write(here.path().join("d/sub/b.txt"), "b").unwrap();
+        let p = spawn(JobKind::Move, vec![here.path().join("f.txt"), here.path().join("d")], dest.clone(), ASK);
+        assert!(matches!(wait(&p), JobState::Failed(_)));
+        assert_eq!(read(here.path().join("f.txt")), "f", "the source stays when its copy is not confirmed");
+        assert_eq!(read(here.path().join("d/sub/b.txt")), "b");
+        assert_eq!(read(dest.join("d/sub/b.txt")), "b", "the copy is there as well");
     }
 
     #[test]
