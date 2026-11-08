@@ -5,14 +5,26 @@ signal closed
 
 var index := 0
 var showing_full := false
+var commands: Array = []
 var _thumbs: JoyThumbs
 var _entries: Array = []
 var _title: Label
 var _image: TextureRect
 var _info: Label
+var _hints: HBoxContainer
 
 
 func _init() -> void:
+	var close := func() -> void: closed.emit()
+	commands = [
+		["jf_left", "Previous", _step.bind(-1), _has_step.bind(-1)],
+		["jf_right", "Next", _step.bind(1), _has_step.bind(1)],
+		["jf_back", "Close", close],
+		["jf_up", "", _step.bind(-1), _has_step.bind(-1)],
+		["jf_down", "", _step.bind(1), _has_step.bind(1)],
+		["jf_accept", "", close],
+		["jf_menu", "", close],
+	]
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 12)
 	add_child(box)
@@ -29,7 +41,8 @@ func _init() -> void:
 	frame.add_child(_image)
 	_info = Theme_.label("", Theme_.MUTED, 20)
 	box.add_child(_info)
-	box.add_child(Theme_.hints([["jf_left", "Previous"], ["jf_right", "Next"], ["jf_back", "Close"]]))
+	_hints = HBoxContainer.new()
+	box.add_child(_hints)
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 20))
 
 
@@ -46,10 +59,7 @@ func current() -> Dictionary:
 
 
 func handle(action: String) -> void:
-	match action:
-		"jf_left", "jf_up": _step(-1)
-		"jf_right", "jf_down": _step(1)
-		"jf_back", "jf_accept", "jf_menu": closed.emit()
+	JoyCommands.run(action, commands)
 
 
 func refresh() -> void:
@@ -69,28 +79,33 @@ func refresh() -> void:
 		parts.append("Loading...")
 	_info.text = "  |  ".join(parts)
 	_thumbs.want(_wanted_paths(), JoyThumbs.PREVIEW_SIDE)
+	Theme_.update_hints(_hints, JoyCommands.hints(commands))
 
 
 func _loadable(e: Dictionary) -> bool:
 	return JoyThumbs.is_image(e["name"]) and not JoyPathText.is_opaque(e["path"])
 
 
-func _step(direction: int) -> void:
+func _neighbor(direction: int) -> int:
 	var i := index + direction
 	while i >= 0 and i < _entries.size():
 		if _loadable(_entries[i]):
-			index = i
-			return
+			return i
 		i += direction
+	return -1
+
+
+func _has_step(direction: int) -> bool:
+	return _neighbor(direction) >= 0
+
+
+func _step(direction: int) -> void:
+	index = _neighbor(direction)
 
 
 func _wanted_paths() -> Array:
 	var paths: Array = [current()["path"]]
 	for direction: int in [1, -1]:
-		var i := index + direction
-		while i >= 0 and i < _entries.size():
-			if _loadable(_entries[i]):
-				paths.append(_entries[i]["path"])
-				break
-			i += direction
+		if _has_step(direction):
+			paths.append(_entries[_neighbor(direction)]["path"])
 	return paths

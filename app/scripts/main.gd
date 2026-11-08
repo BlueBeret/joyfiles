@@ -48,6 +48,8 @@ var preview: JoyPreview
 var pad := JoyInput.new()
 
 var _handlers := {}
+# one command table per mode, read by both the handler and the hints, so the two cannot drift
+var _commands := {}
 var _panels := {}
 var _overlay_renderers := {}
 var _clock := 0.0
@@ -95,18 +97,25 @@ func _ready() -> void:
 		places_source = core.places
 	if not quitter.is_valid():
 		quitter = get_tree().quit
+	_commands = _main_commands()
 	_build_ui()
 	_handlers = {
-		Mode.FILES: _files_action,
-		Mode.PLACES: _places_action,
-		Mode.MENU: _menu_action,
 		Mode.KEYBOARD: _keyboard.handle,
-		Mode.CONFIRM: _confirm_action,
 		Mode.CONFLICT: conflict_panel.handle,
 		Mode.JOBS: jobs_panel.handle,
 		Mode.PROPS: props_panel.handle,
 		Mode.PREVIEW: preview.handle,
 	}
+	for own_mode: int in _commands:
+		var table: Array = _commands[own_mode]
+		_handlers[own_mode] = func(action: String) -> void: JoyCommands.run(action, table)
+	_commands.merge({
+		Mode.KEYBOARD: _keyboard.commands,
+		Mode.CONFLICT: conflict_panel.commands,
+		Mode.JOBS: jobs_panel.commands,
+		Mode.PROPS: props_panel.commands,
+		Mode.PREVIEW: preview.commands,
+	})
 	_panels = {
 		Mode.MENU: _menu_panel,
 		Mode.CONFIRM: _confirm_panel,
@@ -208,53 +217,87 @@ func fire(action: String) -> void:
 
 # mode handlers
 
-func _files_action(action: String) -> void:
-	match action:
-		"jf_up": _move(-1)
-		"jf_down": _move(1)
-		"jf_page_up": _move(-VISIBLE_ROWS)
-		"jf_page_down": _move(VISIBLE_ROWS)
-		"jf_accept", "jf_right": _open_current()
-		"jf_back": _back()
-		"jf_left", "jf_pane": _open_places()
-		"jf_select": _toggle_select()
-		"jf_menu": _open_menu(_file_menu())
-		"jf_start": _open_menu(_app_menu())
-		"jf_view": _toggle_hidden()
-		"jf_search": _ask_filter()
-		"jf_jobs": _open_jobs()
+func _main_commands() -> Dictionary:
+	var app_menu := func() -> void: _open_menu(_app_menu())
+	var to_files := _set_mode.bind(Mode.FILES)
+	return {
+		Mode.FILES: [
+			["jf_accept", "Open", _open_current, _has_entries],
+			["jf_back", _back_label, _back, _can_back],
+			["jf_menu", "Actions", func() -> void: _open_menu(_file_menu())],
+			["jf_select", "Select", _toggle_select, _has_entries],
+			["jf_pane", "Places", _open_places],
+			["jf_start", "Menu", app_menu],
+			["jf_jobs", _jobs_hint, _open_jobs],
+			["jf_up", "", _move.bind(-1)],
+			["jf_down", "", _move.bind(1)],
+			["jf_page_up", "", _move.bind(-VISIBLE_ROWS)],
+			["jf_page_down", "", _move.bind(VISIBLE_ROWS)],
+			["jf_right", "", _open_current, _on_folder],
+			["jf_left", "", _open_places],
+			["jf_view", "", _toggle_hidden],
+			["jf_search", "", _ask_filter],
+		],
+		Mode.PLACES: [
+			["jf_accept", "Go", _go_place],
+			["jf_back", "Back", to_files],
+			["jf_start", "Menu", app_menu],
+			["jf_jobs", _jobs_hint, _open_jobs],
+			["jf_up", "", func() -> void: place_cursor = posmod(place_cursor - 1, places.size())],
+			["jf_down", "", func() -> void: place_cursor = posmod(place_cursor + 1, places.size())],
+			["jf_right", "", _go_place],
+			["jf_pane", "", to_files],
+		],
+		Mode.MENU: [
+			["jf_accept", "Choose", _choose_menu_item],
+			["jf_back", "Close", _close],
+			["jf_up", "", func() -> void: menu_cursor = posmod(menu_cursor - 1, menu_items.size())],
+			["jf_down", "", func() -> void: menu_cursor = posmod(menu_cursor + 1, menu_items.size())],
+			["jf_menu", "", _close],
+			["jf_start", "", _close],
+		],
+		Mode.CONFIRM: [
+			["jf_accept", "Yes", _confirm],
+			["jf_back", "No", _close],
+		],
+	}
 
 
-func _places_action(action: String) -> void:
-	match action:
-		"jf_up": place_cursor = posmod(place_cursor - 1, places.size())
-		"jf_down": place_cursor = posmod(place_cursor + 1, places.size())
-		"jf_accept", "jf_right":
-			navigate(places[place_cursor]["path"])
-			_set_mode(Mode.FILES)
-		"jf_back", "jf_pane": _set_mode(Mode.FILES)
-		"jf_start": _open_menu(_app_menu())
-		"jf_jobs": _open_jobs()
+func _has_entries() -> bool:
+	return not entries.is_empty()
 
 
-func _menu_action(action: String) -> void:
-	match action:
-		"jf_up": menu_cursor = posmod(menu_cursor - 1, menu_items.size())
-		"jf_down": menu_cursor = posmod(menu_cursor + 1, menu_items.size())
-		"jf_back", "jf_menu", "jf_start": _close()
-		"jf_accept":
-			var item: Callable = menu_items[menu_cursor][1]
-			_close()
-			item.call()
+# Right goes into folders only, so a push of the stick never launches an app
+func _on_folder() -> bool:
+	return _has_entries() and entries[cursor]["is_dir"]
 
 
-func _confirm_action(action: String) -> void:
-	match action:
-		"jf_accept":
-			_close()
-			_on_confirm.call()
-		"jf_back":
-			_close()
+func _back_label() -> String:
+	return "Clear filter" if filter != "" else "Up"
+
+
+func _can_back() -> bool:
+	return filter != "" or core.parent_dir(cwd) != ""
+
+
+func _jobs_hint() -> String:
+	return "" if jobs.is_empty() and reports.is_empty() else "Jobs"
+
+
+func _go_place() -> void:
+	navigate(places[place_cursor]["path"])
+	_set_mode(Mode.FILES)
+
+
+func _choose_menu_item() -> void:
+	var item: Callable = menu_items[menu_cursor][1]
+	_close()
+	item.call()
+
+
+func _confirm() -> void:
+	_close()
+	_on_confirm.call()
 
 
 # navigation
@@ -519,10 +562,10 @@ func _file_menu() -> Array:
 	items.append(["New folder", _ask_new_folder])
 	if not t.is_empty():
 		items.append(["Move to trash (%d)" % t.size(), func(): _ask_trash(t)])
-	if _visible_selection().is_empty():
-		items.append(["Select all", select_all])
-	else:
+	if not _visible_selection().is_empty():
 		items.append(["Clear selection", func(): selected.clear()])
+	elif _has_entries():
+		items.append(["Select all", select_all])
 	return items
 
 
@@ -705,10 +748,10 @@ func _poll_jobs() -> void:
 		_render()
 	_ask_next_conflict()
 	_render_status()
-	if ended and not refreshed:
-		_render_hints()
 	if mode == Mode.JOBS:
 		_render_overlay()
+	if ended and not refreshed:
+		_render_hints()
 
 
 func _announce_end(job: Dictionary) -> void:
@@ -893,7 +936,7 @@ func _build_ui() -> void:
 	_confirm_panel.add_child(confirm_box)
 	_confirm_label = Theme_.label("", Theme_.TEXT, 26)
 	confirm_box.add_child(_confirm_label)
-	confirm_box.add_child(Theme_.hints([["jf_accept", "Yes"], ["jf_back", "No"]]))
+	confirm_box.add_child(Theme_.hints(JoyCommands.hints(_commands[Mode.CONFIRM])))
 	_overlay.add_child(_confirm_panel)
 	_keyboard = JoyKeyboard.new()
 	_keyboard.submitted.connect(_on_keyboard_submitted)
@@ -1016,25 +1059,9 @@ func _render_menu() -> void:
 		_menu_box.add_child(l)
 
 
-const HINTS := {
-	Mode.FILES: [["jf_accept", "Open"], ["jf_back", "Up"], ["jf_menu", "Actions"], ["jf_select", "Select"], ["jf_pane", "Places"], ["jf_start", "Menu"]],
-	Mode.PLACES: [["jf_accept", "Go"], ["jf_back", "Back"], ["jf_start", "Menu"]],
-	Mode.MENU: [["jf_accept", "Choose"], ["jf_back", "Close"]],
-	Mode.KEYBOARD: [],
-	Mode.CONFIRM: [["jf_accept", "Yes"], ["jf_back", "No"]],
-	Mode.CONFLICT: [["jf_accept", "Choose"], ["jf_select", "All"], ["jf_back", "Cancel job"]],
-	Mode.PROPS: [["jf_back", "Close"]],
-	Mode.PREVIEW: [["jf_left", "Previous"], ["jf_right", "Next"], ["jf_back", "Close"]],
-}
-
-
+# the keyboard draws its own hint row next to the keys
 func _hints_for_mode() -> Array:
-	var pairs: Array = jobs_panel.hint_pairs(jobs) if mode == Mode.JOBS else HINTS[mode].duplicate()
-	if mode in PROMPT_MODES and not (jobs.is_empty() and reports.is_empty()):
-		pairs.append(["jf_jobs", "Jobs"])
-	if mode == Mode.FILES and filter != "":
-		pairs = pairs.map(func(p: Array) -> Array: return [p[0], "Clear filter"] if p[0] == "jf_back" else p)
-	return pairs
+	return [] if mode == Mode.KEYBOARD else JoyCommands.hints(_commands[mode])
 
 
 func _render_hints() -> void:

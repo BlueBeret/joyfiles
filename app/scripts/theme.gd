@@ -61,6 +61,16 @@ static func hints(pairs: Array) -> HBoxContainer:
 	return row
 
 
+static func update_hints(holder: Container, pairs: Array) -> void:
+	var key := str(pairs)
+	if holder.get_meta("pairs", "") == key:
+		return
+	holder.set_meta("pairs", key)
+	for child in holder.get_children():
+		child.queue_free()
+	holder.add_child(hints(pairs))
+
+
 static func human_size(bytes: int) -> String:
 	var units := ["B", "KB", "MB", "GB", "TB"]
 	var value := float(bytes)

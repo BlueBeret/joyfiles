@@ -10,6 +10,7 @@ const CHOICES := [["Replace", "replace"], ["Keep both", "keep_both"], ["Skip", "
 var apply_all := false
 var cursor := 1
 var conflict := {}
+var commands: Array = []
 var _title: Label
 var _existing: Label
 var _incoming: Label
@@ -17,6 +18,13 @@ var _rows: Array[Label] = []
 
 
 func _init() -> void:
+	commands = [
+		["jf_accept", "Choose", _choose],
+		["jf_select", "Apply to all", func() -> void: apply_all = not apply_all],
+		["jf_back", "Cancel job", func() -> void: cancelled.emit()],
+		["jf_up", "", func() -> void: cursor = posmod(cursor - 1, _rows.size())],
+		["jf_down", "", func() -> void: cursor = posmod(cursor + 1, _rows.size())],
+	]
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 14)
 	box.custom_minimum_size.x = 640
@@ -35,7 +43,7 @@ func _init() -> void:
 		var row := Theme_.label("", Theme_.TEXT, 24)
 		list.add_child(row)
 		_rows.append(row)
-	box.add_child(Theme_.hints([["jf_accept", "Choose"], ["jf_select", "Apply to all"], ["jf_back", "Cancel job"]]))
+	box.add_child(Theme_.hints(JoyCommands.hints(commands)))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 
@@ -50,17 +58,15 @@ func open(info: Dictionary) -> void:
 
 
 func handle(action: String) -> void:
-	match action:
-		"jf_up": cursor = posmod(cursor - 1, _rows.size())
-		"jf_down": cursor = posmod(cursor + 1, _rows.size())
-		"jf_select": apply_all = not apply_all
-		"jf_back": cancelled.emit()
-		"jf_accept":
-			if cursor == CHOICES.size():
-				apply_all = not apply_all
-			else:
-				answered.emit(CHOICES[cursor][1], apply_all)
+	JoyCommands.run(action, commands)
 	_render()
+
+
+func _choose() -> void:
+	if cursor == CHOICES.size():
+		apply_all = not apply_all
+	else:
+		answered.emit(CHOICES[cursor][1], apply_all)
 
 
 func _describe(is_dir: bool, size: int, modified: int) -> String:

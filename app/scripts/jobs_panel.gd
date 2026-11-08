@@ -18,6 +18,8 @@ var failure_cursor := 0
 var failure_top := 0
 # one text per failed item of the open report, so the labels and the tests read the same data
 var failure_texts: Array = []
+var commands: Array = []
+var _jobs := {}
 var _reports := {}
 var _list: VBoxContainer
 var _report_list: VBoxContainer
@@ -27,12 +29,31 @@ var _detail_title: Label
 var _detail_count: Label
 var _detail_rows: Array[Dictionary] = []
 var _hints_box: VBoxContainer
-var _hints_key := ""
 var _rows := {}
 var _report_rows := {}
 
 
 func _init() -> void:
+	var listing := func() -> bool: return viewing < 0
+	var reading := func() -> bool: return viewing >= 0
+	var on_job := func() -> bool: return viewing < 0 and focused_id() >= 0
+	var on_report := func() -> bool: return viewing < 0 and focused_report() >= 0
+	commands = [
+		["jf_accept", "Answer", func() -> void: answer_requested.emit(focused_id()), func() -> bool: return on_job.call() and is_waiting(focused_id(), _jobs)],
+		["jf_accept", "Open list", _open_report, on_report],
+		["jf_menu", "Cancel job", func() -> void: cancel_requested.emit(focused_id()), on_job],
+		["jf_menu", "Dismiss", func() -> void: dismissed.emit(focused_report()), on_report],
+		["jf_menu", "Dismiss", _dismiss_open_report, reading],
+		["jf_back", "Close", func() -> void: closed.emit(), listing],
+		["jf_back", "Back", func() -> void: viewing = -1, reading],
+		["jf_jobs", "", _close_all],
+		["jf_up", "", func() -> void: cursor = maxi(cursor - 1, 0), listing],
+		["jf_down", "", func() -> void: cursor = mini(cursor + 1, maxi(ids.size() + report_ids.size() - 1, 0)), listing],
+		["jf_up", "", _step_failure.bind(-1), reading],
+		["jf_down", "", _step_failure.bind(1), reading],
+		["jf_page_up", "", _step_failure.bind(-DETAIL_ROWS), reading],
+		["jf_page_down", "", _step_failure.bind(DETAIL_ROWS), reading],
+	]
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 14)
 	box.custom_minimum_size.x = 760
@@ -97,46 +118,32 @@ func is_waiting(id: int, jobs: Dictionary) -> bool:
 
 
 func handle(action: String) -> void:
-	if viewing >= 0:
-		_handle_detail(action)
-		return
-	var total := ids.size() + report_ids.size()
-	match action:
-		"jf_up": cursor = maxi(cursor - 1, 0)
-		"jf_down": cursor = mini(cursor + 1, maxi(total - 1, 0))
-		"jf_menu":
-			if focused_id() >= 0:
-				cancel_requested.emit(focused_id())
-			elif focused_report() >= 0:
-				dismissed.emit(focused_report())
-		"jf_accept":
-			if focused_id() >= 0:
-				answer_requested.emit(focused_id())
-			elif focused_report() >= 0:
-				viewing = focused_report()
-				failure_cursor = 0
-				failure_top = 0
-		"jf_back", "jf_jobs": closed.emit()
+	JoyCommands.run(action, commands)
 
 
-func _handle_detail(action: String) -> void:
-	var last := failure_texts.size() - 1
-	match action:
-		"jf_up": failure_cursor = maxi(failure_cursor - 1, 0)
-		"jf_down": failure_cursor = clampi(failure_cursor + 1, 0, maxi(last, 0))
-		"jf_page_up": failure_cursor = maxi(failure_cursor - DETAIL_ROWS, 0)
-		"jf_page_down": failure_cursor = clampi(failure_cursor + DETAIL_ROWS, 0, maxi(last, 0))
-		"jf_menu":
-			var id := viewing
-			viewing = -1
-			dismissed.emit(id)
-		"jf_back": viewing = -1
-		"jf_jobs":
-			viewing = -1
-			closed.emit()
+func _open_report() -> void:
+	viewing = focused_report()
+	failure_cursor = 0
+	failure_top = 0
+
+
+func _dismiss_open_report() -> void:
+	var id := viewing
+	viewing = -1
+	dismissed.emit(id)
+
+
+func _close_all() -> void:
+	viewing = -1
+	closed.emit()
+
+
+func _step_failure(step: int) -> void:
+	failure_cursor = clampi(failure_cursor + step, 0, maxi(failure_texts.size() - 1, 0))
 
 
 func update(jobs: Dictionary, reports := {}) -> void:
+	_jobs = jobs
 	ids = jobs.keys()
 	ids.sort()
 	report_ids = reports.keys()
@@ -163,7 +170,7 @@ func update(jobs: Dictionary, reports := {}) -> void:
 	_list.visible = viewing < 0
 	_report_list.visible = viewing < 0
 	_empty.visible = viewing < 0 and ids.is_empty() and report_ids.is_empty()
-	_set_hints(jobs)
+	Theme_.update_hints(_hints_box, JoyCommands.hints(commands))
 
 
 func _drop_gone(rows: Dictionary, data: Dictionary) -> void:
@@ -244,31 +251,3 @@ func _render_detail() -> void:
 		parts["message"].text = failures[at]["error"]
 		parts["path"].text = JoyPathText.printable(failures[at]["path"])
 		parts["row"].add_theme_stylebox_override("panel", Theme_.box(Theme_.ROW_SEL if at == failure_cursor else Color.TRANSPARENT, 8, 10))
-
-
-func hint_pairs(jobs: Dictionary) -> Array:
-	var pairs: Array = []
-	if viewing >= 0:
-		pairs.append(["jf_menu", "Dismiss"])
-		pairs.append(["jf_back", "Back"])
-		return pairs
-	if focused_id() >= 0:
-		pairs.append(["jf_menu", "Cancel job"])
-		if is_waiting(focused_id(), jobs):
-			pairs.append(["jf_accept", "Answer"])
-	elif focused_report() >= 0:
-		pairs.append(["jf_accept", "Open list"])
-		pairs.append(["jf_menu", "Dismiss"])
-	pairs.append(["jf_back", "Close"])
-	return pairs
-
-
-func _set_hints(jobs: Dictionary) -> void:
-	var pairs := hint_pairs(jobs)
-	var key := str(pairs)
-	if key == _hints_key:
-		return
-	_hints_key = key
-	for child in _hints_box.get_children():
-		child.queue_free()
-	_hints_box.add_child(Theme_.hints(pairs))

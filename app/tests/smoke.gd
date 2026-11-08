@@ -679,11 +679,11 @@ func _glyphs() -> void:
 	var unbound := JoyGlyph.SPECS.keys().filter(func(a): return not JoyInput.ACTIONS.has(a))
 	check(unbound.is_empty(), "every glyph names a real action: %s" % [unbound])
 	var unknown: Array = []
-	for mode: int in app.HINTS:
-		for pair: Array in app.HINTS[mode]:
-			if not JoyGlyph.SPECS.has(pair[0]):
-				unknown.append(pair[0])
-	check(unknown.is_empty(), "every hint table entry is keyed by an action: %s" % [unknown])
+	for mode: int in app.Mode.values():
+		for command: Array in app._commands[mode]:
+			if not JoyGlyph.SPECS.has(command[0]):
+				unknown.append(command[0])
+	check(unknown.is_empty(), "every mode has a command table keyed by real actions: %s" % [unknown])
 
 	app.navigate(root_dir)
 	app.mode = app.Mode.FILES

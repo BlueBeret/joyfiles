@@ -8,6 +8,7 @@ const FIELDS := ["Name", "Path", "Type", "Size", "Modified", "Contains"]
 # one text per field, so the labels and the tests read the same data
 var shown := {}
 var scan_done := true
+var commands: Array = []
 var _core: JoyCore
 var _scan := -1
 var _labels := {}
@@ -16,6 +17,8 @@ var _title: Label
 
 
 func _init() -> void:
+	var close := func() -> void: closed.emit()
+	commands = [["jf_back", "Close", close], ["jf_accept", "", close], ["jf_menu", "", close]]
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 16)
 	add_child(box)
@@ -34,7 +37,7 @@ func _init() -> void:
 		value.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		_grid.add_child(value)
 		_labels[field] = value
-	box.add_child(Theme_.hints([["jf_back", "Close"]]))
+	box.add_child(Theme_.hints(JoyCommands.hints(commands)))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 
@@ -71,8 +74,7 @@ func open(core: JoyCore, path: String) -> void:
 
 
 func handle(action: String) -> void:
-	match action:
-		"jf_back", "jf_accept", "jf_menu": closed.emit()
+	JoyCommands.run(action, commands)
 
 
 func poll() -> void:

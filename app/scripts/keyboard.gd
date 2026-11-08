@@ -24,12 +24,25 @@ var text := ""
 var shift := false
 var row := 1
 var col := 0
+var commands: Array = []
 var _title: Label
 var _field: Label
 var _grid: VBoxContainer
 
 
 func _init() -> void:
+	commands = [
+		["jf_accept", "Type", func() -> void: _press(ROWS[row][_col()])],
+		["jf_back", "Delete", _press.bind("{del}")],
+		["jf_select", "Shift", _press.bind("{shift}")],
+		["jf_menu", "Space", _press.bind("{space}")],
+		["jf_start", "Done", _press.bind("{done}")],
+		["jf_view", "Cancel", _press.bind("{cancel}")],
+		["jf_up", "", func() -> void: row = posmod(row - 1, ROWS.size())],
+		["jf_down", "", func() -> void: row = posmod(row + 1, ROWS.size())],
+		["jf_left", "", func() -> void: col -= 1],
+		["jf_right", "", func() -> void: col += 1],
+	]
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 12)
 	add_child(box)
@@ -41,7 +54,7 @@ func _init() -> void:
 	box.add_child(_field)
 	_grid = VBoxContainer.new()
 	box.add_child(_grid)
-	box.add_child(Theme_.hints([["jf_accept", "Type"], ["jf_back", "Delete"], ["jf_select", "Shift"], ["jf_menu", "Space"], ["jf_start", "Done"], ["jf_view", "Cancel"]]))
+	box.add_child(Theme_.hints(JoyCommands.hints(commands)))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 
@@ -59,17 +72,7 @@ func set_title(title: String) -> void:
 
 
 func handle(action: String) -> void:
-	match action:
-		"jf_up": row = posmod(row - 1, ROWS.size())
-		"jf_down": row = posmod(row + 1, ROWS.size())
-		"jf_left": col -= 1
-		"jf_right": col += 1
-		"jf_accept": _press(ROWS[row][_col()])
-		"jf_back": _press("{del}")
-		"jf_select": _press("{shift}")
-		"jf_menu": _press("{space}")
-		"jf_start": _press("{done}")
-		"jf_view": _press("{cancel}")
+	JoyCommands.run(action, commands)
 	col = posmod(col, ROWS[row].size())
 	_render()
 
