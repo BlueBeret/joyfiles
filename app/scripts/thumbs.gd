@@ -77,7 +77,7 @@ func _trim() -> void:
 # a name that is not valid text reaches Godot only as bytes, so the core reads it and Godot decodes the buffer
 static func _load(path: String) -> Image:
 	if not JoyPathText.is_opaque(path):
-		return Image.load_from_file(path)
+		return Image.load_from_file(JoyPathText.native(path))
 	var bytes := JoyFiles.read_bytes(path, MAX_FILE_BYTES)
 	var image := Image.new()
 	var err := ERR_FILE_UNRECOGNIZED

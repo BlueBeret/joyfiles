@@ -23,6 +23,9 @@ const UNTYPABLE := [
 const WIDTH := 780
 
 var text := ""
+# the tokens of the first text, as [start, end, original text], that still count while the text keeps its start
+var _marks: Array = []
+var _initial := ""
 var shift := false
 var row := 1
 var col := 0
@@ -62,9 +65,11 @@ func _init() -> void:
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 
-func open(title: String, initial: String) -> void:
+func open(title: String, initial: String, marks: Array = []) -> void:
 	_title.text = title
 	text = initial
+	_initial = initial
+	_marks = marks
 	shift = false
 	row = 1
 	col = 0
@@ -130,7 +135,12 @@ func _press(key: String) -> void:
 
 
 func _render() -> void:
-	_field.set_full(text + "|")
+	var keep := JoyPathText.shared_start(_initial, text)
+	var tail := JoyPathText.scan(text.substr(keep) + "|")
+	var known: Array = _marks.filter(func(t: Array) -> bool: return t[1] <= keep)
+	for t: Array in tail["tokens"]:
+		known.append([t[0] + keep, t[1] + keep, t[2]])
+	_field.set_full(text.left(keep) + tail["shown"], known)
 	for child in _grid.get_children():
 		child.queue_free()
 	for r in ROWS.size():

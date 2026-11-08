@@ -14,6 +14,10 @@ var cut := Cut.END
 # with a start cut, the text keeps whole parts after one of these characters, like "/"
 var boundary := ""
 var full := ""
+# text that stays whole right after the cut text
+var suffix := ""
+# the tokens of the full text as [start, end, original text], so a cut never splits one
+var tokens: Array = []
 
 
 func _init() -> void:
@@ -22,8 +26,15 @@ func _init() -> void:
 	resized.connect(_fit)
 
 
-func set_full(value: String) -> void:
-	full = JoyPathText.printable(value)
+# a raw text gets scanned, and a text that the caller already scanned comes with its tokens
+func set_full(value: String, known: Variant = null) -> void:
+	if known == null:
+		var scanned := JoyPathText.scan(value)
+		full = scanned["shown"]
+		tokens = scanned["tokens"]
+	else:
+		full = value
+		tokens = known
 	_fit()
 
 
@@ -31,22 +42,24 @@ func _fit() -> void:
 	var room := size.x - get_theme_stylebox("normal").get_minimum_size().x - SLACK
 	# before the first layout a label has no width, so it keeps the whole text until it gets one
 	if room <= 0.0 or not is_inside_tree():
-		text = full
+		text = full + suffix
 		return
-	var shown := cut_text(full, get_theme_font("font"), get_theme_font_size("font_size"), room, cut, boundary)
+	var font := get_theme_font("font")
+	var font_size := get_theme_font_size("font_size")
+	var shown := cut_text(full, font, font_size, room - _width(suffix, font, font_size), cut, boundary, tokens) + suffix
 	if shown != text:
 		text = shown
 
 
-static func cut_text(value: String, font: Font, font_size: int, room: float, how: int, parts := "") -> String:
+static func cut_text(value: String, font: Font, font_size: int, room: float, how: int, parts := "", marks: Array = []) -> String:
 	if _width(value, font, font_size) <= room:
 		return value
 	match how:
 		Cut.START:
-			return _cut_start(value, font, font_size, room, parts)
+			return _cut_start(value, font, font_size, room, parts, marks)
 		Cut.MIDDLE:
-			return _cut_middle(value, font, font_size, room)
-	return _cut_end(value, font, font_size, room)
+			return _cut_middle(value, font, font_size, room, marks)
+	return _cut_end(value, font, font_size, room, marks)
 
 
 static func _width(value: String, font: Font, font_size: int) -> float:
@@ -66,26 +79,30 @@ static func _most_that_fit(count: int, fits: Callable) -> int:
 	return low
 
 
-static func _cut_end(value: String, font: Font, font_size: int, room: float) -> String:
+static func _cut_end(value: String, font: Font, font_size: int, room: float, marks: Array) -> String:
 	var kept := _most_that_fit(value.length(), func(n: int) -> bool: return _width(value.left(n) + ELLIPSIS, font, font_size) <= room)
-	return _whole_head(value.left(kept)) + ELLIPSIS
+	return value.left(_before_token(kept, marks)) + ELLIPSIS
 
 
-# a cut inside a <U+XXXX> or <+N marks> token drops the rest of that token, so no half token shows
-static func _whole_head(head: String) -> String:
-	var open := head.rfind("<")
-	return head.left(open) if open >= 0 and head.find(">", open) < 0 else head
+# a cut inside a token moves to the start of that token, so no half token shows
+static func _before_token(at: int, marks: Array) -> int:
+	for token: Array in marks:
+		if token[0] < at and at < token[1]:
+			return token[0]
+	return at
 
 
-static func _whole_tail(tail: String) -> String:
-	var close := tail.find(">")
-	var open := tail.find("<")
-	return tail.substr(close + 1) if close >= 0 and close <= 9 and (open < 0 or close < open) else tail
+# a cut inside a token moves to the end of that token
+static func _after_token(at: int, marks: Array) -> int:
+	for token: Array in marks:
+		if token[0] < at and at < token[1]:
+			return token[1]
+	return at
 
 
-static func _cut_start(value: String, font: Font, font_size: int, room: float, parts: String) -> String:
+static func _cut_start(value: String, font: Font, font_size: int, room: float, parts: String, marks: Array) -> String:
 	var kept := _most_that_fit(value.length(), func(n: int) -> bool: return _width(ELLIPSIS + value.right(n), font, font_size) <= room)
-	var from := value.length() - kept
+	var from := _after_token(value.length() - kept, marks)
 	if parts != "":
 		for i in range(maxi(from, 1), value.length()):
 			if parts.contains(value[i]):
@@ -94,14 +111,14 @@ static func _cut_start(value: String, font: Font, font_size: int, room: float, p
 
 
 # keeps the extension and a few characters before it, so two long names that differ at the start stay apart
-static func _cut_middle(value: String, font: Font, font_size: int, room: float) -> String:
+static func _cut_middle(value: String, font: Font, font_size: int, room: float, marks: Array) -> String:
 	var tail_length := mini(TAIL_CHARS, value.length() - 1)
 	var dot := value.rfind(".")
 	if dot > 0 and value.length() - dot <= EXTENSION_CHARS and not value.substr(dot).contains(" "):
 		tail_length = mini(value.length() - dot + EXTENSION_KEEP, value.length() - 1)
-	var tail := _whole_tail(value.right(tail_length))
+	var tail := value.substr(_after_token(value.length() - tail_length, marks))
 	var head := value.left(value.length() - tail_length)
 	var kept := _most_that_fit(head.length(), func(n: int) -> bool: return _width(head.left(n) + ELLIPSIS + tail, font, font_size) <= room)
 	if kept == 0 and _width(ELLIPSIS + tail, font, font_size) > room:
-		return _cut_end(value, font, font_size, room)
-	return _whole_head(head.left(kept)) + ELLIPSIS + tail
+		return _cut_end(value, font, font_size, room, marks)
+	return value.left(_before_token(kept, marks)) + ELLIPSIS + tail

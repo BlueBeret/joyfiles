@@ -236,6 +236,7 @@ func _run() -> void:
 	await _round3_layout()
 	await _round4_text()
 	await _round5_text()
+	await _round6_app()
 	app.queue_free()
 	await frames()
 	var input_suite: GDScript = load("res://tests/input.gd")
@@ -1508,7 +1509,7 @@ func _round4_text() -> void:
 	check(app.conflict_panel._title.text == "\"%s\" already exists here." % shown, "the clash title is printable (%s)" % app.conflict_panel._title.text)
 	app.jobs[5] = {"watch": [], "state": "running", "kind": "copy", "current": evil, "done_bytes": 1, "total_bytes": 10, "conflict": info}
 	app._render_status()
-	check(app._status.text == "Copying paused: " + shown, "the footer status is printable (%s)" % app._status.text)
+	check(app._status.full == "Copying paused: " + shown and app._status.suffix == " already exists.", "the footer status is printable (%s)" % app._status.full)
 	app.jobs[5]["conflict"] = {}
 	app.jobs[5]["current"] = "a\nb" + evil
 	app.jobs_panel.update(app.jobs, {})
@@ -1619,11 +1620,12 @@ func _round5_text() -> void:
 		check(kept.size() == 1 and kept[0]["path"].ends_with("bytex"), "an edited name keeps the invalid byte")
 		check(not (app._toast_panel.visible and app._toast_label.text.contains("is hidden")) and app.entries[app.cursor]["path"] == kept[0]["path"], "a rename of such a name gives no hidden notice and keeps the cursor (%s)" % app._toast_label.text)
 
-	var long_text := JoyPathText.printable("ctl_" + "A".repeat(10) + "\u202E".repeat(30) + "B".repeat(10) + ".txt")
+	var long_scan := JoyPathText.scan("ctl_" + "A".repeat(10) + "\u202E".repeat(30) + "B".repeat(10) + ".txt")
+	var long_text: String = long_scan["shown"]
 	var font := ThemeDB.fallback_font
 	var split := 0
 	for room in range(120, 600, 7):
-		var cut := JoyFitLabel.cut_text(long_text, font, 24, float(room), JoyFitLabel.Cut.MIDDLE)
+		var cut := JoyFitLabel.cut_text(long_text, font, 24, float(room), JoyFitLabel.Cut.MIDDLE, "", long_scan["tokens"])
 		for piece in cut.split("\u2026"):
 			if piece.count("<") != piece.count(">"):
 				split += 1
@@ -1653,3 +1655,82 @@ func _round5_text() -> void:
 	check(bare.cwd == "/" and not bare.entries.is_empty() and bare._toast_label.text.begins_with("No home folder"), "no places at all still opens the root folder with a notice (%s)" % bare.cwd)
 	bare.queue_free()
 	await frames(2)
+
+
+# true when no cut piece ends or starts inside a token
+func _cut_whole(shown: String, tokens: Array, cut: String) -> bool:
+	var pieces := cut.split("\u2026")
+	var ends: Array = []
+	if pieces[0] != "":
+		ends.append(pieces[0].length())
+	if pieces.size() > 1 and pieces[1] != "":
+		ends.append(shown.length() - pieces[1].length())
+	for at: int in ends:
+		if tokens.any(func(t: Array) -> bool: return t[0] < at and at < t[1]):
+			return false
+	return true
+
+
+func _round6_app() -> void:
+	var font := ThemeDB.fallback_font
+	var long_marks := "start_of_a_long_file_name_here" + "\u202E".repeat(4) + "rest.txt"
+	var scan := JoyPathText.scan(long_marks)
+	var split := 0
+	for room in range(150, 700, 5):
+		for how in [JoyFitLabel.Cut.END, JoyFitLabel.Cut.START, JoyFitLabel.Cut.MIDDLE]:
+			if not _cut_whole(scan["shown"], scan["tokens"], JoyFitLabel.cut_text(scan["shown"], font, 24, float(room), how, "", scan["tokens"])):
+				split += 1
+	check(split == 0, "no cut splits a mark, the start cut included (%d split)" % split)
+
+	var angle := "a<b very long name that goes on and on and on and on and on and on and on.txt"
+	var end_cut := JoyFitLabel.cut_text(angle, font, 24, 600.0, JoyFitLabel.Cut.END, "", [])
+	check(end_cut.length() > 30, "a real < in a name does not cut it to one letter (%s)" % end_cut)
+	var close := "this_is_a_very_long_name_with_arrow_and_more_then_some_x>y.txt"
+	var mid_cut := JoyFitLabel.cut_text(close, font, 24, 300.0, JoyFitLabel.Cut.MIDDLE, "", [])
+	check(mid_cut.ends_with("x>y.txt"), "a real > in the tail of a name stays (%s)" % mid_cut)
+
+	var dir := root_dir + "/r6"
+	app.settings.show_hidden = true
+	var nerd := "x\uF741y.txt"
+	write(dir + "/" + nerd, "x")
+	app.navigate(dir)
+	var found: Array = app.entries.filter(func(e: Dictionary) -> bool: return e["name"].begins_with("x"))
+	check(found.size() == 1 and not JoyPathText.is_opaque(found[0]["path"]), "a real U+F741 in a valid name is not opaque")
+	check(JoyPathText.printable(found[0]["name"]) == "x<U+F741>y.txt", "a real U+F741 shows as a mark (%s)" % JoyPathText.printable(found[0]["name"]))
+	var opened: Array = []
+	app.opener = func(p: String) -> int:
+		opened.append(p)
+		return OK
+	app.cursor = app.entries.find(found[0])
+	app._open_current()
+	check(opened.size() == 1 and FileAccess.file_exists(opened[0]), "such a name is opened by its real path (%s)" % [opened])
+	_rename_to(found[0]["path"], func(t: String) -> String: return t + "X")
+	check(FileAccess.file_exists(dir + "/" + nerd + "X"), "an edited rename keeps the real U+F741")
+	check(JoyPathText.is_opaque("x\uF7FF") and not JoyPathText.is_opaque("\uF7EF\uF79D\uF781"), "a lone escaped byte stays opaque and an escaped U+F741 does not")
+
+	var blank := "   "
+	write(dir + "/" + blank, "x")
+	app.toast("")
+	_rename_to(dir + "/" + blank, func(t: String) -> String: return t)
+	check(FileAccess.file_exists(dir + "/" + blank) and not (app._toast_panel.visible and app._toast_label.text == "The name is not valid."), "an unchanged rename of a blank name is quiet")
+	var tail_name := "a".repeat(80) + "\u202E".repeat(4) + "rest.txt"
+	write(dir + "/" + tail_name, "x")
+	app.navigate(dir)
+	app._ask_rename(dir + "/" + tail_name)
+	var field: String = app._keyboard._field.text
+	check(field.count("<") == field.count(">"), "the rename field does not start with half a mark (%s)" % field)
+	app._on_keyboard_submitted(app._keyboard.text)
+
+	var clash := {"name": "n".repeat(120) + ".txt", "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 0}
+	app.jobs[6] = {"watch": [], "state": "running", "kind": "copy", "current": "x", "done_bytes": 1, "total_bytes": 10, "conflict": clash}
+	app._render_status()
+	check(app._status.text.ends_with(" already exists.") and app._status.text.contains("\u2026") and app._status_tail.text == "", "the clash reason follows the name in one text (%s)" % app._status.text)
+	app.jobs.erase(6)
+	app._render_status()
+
+	var homes: Array = app.places
+	app.places = [{"label": "Root", "path": "/", "kind": "folder"}]
+	check(app._pretty_path("/home/x") == "/home/x", "with the root as the only place the path keeps its first slash (%s)" % app._pretty_path("/home/x"))
+	app.places = [{"label": "Home", "path": "/home/a", "kind": "home"}]
+	check(app._pretty_path("/home/a/b") == "~/b" and app._pretty_path("/home/ab") == "/home/ab" and app._pretty_path("/home/a") == "~", "the home prefix needs a whole folder")
+	app.places = homes

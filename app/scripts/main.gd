@@ -468,7 +468,8 @@ func _leave_missing_folder() -> void:
 
 func _pretty_path(path: String) -> String:
 	var home: String = places[0]["path"]
-	return JoyPathText.printable(("~" + path.trim_prefix(home)) if path.begins_with(home) else path)
+	# a home that ends with a slash is the root, and a "~" there would eat the first slash of the path
+	return ("~" + path.trim_prefix(home)) if not home.ends_with("/") and (path == home or path.begins_with(home + "/")) else path
 
 
 func _back() -> void:
@@ -548,7 +549,7 @@ func _open_file(e: Dictionary) -> void:
 	if JoyPathText.is_opaque(e["path"]):
 		toast("Could not open %s. Its name is not valid text, so no app can be asked to open it." % e["name"], true)
 		return
-	var err: int = opener.call(e["path"])
+	var err: int = opener.call(JoyPathText.native(e["path"]))
 	if err == OK:
 		toast("Asked the system to open %s. If nothing happens, open it in Desktop Mode." % e["name"])
 	else:
@@ -713,12 +714,15 @@ func _ask_rename(path: String) -> void:
 		if real == null:
 			toast("Rename refused. The edit cut into a hidden character mark such as <U+202E>. Delete the whole mark or leave it.", true)
 			return
+		if real == path.get_file():
+			return
 		var r: Dictionary = core.rename(path, real)
 		if r["ok"]:
 			_refresh_to_new(r["path"])
 		else:
 			toast(r["error"], true),
-		func(text: String): kept[0] = mini(kept[0], JoyPathText.shared_start(shown, text)))
+		func(text: String): kept[0] = mini(kept[0], JoyPathText.shared_start(shown, text)),
+		Callable(), first["tokens"])
 
 
 func _ask_new_folder() -> void:
@@ -775,12 +779,12 @@ func _on_report_dismissed(id: int) -> void:
 
 
 # the title is text or a Callable, and a Callable title is read again whenever the list changes
-func _ask_text(title: Variant, initial: String, on_submit: Callable, on_change := Callable(), on_cancel := Callable()) -> void:
+func _ask_text(title: Variant, initial: String, on_submit: Callable, on_change := Callable(), on_cancel := Callable(), marks: Array = []) -> void:
 	_keyboard_title = title if title is Callable else func() -> String: return title
 	_on_submit = on_submit
 	_on_change = on_change
 	_on_cancel = on_cancel
-	_keyboard.open(_keyboard_title.call(), initial)
+	_keyboard.open(_keyboard_title.call(), initial, marks)
 	_open(Mode.KEYBOARD)
 
 
@@ -1223,7 +1227,7 @@ func _render_rows() -> void:
 		part["mark"].text = "✓" if is_selected else ""
 		part["glyph"].text = "" if tex != null else ("▰" if e["is_dir"] else "▫")
 		part["glyph"].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
-		part["name"].set_full(JoyPathText.printable(e["name"]))
+		part["name"].set_full(e["name"])
 		part["name"].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
 		part["size"].text = "" if e["is_dir"] else Theme_.human_size(e["size"])
 	thumbs.want(wanted, JoyThumbs.THUMB_SIDE)
@@ -1307,15 +1311,16 @@ func _render_status() -> void:
 	var j: Dictionary = running[0]
 	var verb := "Moving" if j.get("kind") == "move" else "Copying"
 	if not j.get("conflict", {}).is_empty():
-		_set_status("%s paused: %s" % [verb, j["conflict"]["name"]], "already exists.", Theme_.TEXT)
+		_set_status("%s paused: %s" % [verb, j["conflict"]["name"]], "", Theme_.TEXT, JoyFitLabel.Cut.MIDDLE, " already exists.")
 		return
 	var pct: int = 0 if j.get("total_bytes", 0) == 0 else int(100.0 * j["done_bytes"] / j["total_bytes"])
 	_set_status("%s %s" % [verb, j.get("current", "")], "%d%%" % pct, Theme_.TEXT)
 
 
 # the tail stays whole, so a long name never hides the percent or the reason
-func _set_status(head: String, tail: String, color: Color, how := JoyFitLabel.Cut.MIDDLE) -> void:
+func _set_status(head: String, tail: String, color: Color, how := JoyFitLabel.Cut.MIDDLE, follow := "") -> void:
 	_status.cut = how
+	_status.suffix = follow
 	_status.set_full(head)
 	_status_tail.text = tail
 	for label: Label in [_status, _status_tail]:

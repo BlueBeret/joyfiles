@@ -270,5 +270,5 @@ func _render_detail() -> void:
 		if at >= failures.size():
 			continue
 		parts["message"].text = failure_texts[at]
-		parts["path"].set_full(JoyPathText.printable(failures[at]["path"]))
+		parts["path"].set_full(failures[at]["path"])
 		parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(at == failure_cursor))
