@@ -37,6 +37,8 @@ const REPEAT := {
 
 # a source is one physical control that is down, mapped to the action it holds
 var _live := {}
+# sources that were down when the screen changed, ignored until their release
+var _stale := {}
 var _dpads := {}
 var _axes := {}
 # an axis source fires only after it rests near the center, so a spring back cannot fire the other way
@@ -89,9 +91,16 @@ func press(e: InputEvent) -> String:
 	if not e.is_pressed():
 		_up(src)
 		return ""
-	if e.is_echo() or _live.has(src):
+	if e.is_echo() or _live.has(src) or _stale.has(src):
 		return ""
 	return _down(src, action_of(e))
+
+
+# a control that is down when the screen changes does nothing more until it is released
+func block() -> void:
+	_stale.merge(_live)
+	_live.clear()
+	_repeat = ""
 
 
 # the stick and the triggers are read once per frame, after every axis event of that frame
@@ -129,7 +138,7 @@ func _dpad(e: InputEventJoypadButton) -> String:
 	var action := action_of(e)
 	if not e.pressed:
 		down.erase(action)
-		if _live.get(src, "") == action:
+		if _held(src) == action:
 			_up(src)
 		return ""
 	var from_rest := down.is_empty()
@@ -139,7 +148,7 @@ func _dpad(e: InputEventJoypadButton) -> String:
 
 # a stick holds its strongest direction until that direction falls below RELEASE
 func _settle(src: String, pulls: Dictionary, on_press: Callable) -> void:
-	var held: String = _live.get(src, "")
+	var held := _held(src)
 	if held != "":
 		if pulls[held] >= RELEASE:
 			return
@@ -169,8 +178,13 @@ func _down(src: String, action: String) -> String:
 	return action
 
 
+func _held(src: String) -> String:
+	return _live.get(src, _stale.get(src, ""))
+
+
 func _up(src: String) -> void:
 	_live.erase(src)
+	_stale.erase(src)
 
 
 # the newest held direction repeats, so letting go of a second direction hands back to the first

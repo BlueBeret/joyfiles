@@ -11,6 +11,10 @@ const TOAST_LIFT := 84
 const PLACES_REFRESH_SECONDS := 3.0
 # a clash prompt never cuts into a menu, a keyboard or a confirm that the user is using
 const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
+# a double tap is two fresh presses, so only time can tell the second tap from a deliberate press
+const GUARD_SECONDS := 0.15
+# the presses that answer or close a screen, ignored for GUARD_SECONDS after a screen change
+const GUARDED := ["jf_accept", "jf_back"]
 
 var start_path := ""
 var settings_path := "user://settings.cfg"
@@ -47,6 +51,9 @@ var _handlers := {}
 var _panels := {}
 var _overlay_renderers := {}
 var _clock := 0.0
+var _guard_until := 0.0
+# the mode that each open modal returns to when it closes
+var _return := {}
 var _on_submit: Callable
 var _on_change: Callable
 var _on_cancel: Callable
@@ -54,7 +61,6 @@ var _on_confirm: Callable
 var _toast_until := 0.0
 var _places_at := 0.0
 var _conflict_job := -1
-var _conflict_return := Mode.FILES
 var _report_seq := 0
 
 var _path_label: Label
@@ -142,12 +148,12 @@ func _unhandled_input(event: InputEvent) -> void:
 	var action := pad.press(event)
 	if action != "":
 		get_viewport().set_input_as_handled()
-		fire(action)
+		_on_press(action)
 
 
 func _process(delta: float) -> void:
 	_clock += delta
-	pad.tick(_clock, fire)
+	pad.tick(_clock, _on_press)
 	_poll_jobs()
 	if _clock >= _places_at:
 		refresh_places()
@@ -158,6 +164,30 @@ func _process(delta: float) -> void:
 	if _toast_until > 0.0 and _clock > _toast_until:
 		_toast_until = 0.0
 		_toast_panel.visible = false
+
+
+func _on_press(action: String) -> void:
+	if action in GUARDED and _clock < _guard_until:
+		return
+	fire(action)
+
+
+# every screen change drops the held controls, so a press meant for the old screen cannot act on the new one
+func _set_mode(next: int) -> void:
+	if next == mode:
+		return
+	mode = next
+	pad.block()
+	_guard_until = _clock + GUARD_SECONDS
+
+
+func _open(modal: int) -> void:
+	_return[modal] = mode
+	_set_mode(modal)
+
+
+func _close() -> void:
+	_set_mode(_return.get(mode, Mode.FILES))
 
 
 func fire(action: String) -> void:
@@ -190,8 +220,8 @@ func _places_action(action: String) -> void:
 		"jf_down": place_cursor = posmod(place_cursor + 1, places.size())
 		"jf_accept", "jf_right":
 			navigate(places[place_cursor]["path"])
-			mode = Mode.FILES
-		"jf_back", "jf_pane": mode = Mode.FILES
+			_set_mode(Mode.FILES)
+		"jf_back", "jf_pane": _set_mode(Mode.FILES)
 		"jf_start": _open_menu(_app_menu())
 		"jf_jobs": _open_jobs()
 
@@ -200,26 +230,27 @@ func _menu_action(action: String) -> void:
 	match action:
 		"jf_up": menu_cursor = posmod(menu_cursor - 1, menu_items.size())
 		"jf_down": menu_cursor = posmod(menu_cursor + 1, menu_items.size())
-		"jf_back", "jf_menu", "jf_start": mode = Mode.FILES
+		"jf_back", "jf_menu", "jf_start": _close()
 		"jf_accept":
-			mode = Mode.FILES
-			menu_items[menu_cursor][1].call()
+			var item: Callable = menu_items[menu_cursor][1]
+			_close()
+			item.call()
 
 
 func _confirm_action(action: String) -> void:
 	match action:
 		"jf_accept":
-			mode = Mode.FILES
+			_close()
 			_on_confirm.call()
 		"jf_back":
-			mode = Mode.FILES
+			_close()
 
 
 # navigation
 
 func _open_places() -> void:
 	refresh_places()
-	mode = Mode.PLACES
+	_set_mode(Mode.PLACES)
 
 
 # a card can be mounted or removed at any time, so the list is read again on a timer
@@ -397,7 +428,7 @@ func _open_current() -> void:
 		navigate(e["path"])
 	elif _previewable(e):
 		preview.open(thumbs, entries, cursor)
-		mode = Mode.PREVIEW
+		_open(Mode.PREVIEW)
 	else:
 		_open_file(e)
 
@@ -513,7 +544,7 @@ func _ask_quit() -> void:
 		return
 	_confirm_label.text = "A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size()
 	_on_confirm = quitter
-	mode = Mode.CONFIRM
+	_open(Mode.CONFIRM)
 
 
 func _open_sort_menu() -> void:
@@ -529,7 +560,7 @@ func _open_sort_menu() -> void:
 func _open_menu(items: Array) -> void:
 	menu_items = items
 	menu_cursor = 0
-	mode = Mode.MENU
+	_open(Mode.MENU)
 
 
 func _set_clipboard(paths: PackedStringArray, is_move: bool) -> void:
@@ -581,7 +612,7 @@ func _ask_trash(paths: PackedStringArray) -> void:
 	_on_confirm = func():
 		_announce_trash(core.trash(paths), what)
 		refresh()
-	mode = Mode.CONFIRM
+	_open(Mode.CONFIRM)
 
 
 func _announce_trash(r: Dictionary, what: String) -> void:
@@ -612,11 +643,11 @@ func _ask_text(title: String, initial: String, on_submit: Callable, on_change :=
 	_on_change = on_change
 	_on_cancel = on_cancel
 	_keyboard.open(title, initial)
-	mode = Mode.KEYBOARD
+	_open(Mode.KEYBOARD)
 
 
 func _on_keyboard_submitted(text: String) -> void:
-	mode = Mode.FILES
+	_close()
 	_on_submit.call(text)
 	_render()
 
@@ -627,7 +658,7 @@ func _on_keyboard_changed(text: String) -> void:
 
 
 func _on_keyboard_cancelled() -> void:
-	mode = Mode.FILES
+	_close()
 	if _on_cancel.is_valid():
 		_on_cancel.call()
 	_render()
@@ -635,11 +666,11 @@ func _on_keyboard_cancelled() -> void:
 
 func _open_props(path: String) -> void:
 	props_panel.open(core, path)
-	mode = Mode.PROPS
+	_open(Mode.PROPS)
 
 
 func _open_jobs() -> void:
-	mode = Mode.JOBS
+	_open(Mode.JOBS)
 
 
 func _poll_jobs() -> void:
@@ -699,9 +730,8 @@ func _ask_next_conflict() -> void:
 
 func _open_conflict(id: int) -> void:
 	_conflict_job = id
-	_conflict_return = mode
 	conflict_panel.open(jobs[id]["conflict"])
-	mode = Mode.CONFLICT
+	_open(Mode.CONFLICT)
 	_render()
 
 
@@ -719,7 +749,7 @@ func _close_conflict() -> void:
 	if jobs.has(_conflict_job):
 		jobs[_conflict_job]["conflict"] = {}
 	_conflict_job = -1
-	mode = _conflict_return
+	_close()
 
 
 func _on_answer_requested(id: int) -> void:
@@ -735,12 +765,12 @@ func _on_preview_closed() -> void:
 			break
 	cursor = clampi(cursor, 0, maxi(entries.size() - 1, 0))
 	_clamp_view()
-	mode = Mode.FILES
+	_close()
 
 
 func _on_props_closed() -> void:
 	props_panel.close()
-	mode = Mode.FILES
+	_close()
 
 
 func toast(text: String, is_error := false) -> void:
@@ -864,7 +894,7 @@ func _build_ui() -> void:
 	conflict_panel.cancelled.connect(_on_conflict_cancelled)
 	_overlay.add_child(conflict_panel)
 	jobs_panel = JoyJobs.new()
-	jobs_panel.closed.connect(func(): mode = Mode.FILES)
+	jobs_panel.closed.connect(_close)
 	jobs_panel.cancel_requested.connect(core.cancel_job)
 	jobs_panel.answer_requested.connect(_on_answer_requested)
 	jobs_panel.dismissed.connect(_on_report_dismissed)
