@@ -1,0 +1,13 @@
+// steamcmd depot template for the Linux build
+"DepotBuildConfig"
+{
+	// placeholder, it must match the Linux depot id in app_build.vdf
+	"DepotID" "REPLACE_ME_DEPOT_LINUX"
+
+	"FileMapping"
+	{
+		"LocalPath" "linux/*"
+		"DepotPath" "."
+		"recursive" "1"
+	}
+}

@@ -1,0 +1,13 @@
+// steamcmd depot template for the Windows build
+"DepotBuildConfig"
+{
+	// placeholder, it must match the Windows depot id in app_build.vdf
+	"DepotID" "REPLACE_ME_DEPOT_WINDOWS"
+
+	"FileMapping"
+	{
+		"LocalPath" "windows/*"
+		"DepotPath" "."
+		"recursive" "1"
+	}
+}

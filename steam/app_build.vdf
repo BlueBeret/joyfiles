@@ -1,0 +1,24 @@
+// steamcmd template, replace every REPLACE_ME value in steam/ before you run scripts/steam-upload.sh
+"AppBuild"
+{
+	// placeholder for your Steamworks app id
+	"AppID" "REPLACE_ME_APPID"
+	"Desc" "Joyfiles build"
+
+	// paths are relative to this file
+	"ContentRoot" "../build/"
+	"BuildOutput" "../build/steam-output/"
+
+	// preview 1 only checks the files, set it to 0 for a real upload
+	"Preview" "1"
+
+	// an empty value uploads the build and does not set a branch live
+	"SetLive" ""
+
+	"Depots"
+	{
+		// placeholders for your Linux depot id and your Windows depot id
+		"REPLACE_ME_DEPOT_LINUX" "depot_build_linux.vdf"
+		"REPLACE_ME_DEPOT_WINDOWS" "depot_build_windows.vdf"
+	}
+}
