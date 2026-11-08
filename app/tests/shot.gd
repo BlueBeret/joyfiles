@@ -97,6 +97,16 @@ func cursor_to(name: String) -> void:
 			app.cursor = i
 
 
+func rm_tree(path: String) -> void:
+	if not path.begins_with(base + "/"):
+		return
+	for d in DirAccess.get_directories_at(path):
+		rm_tree(path + "/" + d)
+	for f in DirAccess.get_files_at(path):
+		DirAccess.remove_absolute(path + "/" + f)
+	DirAccess.remove_absolute(path)
+
+
 func copy_all_from(dir: String) -> void:
 	app.navigate(dir)
 	pick("Select all")
@@ -204,4 +214,41 @@ func _run() -> void:
 	await snap("jobs_panel")
 	press(["jf_back"])
 	await snap("files_after_closing_jobs")
+	press(["jf_back"])
+	await until(func(): return app.jobs.is_empty(), 300)
+
+	for n in ["photo_a.txt", "photo_b.txt", "doc1.txt", "doc2.txt", "doc3.txt", "doc4.txt"]:
+		write_text("%s/hiding/%s" % [base, n], "x")
+	app.navigate(base + "/hiding")
+	pick("Select all")
+	app._set_filter("photo")
+	press(["jf_menu"])
+	await snap("filter_hides_selection")
+	press(["jf_back"])
+	app._set_filter("")
+	app.selected.clear()
+
+	var home: Dictionary = app.places[0]
+	app.places_source = func() -> Array: return [home, {"label": "SD CARD", "path": base, "kind": "drive"}]
+	press(["jf_pane"])
+	await snap("places_new_card")
+	press(["jf_back"])
+	app.places_source = app.core.places
+	app.refresh_places()
+
+	write_text(base + "/gone/inner/f.txt", "x")
+	app.navigate(base + "/gone/inner")
+	rm_tree(base + "/gone")
+	pick("Refresh", true)
+	await snap("folder_gone")
+
+	copy_all_from(base + "/clash_src2")
+	app.navigate(base + "/clash_dst")
+	pick("Paste")
+	pick("Quit", true)
+	await snap("quit_while_job_runs")
+	press(["jf_back"])
+	await until(func(): return app.mode == app.Mode.CONFLICT, 300)
+	press(["jf_back"])
+	await until(func(): return app.jobs.is_empty(), 300)
 	quit()
