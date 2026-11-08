@@ -488,8 +488,7 @@ func _ask_quit() -> void:
 	if jobs.is_empty():
 		quitter.call()
 		return
-	var what := "A job is still running." if jobs.size() == 1 else "%d jobs are still running." % jobs.size()
-	_confirm_label.text = what + " Quit anyway?"
+	_confirm_label.text = "A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size()
 	_on_confirm = quitter
 	mode = Mode.CONFIRM
 

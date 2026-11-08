@@ -631,7 +631,7 @@ func _quit_with_job() -> void:
 	pick("Paste")
 	pick_start("Quit")
 	check(app.mode == app.Mode.CONFIRM and quits.size() == 1, "Quit asks first while a job runs")
-	check(app._confirm_label.text.begins_with("A job is still running."), "the question names the running job: %s" % app._confirm_label.text)
+	check(app._confirm_label.text == "A job is still running. Quit and cancel it?", "the question says that quitting cancels the job: %s" % app._confirm_label.text)
 	press("jf_back")
 	check(app.mode == app.Mode.FILES and quits.size() == 1, "B keeps the app open")
 	pick_start("Quit")
