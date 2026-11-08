@@ -29,7 +29,7 @@ func _init() -> void:
 	frame.add_child(_image)
 	_info = Theme_.label("", Theme_.MUTED, 20)
 	box.add_child(_info)
-	box.add_child(Theme_.hints([["Left", "Previous"], ["Right", "Next"], ["B", "Close"]]))
+	box.add_child(Theme_.hints([["jf_left", "Previous"], ["jf_right", "Next"], ["jf_back", "Close"]]))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 20))
 
 

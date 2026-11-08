@@ -10,7 +10,6 @@ const MUTED := Color("#8a90a0")
 const FOLDER := Color("#ffc857")
 const DANGER := Color("#ff5d5d")
 const WARN := Color("#ffc857")
-const BUTTON_COLORS := {"A": Color("#3fb950"), "B": Color("#f85149"), "X": Color("#4f7cff"), "Y": Color("#e3b341")}
 
 
 static func box(color: Color, radius := 0, margin := 12) -> StyleBoxFlat:
@@ -52,16 +51,13 @@ static func label(text: String, color := TEXT, size := 24, clip := false) -> Lab
 
 static func hints(pairs: Array) -> HBoxContainer:
 	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 20)
+	row.add_theme_constant_override("separation", 28)
 	for pair: Array in pairs:
-		var chip := Label.new()
-		chip.text = pair[0]
-		chip.add_theme_font_size_override("font_size", 18)
-		chip.add_theme_color_override("font_color", Color.WHITE)
-		chip.add_theme_stylebox_override("normal", box(BUTTON_COLORS.get(pair[0], Color("#555b6b")), 14, 6))
-		chip.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-		row.add_child(chip)
-		row.add_child(label(pair[1], MUTED, 20))
+		var item := HBoxContainer.new()
+		item.add_theme_constant_override("separation", 10)
+		item.add_child(JoyGlyph.of(pair[0]))
+		item.add_child(label(pair[1], MUTED, 20))
+		row.add_child(item)
 	return row
 
 

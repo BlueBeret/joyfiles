@@ -34,7 +34,7 @@ func _init() -> void:
 		value.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		_grid.add_child(value)
 		_labels[field] = value
-	box.add_child(Theme_.hints([["B", "Close"]]))
+	box.add_child(Theme_.hints([["jf_back", "Close"]]))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 

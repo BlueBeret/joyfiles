@@ -700,7 +700,7 @@ func _build_ui() -> void:
 	_confirm_panel.add_child(confirm_box)
 	_confirm_label = Theme_.label("", Theme_.TEXT, 26)
 	confirm_box.add_child(_confirm_label)
-	confirm_box.add_child(Theme_.hints([["A", "Yes"], ["B", "No"]]))
+	confirm_box.add_child(Theme_.hints([["jf_accept", "Yes"], ["jf_back", "No"]]))
 	_overlay.add_child(_confirm_panel)
 	_keyboard = JoyKeyboard.new()
 	_keyboard.submitted.connect(_on_keyboard_submitted)
@@ -823,24 +823,24 @@ func _render_menu() -> void:
 
 
 const HINTS := {
-	Mode.FILES: [["A", "Open"], ["B", "Up"], ["X", "Actions"], ["Y", "Select"], ["LB", "Places"], ["Start", "Menu"]],
-	Mode.PLACES: [["A", "Go"], ["B", "Back"], ["Start", "Menu"]],
-	Mode.MENU: [["A", "Choose"], ["B", "Close"]],
+	Mode.FILES: [["jf_accept", "Open"], ["jf_back", "Up"], ["jf_menu", "Actions"], ["jf_select", "Select"], ["jf_pane", "Places"], ["jf_start", "Menu"]],
+	Mode.PLACES: [["jf_accept", "Go"], ["jf_back", "Back"], ["jf_start", "Menu"]],
+	Mode.MENU: [["jf_accept", "Choose"], ["jf_back", "Close"]],
 	Mode.KEYBOARD: [],
-	Mode.CONFIRM: [["A", "Yes"], ["B", "No"]],
-	Mode.CONFLICT: [["A", "Choose"], ["Y", "All"], ["B", "Cancel job"]],
-	Mode.JOBS: [["X", "Cancel job"], ["B", "Close"]],
-	Mode.PROPS: [["B", "Close"]],
-	Mode.PREVIEW: [["Left", "Previous"], ["Right", "Next"], ["B", "Close"]],
+	Mode.CONFIRM: [["jf_accept", "Yes"], ["jf_back", "No"]],
+	Mode.CONFLICT: [["jf_accept", "Choose"], ["jf_select", "All"], ["jf_back", "Cancel job"]],
+	Mode.JOBS: [["jf_menu", "Cancel job"], ["jf_back", "Close"]],
+	Mode.PROPS: [["jf_back", "Close"]],
+	Mode.PREVIEW: [["jf_left", "Previous"], ["jf_right", "Next"], ["jf_back", "Close"]],
 }
 
 
 func _hints_for_mode() -> Array:
 	var pairs: Array = HINTS[mode].duplicate()
 	if mode in PROMPT_MODES and not jobs.is_empty():
-		pairs.append(["L3", "Jobs"])
+		pairs.append(["jf_jobs", "Jobs"])
 	if mode == Mode.FILES and filter != "":
-		pairs = pairs.map(func(p: Array) -> Array: return ["B", "Clear filter"] if p[1] == "Up" else p)
+		pairs = pairs.map(func(p: Array) -> Array: return [p[0], "Clear filter"] if p[0] == "jf_back" else p)
 	return pairs
 
 

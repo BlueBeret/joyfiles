@@ -35,7 +35,7 @@ func _init() -> void:
 		var row := Theme_.label("", Theme_.TEXT, 24)
 		list.add_child(row)
 		_rows.append(row)
-	box.add_child(Theme_.hints([["A", "Choose"], ["Y", "Apply to all"], ["B", "Cancel job"]]))
+	box.add_child(Theme_.hints([["jf_accept", "Choose"], ["jf_select", "Apply to all"], ["jf_back", "Cancel job"]]))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 

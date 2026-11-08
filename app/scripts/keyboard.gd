@@ -35,7 +35,7 @@ func _init() -> void:
 	box.add_child(_field)
 	_grid = VBoxContainer.new()
 	box.add_child(_grid)
-	box.add_child(Theme_.hints([["A", "Type"], ["B", "Delete"], ["Y", "Shift"], ["X", "Space"], ["Start", "Done"], ["View", "Cancel"]]))
+	box.add_child(Theme_.hints([["jf_accept", "Type"], ["jf_back", "Delete"], ["jf_select", "Shift"], ["jf_menu", "Space"], ["jf_start", "Done"], ["jf_view", "Cancel"]]))
 	add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 16, 24))
 
 

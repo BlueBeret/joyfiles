@@ -106,10 +106,10 @@ func _fill_row(parts: Dictionary, job: Dictionary, focused: bool) -> void:
 func _set_hints(jobs: Dictionary) -> void:
 	var pairs: Array = []
 	if not ids.is_empty():
-		pairs.append(["X", "Cancel job"])
+		pairs.append(["jf_menu", "Cancel job"])
 		if is_waiting(focused_id(), jobs):
-			pairs.append(["A", "Answer"])
-	pairs.append(["B", "Close"])
+			pairs.append(["jf_accept", "Answer"])
+	pairs.append(["jf_back", "Close"])
 	var key := str(pairs)
 	if key == _hints_key:
 		return
