@@ -596,7 +596,7 @@ func _missing_folder() -> void:
 	app.refresh()
 	check(app.cwd == base, "refresh leaves a deleted folder for the nearest one that exists (%s)" % app.cwd)
 	check(names() == ["keep.txt"], "the nearest folder lists its own entries: %s" % [names()])
-	check(app._toast_label.text.begins_with("The folder mid is gone."), "a toast says that the folder is gone: %s" % app._toast_label.text)
+	check(app._toast_label.text.begins_with("The folder mid is not available."), "a toast says that the folder is not available: %s" % app._toast_label.text)
 
 	write(base + "/top/mid/f.txt", "x")
 	app.navigate(base + "/top/mid")

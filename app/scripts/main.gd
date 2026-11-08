@@ -244,10 +244,11 @@ func refresh_places() -> void:
 	_render_places()
 
 
-func _list(path: String) -> Variant:
+func _list(path: String, quiet := false) -> Variant:
 	var result: Dictionary = core.list_dir(path, settings.show_hidden, settings.sort_key, settings.sort_desc)
 	if not result["ok"]:
-		toast(result["error"], true)
+		if not quiet:
+			toast(result["error"], true)
 		return null
 	return result["entries"]
 
@@ -256,6 +257,10 @@ func navigate(path: String, focus_name := "") -> void:
 	var listed: Variant = _list(path)
 	if listed == null:
 		return
+	_enter(path, listed, focus_name)
+
+
+func _enter(path: String, listed: Array, focus_name := "") -> void:
 	cwd = path
 	all_entries = listed
 	filter = ""
@@ -265,8 +270,9 @@ func navigate(path: String, focus_name := "") -> void:
 
 func refresh(focus_name := "") -> void:
 	var keep := focus_name if focus_name != "" else _cursor_name()
-	var listed: Variant = _list(cwd)
+	var listed: Variant = _list(cwd, true)
 	if listed == null:
+		_leave_missing_folder()
 		return
 	all_entries = listed
 	if not selected.is_empty():
@@ -281,8 +287,35 @@ func refresh(focus_name := "") -> void:
 
 func go_up() -> void:
 	var parent: String = core.parent_dir(cwd)
-	if parent != "":
-		navigate(parent, cwd.get_file() if cwd.get_file() != "" else cwd)
+	if parent == "":
+		return
+	if not DirAccess.dir_exists_absolute(cwd):
+		_leave_missing_folder()
+		return
+	navigate(parent, cwd.get_file() if cwd.get_file() != "" else cwd)
+
+
+# a deleted folder or a removed card leaves a stale list, so move to the nearest folder that still lists
+func _leave_missing_folder() -> void:
+	var gone := cwd
+	var candidates: Array = []
+	var path: String = core.parent_dir(cwd)
+	while path != "":
+		candidates.append(path)
+		path = core.parent_dir(path)
+	candidates.append(places[0]["path"])
+	for candidate: String in candidates:
+		var listed: Variant = _list(candidate, true)
+		if listed != null:
+			_enter(candidate, listed)
+			toast("The folder %s is not available. Opened %s." % [gone.get_file(), _pretty_path(candidate)])
+			return
+	toast("The folder %s is not available." % gone.get_file(), true)
+
+
+func _pretty_path(path: String) -> String:
+	var home: String = places[0]["path"]
+	return ("~" + path.trim_prefix(home)) if path.begins_with(home) else path
 
 
 func _back() -> void:
@@ -790,8 +823,7 @@ func _build_ui() -> void:
 
 
 func _render() -> void:
-	var home: String = places[0]["path"]
-	_path_label.text = ("~" + cwd.trim_prefix(home)) if cwd.begins_with(home) else cwd
+	_path_label.text = _pretty_path(cwd)
 	_filter_label.visible = filter != ""
 	_filter_label.text = "Filter: " + filter
 	_sort_label.text = "%s %s" % [JoySettings.SORTS[settings.sort_key][0], "▼" if settings.sort_desc else "▲"]
