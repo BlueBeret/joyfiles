@@ -36,6 +36,10 @@ func run() -> void:
 	await _preview_follows_refresh()
 	await _physical_keys()
 	await _display_gaps()
+	await _round3_keys()
+	await _round3_keyboard()
+	await _round3_close()
+	await _round3_missing_place()
 	app.queue_free()
 	await runner.process_frame
 
@@ -664,3 +668,102 @@ func _display_gaps() -> void:
 	check(app.targets().size() == 3, "showing hidden files brings the whole selection back (%d)" % app.targets().size())
 	app.settings.show_hidden = false
 	app._save_settings()
+
+
+func chord(code: int, mods: Dictionary) -> void:
+	for pressed in [true, false]:
+		var e := InputEventKey.new()
+		e.keycode = code
+		e.physical_keycode = code
+		e.pressed = pressed
+		e.shift_pressed = mods.get("shift", false)
+		e.ctrl_pressed = mods.get("ctrl", false)
+		e.alt_pressed = mods.get("alt", false)
+		e.meta_pressed = mods.get("meta", false)
+		Input.parse_input_event(e)
+		await step()
+
+
+func _round3_keys() -> void:
+	var many := data + "/many"
+	await fresh(many)
+	await type_key(KEY_KP_ENTER)
+	check(app.cwd == many + "/d000", "numpad Enter opens the folder like Enter (%s)" % app.cwd.trim_prefix(data))
+	await fresh(many)
+	for mods: Dictionary in [{"shift": true}, {"ctrl": true}, {"alt": true}, {"meta": true}]:
+		var before: int = app.cursor
+		await chord(KEY_DOWN, mods)
+		check(app.cursor == before + 1, "Down with %s held still moves the cursor (%d to %d)" % [mods.keys()[0], before, app.cursor])
+	await chord(KEY_TAB, {"shift": true})
+	check(app.mode == app.Mode.PLACES, "Shift+Tab opens Places (mode %d)" % app.mode)
+
+
+func _round3_keyboard() -> void:
+	var many := data + "/many"
+	await fresh(many)
+	app._ask_rename(app.entries[12]["path"])
+	await step(2)
+	await type_key(KEY_ENTER, 13)
+	check(app.mode == app.Mode.KEYBOARD, "a physical Enter right after the keyboard opens does not submit it (mode %d)" % app.mode)
+	await type_key(KEY_Q, 113)
+	check(app._keyboard.text.ends_with("q"), "a letter typed right after the keyboard opens still types (%s)" % app._keyboard.text)
+	await settle()
+	await type_key(KEY_DOWN)
+	check(app._keyboard.row == 2, "physical Down moves the key cursor (row %d)" % app._keyboard.row)
+	await type_key(KEY_RIGHT)
+	check(app._keyboard.col == 1, "physical Right moves the key cursor (col %d)" % app._keyboard.col)
+	await type_key(KEY_LEFT)
+	await type_key(KEY_UP)
+	check(app._keyboard.row == 1 and app._keyboard.col == 0, "physical Left and Up move it back (%d, %d)" % [app._keyboard.row, app._keyboard.col])
+	var kb: JoyKeyboard = app._keyboard
+	kb.row = 3
+	kb.col = 8
+	kb._across = 0.85
+	kb.handle("jf_down")
+	check(kb.row == 4 and kb.col == 4, "Down from the dot lands on the key under it (col %d)" % kb.col)
+	kb.handle("jf_up")
+	check(kb.row == 3 and kb.col == 8, "Up returns to the same column (col %d)" % kb.col)
+	kb.col = 0
+	kb._across = 0.05
+	kb.handle("jf_down")
+	check(kb.col == 0, "Down from the first column stays in the first column (col %d)" % kb.col)
+	await type_key(KEY_ESCAPE, 27)
+
+
+func _round3_close() -> void:
+	var many := data + "/many"
+	await fresh(many)
+	check(ProjectSettings.get_setting("application/config/auto_accept_quit", true) == false, "the app handles a window close itself")
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	check(quits == 1, "a window close with no job quits at once (quits %d)" % quits)
+	await fresh(many)
+	app.jobs[999] = {"watch": [], "state": "running"}
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	check(quits == 0 and app.mode == app.Mode.CONFIRM, "a window close with a running job asks first (quits %d, mode %d)" % [quits, app.mode])
+	await settle()
+	await tap(JOY_BUTTON_B)
+	check(quits == 0 and app.mode == app.Mode.FILES, "B on the quit question keeps the app open (mode %d)" % app.mode)
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	await settle()
+	await tap(JOY_BUTTON_A)
+	check(quits == 1, "A on the quit question quits (quits %d)" % quits)
+	await fresh(many)
+	app.jobs[999] = {"watch": [], "state": "running"}
+	app._ask_trash(PackedStringArray([app.entries[3]["path"]]))
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	await settle()
+	await tap(JOY_BUTTON_B)
+	check(app.mode == app.Mode.FILES and quits == 0, "a window close over another question does not trap the screen (mode %d)" % app.mode)
+	app.jobs.clear()
+
+
+func _round3_missing_place() -> void:
+	await fresh(data + "/many")
+	var gone := [{"label": "Data", "path": data, "kind": "home"}, {"label": "Gone", "path": data + "/gone", "kind": "folder"}]
+	app.places_source = func() -> Array: return gone
+	app.places = gone
+	await tap(JOY_BUTTON_LEFT_SHOULDER)
+	await settle()
+	await tap(JOY_BUTTON_DPAD_DOWN)
+	await tap(JOY_BUTTON_A)
+	check(app.mode == app.Mode.PLACES and app.cwd == data + "/many", "A on a place that is gone stays in Places (mode %d, %s)" % [app.mode, app.cwd.trim_prefix(data)])

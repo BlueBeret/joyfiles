@@ -10,7 +10,7 @@ const ACTIONS := {
 	"jf_down": [[BTN, JOY_BUTTON_DPAD_DOWN], [KEY, KEY_DOWN]],
 	"jf_left": [[BTN, JOY_BUTTON_DPAD_LEFT], [KEY, KEY_LEFT]],
 	"jf_right": [[BTN, JOY_BUTTON_DPAD_RIGHT], [KEY, KEY_RIGHT]],
-	"jf_accept": [[BTN, JOY_BUTTON_A], [KEY, KEY_ENTER]],
+	"jf_accept": [[BTN, JOY_BUTTON_A], [KEY, KEY_ENTER], [KEY, KEY_KP_ENTER]],
 	"jf_back": [[BTN, JOY_BUTTON_B], [KEY, KEY_BACKSPACE], [KEY, KEY_ESCAPE]],
 	"jf_menu": [[BTN, JOY_BUTTON_X], [KEY, KEY_M]],
 	"jf_select": [[BTN, JOY_BUTTON_Y], [KEY, KEY_SPACE]],
@@ -71,8 +71,10 @@ static func _event_for(binding: Array) -> InputEvent:
 
 
 static func action_of(e: InputEvent) -> String:
+	if e is InputEventKey and e.physical_keycode == KEY_TAB and (e.alt_pressed or e.ctrl_pressed or e.meta_pressed):
+		return ""
 	for action: String in ACTIONS:
-		if e.is_action(action, true):
+		if e.is_action(action, false):
 			return action
 	return ""
 

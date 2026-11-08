@@ -27,6 +27,8 @@ var shift := false
 var row := 1
 var col := 0
 var commands: Array = []
+# where the key cursor sits across the row as a share of its width, so Up and Down land under it
+var _across := 0.05
 var _title: Label
 var _field: JoyFitLabel
 var _grid: VBoxContainer
@@ -40,8 +42,8 @@ func _init() -> void:
 		["jf_menu", "Space", _press.bind("{space}")],
 		["jf_start", "Done", _press.bind("{done}")],
 		["jf_view", "Cancel", _press.bind("{cancel}")],
-		["jf_up", "", func() -> void: row = posmod(row - 1, ROWS.size())],
-		["jf_down", "", func() -> void: row = posmod(row + 1, ROWS.size())],
+		["jf_up", "", _step_row.bind(-1)],
+		["jf_down", "", _step_row.bind(1)],
 		["jf_left", "", func() -> void: col -= 1],
 		["jf_right", "", func() -> void: col += 1],
 	]
@@ -66,6 +68,7 @@ func open(title: String, initial: String) -> void:
 	shift = false
 	row = 1
 	col = 0
+	_across = 0.05
 	_render()
 
 
@@ -76,7 +79,14 @@ func set_title(title: String) -> void:
 func handle(action: String) -> void:
 	JoyCommands.run(action, commands)
 	col = posmod(col, ROWS[row].size())
+	if action == "jf_left" or action == "jf_right":
+		_across = (col + 0.5) / ROWS[row].size()
 	_render()
+
+
+func _step_row(step: int) -> void:
+	row = posmod(row + step, ROWS.size())
+	col = clampi(floori(_across * ROWS[row].size()), 0, ROWS[row].size() - 1)
 
 
 func handle_key(event: InputEventKey) -> void:
@@ -84,6 +94,10 @@ func handle_key(event: InputEventKey) -> void:
 		KEY_ENTER, KEY_KP_ENTER: _press("{done}")
 		KEY_ESCAPE: _press("{cancel}")
 		KEY_BACKSPACE: _press("{del}")
+		KEY_UP: handle("jf_up")
+		KEY_DOWN: handle("jf_down")
+		KEY_LEFT: handle("jf_left")
+		KEY_RIGHT: handle("jf_right")
 		_:
 			if typable(event.unicode):
 				text += char(event.unicode)
