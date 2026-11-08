@@ -407,10 +407,41 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 
 #[cfg(not(unix))]
 pub fn same_dir(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
+    matches!((file_id(a), file_id(b)), (Some(x), Some(y)) if x == y)
+}
+
+// the path text of one folder can differ in case, so the volume and the file index name the folder
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Info {
+        attributes: u32,
+        times: [[u32; 2]; 3],
+        volume: u32,
+        size: [u32; 2],
+        links: u32,
+        index_high: u32,
+        index_low: u32,
     }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut Info) -> i32;
+    }
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = fs::OpenOptions::new().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).ok()?;
+    let mut info = std::mem::MaybeUninit::<Info>::zeroed();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some((info.volume, u64::from(info.index_high) << 32 | u64::from(info.index_low)))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn file_id(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
 }
 
 // a plain rename replaces an item that took the name a moment ago, so this one fails with AlreadyExists instead

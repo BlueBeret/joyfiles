@@ -1610,6 +1610,20 @@ mod tests {
         assert!(matches!(wait(&p), JobState::Failed(_)));
     }
 
+    // Windows finds a folder by any case of its name, so the check must compare the folders and not their path text
+    #[cfg(windows)]
+    #[test]
+    fn refuses_to_copy_a_folder_into_itself_through_a_path_in_other_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Data");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let into = tmp.path().join("data").join("SUB");
+        assert!(into.is_dir(), "the drive ignores case");
+        let p = spawn(JobKind::Copy, vec![dir.clone()], into, ASK);
+        assert_eq!(wait(&p), JobState::Failed("Cannot put a folder inside itself.".into()));
+        assert!(names_in(&dir.join("sub")).is_empty(), "nothing was copied");
+    }
+
     #[cfg(unix)]
     #[test]
     fn refuses_to_put_a_folder_inside_itself_through_a_link() {
