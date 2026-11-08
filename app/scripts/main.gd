@@ -56,6 +56,8 @@ var _clock := 0.0
 var _guard_until := 0.0
 # the mode that each open modal returns to when it closes
 var _return := {}
+var _keyboard_title: Callable
+var _only_hidden := false
 var _on_submit: Callable
 var _on_change: Callable
 var _on_cancel: Callable
@@ -328,7 +330,9 @@ func _list(path: String, quiet := false) -> Variant:
 		if not quiet:
 			toast(result["error"], true)
 		return null
-	return result["entries"]
+	var listed: Array = result["entries"]
+	_only_hidden = listed.is_empty() and not settings.show_hidden and not core.list_dir(path, true, "name", false)["entries"].is_empty()
+	return listed
 
 
 func navigate(path: String, focus_name := "") -> void:
@@ -358,8 +362,9 @@ func refresh(focus_name := "") -> void:
 		var present := {}
 		for e: Dictionary in all_entries:
 			present[e["path"]] = true
+		# an item that the hidden setting takes out of view stays selected while it exists, like a filtered one
 		for path: String in selected.keys():
-			if not present.has(path):
+			if not present.has(path) and not core.props(path)["ok"]:
 				selected.erase(path)
 	_apply_filter(keep)
 
@@ -447,13 +452,13 @@ func _apply_filter(focus_name := "") -> void:
 	_clamp_view()
 	if mode == Mode.PREVIEW and not preview.relist(entries):
 		_close()
+	if mode == Mode.KEYBOARD:
+		_keyboard.set_title(_keyboard_title.call())
 
 
 func _set_filter(text: String) -> void:
 	filter = text
 	_apply_filter()
-	if mode == Mode.KEYBOARD:
-		_keyboard.set_title(_filter_title())
 
 
 func _filter_title() -> String:
@@ -660,8 +665,7 @@ func _ask_new_folder() -> void:
 
 func _ask_filter() -> void:
 	var before := filter
-	_ask_text("Filter this folder", filter, _set_filter, _set_filter, func(): _set_filter(before))
-	_keyboard.set_title(_filter_title())
+	_ask_text(_filter_title, filter, _set_filter, _set_filter, func(): _set_filter(before))
 
 
 func _ask_trash(paths: PackedStringArray) -> void:
@@ -696,11 +700,13 @@ func _on_report_dismissed(id: int) -> void:
 	reports.erase(id)
 
 
-func _ask_text(title: String, initial: String, on_submit: Callable, on_change := Callable(), on_cancel := Callable()) -> void:
+# the title is text or a Callable, and a Callable title is read again whenever the list changes
+func _ask_text(title: Variant, initial: String, on_submit: Callable, on_change := Callable(), on_cancel := Callable()) -> void:
+	_keyboard_title = title if title is Callable else func() -> String: return title
 	_on_submit = on_submit
 	_on_change = on_change
 	_on_cancel = on_cancel
-	_keyboard.open(title, initial)
+	_keyboard.open(_keyboard_title.call(), initial)
 	_open(Mode.KEYBOARD)
 
 
@@ -1009,7 +1015,7 @@ func _render_rows() -> void:
 			part["name"].text = ""
 			part["size"].text = ""
 			if idx == 0:
-				part["name"].text = "No items match the filter." if filter != "" else "This folder is empty."
+				part["name"].text = _empty_text()
 				part["name"].add_theme_color_override("font_color", Theme_.MUTED)
 			continue
 		var e: Dictionary = entries[idx]
@@ -1031,6 +1037,12 @@ func _render_rows() -> void:
 		part["name"].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
 		part["size"].text = "" if e["is_dir"] else Theme_.human_size(e["size"])
 	thumbs.want(wanted, JoyThumbs.THUMB_SIDE)
+
+
+func _empty_text() -> String:
+	if filter != "":
+		return "No items match the filter."
+	return "This folder has only hidden items." if _only_hidden else "This folder is empty."
 
 
 func _render_places() -> void:
