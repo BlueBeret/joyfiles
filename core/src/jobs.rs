@@ -344,7 +344,7 @@ impl Worker<'_> {
     fn copy_one(&mut self, src: &Path, dest: &Path, delete_source: bool, pending: &mut Vec<Step>) -> io::Result<()> {
         let meta = fs::symlink_metadata(src)?;
         if meta.is_dir() {
-            fs::create_dir(dest)?;
+            create_private_dir(dest, &meta)?;
             pending.push(Step::Close { src: src.to_path_buf(), dest: dest.to_path_buf(), meta });
             let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
             for entry in children.into_iter().rev() {
@@ -379,7 +379,42 @@ fn keep_metadata(dest: &Path, meta: &fs::Metadata) {
     if let Ok(times) = file_times(meta) {
         let _ = open_for_times(dest).and_then(|f| f.set_times(times));
     }
-    let _ = fs::set_permissions(dest, meta.permissions());
+    let _ = fs::set_permissions(dest, copy_permissions(meta));
+}
+
+// the copy belongs to whoever runs the job, so like cp it drops setuid and setgid
+#[cfg(unix)]
+fn copy_permissions(meta: &fs::Metadata) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    fs::Permissions::from_mode(meta.permissions().mode() & 0o1777)
+}
+
+#[cfg(not(unix))]
+fn copy_permissions(meta: &fs::Metadata) -> fs::Permissions {
+    meta.permissions()
+}
+
+// the new item starts with no more rights for others than the source has, and the owner can still fill it
+#[cfg(unix)]
+fn create_private_dir(dest: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    fs::DirBuilder::new().mode(meta.permissions().mode() & 0o777 | 0o700).create(dest)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dest: &Path, _meta: &fs::Metadata) -> io::Result<()> {
+    fs::create_dir(dest)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path, meta: &fs::Metadata) -> io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    fs::OpenOptions::new().write(true).create_new(true).mode(meta.permissions().mode() & 0o777 | 0o600).open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path, _meta: &fs::Metadata) -> io::Result<File> {
+    File::create_new(path)
 }
 
 fn file_times(meta: &fs::Metadata) -> io::Result<fs::FileTimes> {
@@ -474,7 +509,8 @@ fn copy_file(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
 }
 
 fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
-    let mut output = File::create_new(part)?;
+    let meta = input.metadata()?;
+    let mut output = create_private_file(part, &meta)?;
     let mut buf = vec![0u8; 1 << 20];
     loop {
         if p.cancel.load(Ordering::Relaxed) {
@@ -487,11 +523,10 @@ fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
         output.write_all(&buf[..n])?;
         p.add_done(n as u64);
     }
-    let meta = input.metadata()?;
     if let Ok(times) = file_times(&meta) {
         let _ = output.set_times(times);
     }
-    let _ = output.set_permissions(meta.permissions());
+    let _ = output.set_permissions(copy_permissions(&meta));
     Ok(())
 }
 
@@ -710,6 +745,56 @@ mod tests {
         assert_eq!(read(out.join("ro/f.txt")), "f");
         fs::set_permissions(out.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_drops_setuid_and_setgid_like_cp() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(src.join("shared")).unwrap();
+        fs::write(src.join("tool"), "x").unwrap();
+        fs::set_permissions(src.join("tool"), fs::Permissions::from_mode(0o4755)).unwrap();
+        fs::set_permissions(src.join("shared"), fs::Permissions::from_mode(0o2775)).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join("tool"), src.join("shared")], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!((mode(&out.join("tool")), mode(&out.join("shared"))), (0o755, 0o775));
+    }
+
+    // the check runs while the big file is still in flight, so it sees the rights of the unfinished items
+    #[cfg(unix)]
+    #[test]
+    fn a_private_item_is_never_readable_by_others_while_it_is_copied() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("priv");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("big.bin"), vec![0u8; 256 << 20]).unwrap();
+        fs::set_permissions(src.join("big.bin"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o700)).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src], out.clone(), ASK);
+        while p.done_bytes.load(Ordering::Relaxed) == 0 && p.state() == JobState::Running {
+            thread::yield_now();
+        }
+        let dir_mode = mode(&out.join("priv"));
+        let part_modes: Vec<u32> = fs::read_dir(out.join("priv")).unwrap().map(|e| mode(&e.unwrap().path())).collect();
+        let in_flight = p.state() == JobState::Running;
+        p.request_cancel();
+        assert!(p.wait_finished(Instant::now() + Duration::from_secs(10)));
+        if !in_flight {
+            eprintln!("skipped: the copy ended before the check");
+            return;
+        }
+        assert_eq!(dir_mode, 0o700, "the new folder is private from the start");
+        assert!(part_modes.iter().all(|m| m & 0o077 == 0), "the unfinished file is private: {part_modes:?}");
     }
 
     #[test]
