@@ -224,6 +224,7 @@ func _run() -> void:
 	_glyphs()
 	_keyboard_fallback()
 	_settings_types()
+	await _fitting()
 	_contrast()
 	app.queue_free()
 	await frames()
@@ -764,6 +765,47 @@ func _settings_types() -> void:
 	check(good.sort_key == "type" and good.show_hidden and good.sort_desc, "a well formed file still loads whole")
 
 
+func _fits(label: JoyFitLabel) -> bool:
+	var width := Theme_.text_width(label.text, label.get_theme_font_size("font_size"))
+	return width <= label.size.x
+
+
+func _fitting() -> void:
+	var base := root_dir + "/fitting"
+	var deep := base + "/deep"
+	for i in 35:
+		deep += "/level_%02d_%s" % [i, "n".repeat(18)]
+	DirAccess.make_dir_recursive_absolute(deep)
+	var long_name := "A".repeat(196) + ".txt"
+	write(base + "/" + long_name, "x")
+	write(base + "/short.txt", "x")
+	app.mode = app.Mode.FILES
+	show(deep)
+	await frames(3)
+	var leaf := deep.get_file()
+	check(app._path_label.text.begins_with("…") and app._path_label.text.ends_with("/" + leaf), "a deep path loses its start and keeps the current folder (%s)" % app._path_label.text)
+	check(_fits(app._path_label), "the cut path fits the header")
+	show(base)
+	await frames(3)
+	check(app._path_label.text.ends_with("/fitting") and not app._path_label.text.begins_with("…"), "a short path shows whole (%s)" % app._path_label.text)
+	var row: Dictionary = app._row_parts[names().find(long_name)]
+	check(row["name"].text.contains("…") and row["name"].text.ends_with("AAA.txt") and _fits(row["name"]), "a long name keeps its extension (%s)" % row["name"].text)
+	var short: Dictionary = app._row_parts[names().find("short.txt")]
+	check(short["name"].text == "short.txt", "a short name shows whole")
+	app._set_filter("x".repeat(200))
+	app._render()
+	await frames(3)
+	check(app._filter_label.size.x <= app.FILTER_MAX_WIDTH + 1.0 and _fits(app._filter_label), "a long filter keeps its limit (%.0f)" % app._filter_label.size.x)
+	check(app._path_label.size.x > 400.0, "a long filter leaves room for the path (%.0f)" % app._path_label.size.x)
+	app._set_filter("")
+	app.jobs[901] = {"watch": [], "kind": "copy", "current": long_name, "total_bytes": 100, "done_bytes": 40, "state": "running", "conflict": {}}
+	app._render_status()
+	await frames(3)
+	check(app._status_tail.text == "40%" and app._status.text.contains("…") and _fits(app._status), "a long job name never hides the percent (%s | %s)" % [app._status.text, app._status_tail.text])
+	app.jobs.erase(901)
+	app._render_status()
+
+
 # the fill that a text sits on, found from the nearest ancestor that paints one
 func _surface_under(node: Node) -> Color:
 	var up := node
@@ -848,7 +890,7 @@ func _contrast() -> void:
 	app._render()
 	audit("the jobs panel")
 	app.jobs.erase(900)
-	check(audited > 50, "the audit looked at the visible texts of every screen (%d)" % audited)
+	check(audited > 500, "the audit looked at the visible texts of every screen (%d)" % audited)
 	app.mode = app.Mode.FILES
 	app.settings.show_hidden = false
 	app.refresh()
@@ -900,7 +942,7 @@ func _job_failures() -> void:
 	var failed_names: Array = report["failures"].map(func(f: Dictionary) -> String: return f["name"])
 	check(failed_names == ["b.txt", "c.txt"], "the report holds every failed item: %s" % [failed_names])
 	check(app.last_error == "2 items could not be copied. Open Jobs to see them.", "the toast counts the failures and says where to look: %s" % app.last_error)
-	check(app._status.text == "2 items failed. Open Jobs to see why.", "the footer keeps the failure in view after the toast: %s" % app._status.text)
+	check(app._status.full == "2 items failed. Open Jobs to see why.", "the footer keeps the failure in view after the toast: %s" % app._status.text)
 	check(app._hints_for_mode().has(["jf_jobs", "Jobs"]), "the jobs hint stays while a report waits")
 	check(app._jobs_label() == "Jobs (1 failed)", "the Start menu counts the report: %s" % app._jobs_label())
 
@@ -917,7 +959,7 @@ func _job_failures() -> void:
 	open_jobs_report()
 	press("jf_menu")
 	check(app.reports.is_empty() and app.jobs_panel.report_ids.is_empty(), "X dismisses the report")
-	check(app._status.text == "" and not app._hints_for_mode().any(func(p: Array) -> bool: return p[0] == "jf_jobs"), "a dismissed report leaves no trace in the footer")
+	check(app._status.full == "" and not app._hints_for_mode().any(func(p: Array) -> bool: return p[0] == "jf_jobs"), "a dismissed report leaves no trace in the footer")
 	press("jf_back")
 
 	for i in 12:

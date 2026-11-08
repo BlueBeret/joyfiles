@@ -94,7 +94,7 @@ func _build_detail(box: VBoxContainer) -> void:
 		message.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		message.max_lines_visible = 2
 		lines.add_child(message)
-		var where := Theme_.label("", Theme_.MUTED, Theme_.SIZE_SMALL, true)
+		var where := Theme_.fit("", Theme_.MUTED, Theme_.SIZE_SMALL, JoyFitLabel.Cut.START, "/")
 		lines.add_child(where)
 		_detail.add_child(row)
 		_detail_rows.append({"row": row, "message": message, "path": where})
@@ -187,7 +187,7 @@ func _make_row() -> Dictionary:
 	row.add_child(box)
 	var line := HBoxContainer.new()
 	box.add_child(line)
-	var title := Theme_.label("", Theme_.TEXT, 22, true)
+	var title := Theme_.fit("", Theme_.TEXT, Theme_.SIZE_BODY, JoyFitLabel.Cut.MIDDLE)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	line.add_child(title)
 	var info := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
@@ -215,7 +215,7 @@ func _fill_row(parts: Dictionary, job: Dictionary, focused: bool) -> void:
 	var ratio := 0.0 if total == 0 else clampf(float(done) / total, 0.0, 1.0)
 	var verb := "Moving" if job.get("kind") == "move" else "Copying"
 	var waiting: bool = not job.get("conflict", {}).is_empty()
-	parts["title"].text = "%s %s" % [verb, job.get("current", "")]
+	parts["title"].set_full("%s %s" % [verb, job.get("current", "")])
 	parts["info"].text = "Needs an answer" if waiting else "%d%%  %s of %s" % [int(ratio * 100.0), Theme_.human_size(done), Theme_.human_size(total)]
 	parts["info"].add_theme_color_override("font_color", Theme_.WARN if waiting else Theme_.MUTED)
 	parts["bar"].value = ratio
@@ -249,5 +249,5 @@ func _render_detail() -> void:
 		if at >= failures.size():
 			continue
 		parts["message"].text = failures[at]["error"]
-		parts["path"].text = JoyPathText.printable(failures[at]["path"])
+		parts["path"].set_full(JoyPathText.printable(failures[at]["path"]))
 		parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(at == failure_cursor))

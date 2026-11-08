@@ -6,6 +6,7 @@ const VISIBLE_ROWS := 12
 const ROW_HEIGHT := 50
 const THUMB_BOX := 42
 const MARK_WIDTH := 30
+const FILTER_MAX_WIDTH := 380.0
 const TOAST_FONT := 22
 const TOAST_MAX_WIDTH := 880.0
 const TOAST_LIFT := 84
@@ -66,14 +67,15 @@ var _places_at := 0.0
 var _conflict_job := -1
 var _report_seq := 0
 
-var _path_label: Label
-var _filter_label: Label
+var _path_label: JoyFitLabel
+var _filter_label: JoyFitLabel
 var _sort_label: Label
 var _count_label: Label
 var _rows: Array[PanelContainer] = []
 var _row_parts: Array[Dictionary] = []
 var _places_box: VBoxContainer
-var _status: Label
+var _status: JoyFitLabel
+var _status_tail: Label
 var _toast_panel: PanelContainer
 var _toast_label: Label
 var _hints: Control
@@ -865,14 +867,14 @@ func _build_ui() -> void:
 	var header_row := HBoxContainer.new()
 	header_row.add_theme_constant_override("separation", 20)
 	header.add_child(header_row)
-	_path_label = Theme_.label("", Theme_.TEXT, 26, true)
+	_path_label = Theme_.fit("", Theme_.TEXT, Theme_.SIZE_TITLE, JoyFitLabel.Cut.START, "/")
 	_path_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	header_row.add_child(_path_label)
-	_filter_label = Theme_.label("", Theme_.WARN, 22)
+	_filter_label = Theme_.fit("", Theme_.WARN, Theme_.SIZE_BODY)
 	header_row.add_child(_filter_label)
-	_sort_label = Theme_.label("", Theme_.MUTED, 22)
+	_sort_label = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	header_row.add_child(_sort_label)
-	_count_label = Theme_.label("", Theme_.MUTED, 22)
+	_count_label = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	header_row.add_child(_count_label)
 	root.add_child(header)
 
@@ -913,7 +915,7 @@ func _build_ui() -> void:
 		glyph.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		glyph.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 		slot.add_child(glyph)
-		var name_label := Theme_.label("", Theme_.TEXT, 24, true)
+		var name_label := Theme_.fit("", Theme_.TEXT, Theme_.SIZE_LIST, JoyFitLabel.Cut.MIDDLE)
 		name_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		hb.add_child(name_label)
 		var size_label := Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
@@ -923,13 +925,16 @@ func _build_ui() -> void:
 		_row_parts.append({"mark": mark, "glyph": glyph, "thumb": thumb, "name": name_label, "size": size_label})
 
 	_footer = HBoxContainer.new()
+	_footer.add_theme_constant_override("separation", 16)
 	var footer_panel := PanelContainer.new()
 	footer_panel.add_theme_stylebox_override("panel", Theme_.box(Theme_.PANEL, 0, 12))
 	footer_panel.add_child(_footer)
 	root.add_child(footer_panel)
-	_status = Theme_.label("", Theme_.TEXT, 20, true)
+	_status = Theme_.fit("", Theme_.TEXT, Theme_.SIZE_BODY, JoyFitLabel.Cut.MIDDLE)
 	_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_footer.add_child(_status)
+	_status_tail = Theme_.label("", Theme_.TEXT, Theme_.SIZE_BODY)
+	_footer.add_child(_status_tail)
 
 	_dim = ColorRect.new()
 	_dim.color = Color(0, 0, 0, 0.55)
@@ -995,11 +1000,12 @@ func _build_ui() -> void:
 
 
 func _render() -> void:
-	_path_label.text = _pretty_path(cwd)
+	_path_label.set_full(_pretty_path(cwd))
 	_filter_label.visible = filter != ""
-	_filter_label.text = "Filter: " + filter
+	_filter_label.set_full("Filter: " + filter)
+	_filter_label.custom_minimum_size.x = minf(Theme_.text_width(_filter_label.full, Theme_.SIZE_BODY) + 4.0, FILTER_MAX_WIDTH)
 	_sort_label.text = "%s %s" % [JoySettings.SORTS[settings.sort_key][0], "▼" if settings.sort_desc else "▲"]
-	_count_label.text = "%d / %d" % [cursor + 1 if not entries.is_empty() else 0, entries.size()]
+	_count_label.text = "%s / %s" % [Theme_.with_commas(cursor + 1 if not entries.is_empty() else 0), Theme_.with_commas(entries.size())]
 	_render_rows()
 	_render_places()
 	_render_overlay()
@@ -1018,10 +1024,10 @@ func _render_rows() -> void:
 			row.add_theme_stylebox_override("panel", Theme_.box_xy(Color.TRANSPARENT, 8, 8, 4))
 			part["mark"].text = ""
 			part["glyph"].text = ""
-			part["name"].text = ""
+			part["name"].set_full("")
 			part["size"].text = ""
 			if idx == 0:
-				part["name"].text = _empty_text()
+				part["name"].set_full(_empty_text())
 				part["name"].add_theme_color_override("font_color", Theme_.MUTED)
 			continue
 		var e: Dictionary = entries[idx]
@@ -1037,7 +1043,7 @@ func _render_rows() -> void:
 		part["mark"].text = "✓" if is_selected else ""
 		part["glyph"].text = "" if tex != null else ("▰" if e["is_dir"] else "▫")
 		part["glyph"].add_theme_color_override("font_color", Theme_.FOLDER if e["is_dir"] else Theme_.MUTED)
-		part["name"].text = e["name"]
+		part["name"].set_full(e["name"])
 		part["name"].add_theme_color_override("font_color", Theme_.MUTED if e["hidden"] else Theme_.TEXT)
 		part["size"].text = "" if e["is_dir"] else Theme_.human_size(e["size"])
 	thumbs.want(wanted, JoyThumbs.THUMB_SIDE)
@@ -1095,14 +1101,21 @@ func _render_status() -> void:
 	var running := jobs.values().filter(func(j): return j.get("state", "running") == "running")
 	if running.is_empty():
 		var failed: int = reports.values().reduce(func(n: int, r: Dictionary) -> int: return n + r["failures"].size(), 0)
-		_status.text = "" if reports.is_empty() else "%s failed. Open Jobs to see why." % Theme_.count(failed, "item")
-		_status.add_theme_color_override("font_color", Theme_.DANGER)
+		_set_status("" if reports.is_empty() else "%s failed. Open Jobs to see why." % Theme_.count(failed, "item"), "", Theme_.DANGER, JoyFitLabel.Cut.END)
 		return
 	var j: Dictionary = running[0]
-	_status.add_theme_color_override("font_color", Theme_.TEXT)
 	var verb := "Moving" if j.get("kind") == "move" else "Copying"
 	if not j.get("conflict", {}).is_empty():
-		_status.text = "%s paused: %s already exists." % [verb, j["conflict"]["name"]]
+		_set_status("%s paused: %s" % [verb, j["conflict"]["name"]], "already exists.", Theme_.TEXT)
 		return
 	var pct: int = 0 if j.get("total_bytes", 0) == 0 else int(100.0 * j["done_bytes"] / j["total_bytes"])
-	_status.text = "%s %s  %d%%" % [verb, j.get("current", ""), pct]
+	_set_status("%s %s" % [verb, j.get("current", "")], "%d%%" % pct, Theme_.TEXT)
+
+
+# the tail stays whole, so a long name never hides the percent or the reason
+func _set_status(head: String, tail: String, color: Color, how := JoyFitLabel.Cut.MIDDLE) -> void:
+	_status.cut = how
+	_status.set_full(head)
+	_status_tail.text = tail
+	for label: Label in [_status, _status_tail]:
+		label.add_theme_color_override("font_color", color)

@@ -130,6 +130,17 @@ static func label(text: String, color := TEXT, size := SIZE_LIST, clip := false)
 	return l
 
 
+# a label that cuts its text to the width it gets, at the end, at the start or in the middle
+static func fit(text: String, color := TEXT, size := SIZE_LIST, cut := JoyFitLabel.Cut.END, boundary := "") -> JoyFitLabel:
+	var l := JoyFitLabel.new()
+	l.cut = cut
+	l.boundary = boundary
+	l.add_theme_color_override("font_color", color)
+	l.add_theme_font_size_override("font_size", size)
+	l.set_full(text)
+	return l
+
+
 static func hints(pairs: Array) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	row.add_theme_constant_override("separation", 28)

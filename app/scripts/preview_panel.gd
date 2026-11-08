@@ -8,7 +8,7 @@ var showing_full := false
 var commands: Array = []
 var _thumbs: JoyThumbs
 var _entries: Array = []
-var _title: Label
+var _title: JoyFitLabel
 var _image: TextureRect
 var _info: Label
 var _hints: HBoxContainer
@@ -28,7 +28,7 @@ func _init() -> void:
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", 12)
 	add_child(box)
-	_title = Theme_.label("", Theme_.TEXT, 26, true)
+	_title = Theme_.fit("", Theme_.TEXT, Theme_.SIZE_TITLE, JoyFitLabel.Cut.MIDDLE)
 	_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	box.add_child(_title)
 	var frame := PanelContainer.new()
@@ -80,7 +80,7 @@ func refresh() -> void:
 	var small := _thumbs.entry(path, JoyThumbs.THUMB_SIDE)
 	showing_full = full.has("tex")
 	_image.texture = full["tex"] if showing_full else small.get("tex")
-	_title.text = e["name"]
+	_title.set_full(e["name"])
 	var parts: Array = ["%d of %d" % [index + 1, _entries.size()], Theme_.human_size(e["size"])]
 	if full.has("size"):
 		parts.append("%d x %d" % [full["size"].x, full["size"].y])
