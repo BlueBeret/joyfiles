@@ -238,19 +238,43 @@ pub fn temp_path(dir: &Path, name: &OsStr) -> PathBuf {
         .expect("an unused name exists")
 }
 
-pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
+// "archive.tar.gz" gives ("archive", ".tar.gz"), and a folder, a dot file or "v1.2" keeps the whole name as the stem
+fn split_extension(name: &OsStr, is_dir: bool) -> (OsString, OsString) {
+    let whole = (name.to_owned(), OsString::new());
+    let path = Path::new(name);
+    let (Some(mut stem), Some(ext)) = (path.file_stem(), path.extension()) else { return whole };
+    if is_dir || !ext.to_string_lossy().chars().any(char::is_alphabetic) {
+        return whole;
+    }
+    let mut suffix = OsString::from(".");
+    suffix.push(ext);
+    if let Some(tar) = Path::new(stem).extension().filter(|e| e.eq_ignore_ascii_case("tar")) {
+        let mut both = OsString::from(".");
+        both.push(tar);
+        both.push(&suffix);
+        suffix = both;
+        stem = Path::new(stem).file_stem().unwrap_or(stem);
+    }
+    if suffix.len() > 16 {
+        return whole;
+    }
+    (stem.to_owned(), suffix)
+}
+
+pub fn unique_dest(dir: &Path, name: &OsStr, is_dir: bool) -> PathBuf {
     let first = dir.join(name);
     if !exists_nofollow(&first) {
         return first;
     }
-    let as_path = Path::new(name);
-    let stem = as_path.file_stem().unwrap_or(name).to_string_lossy();
-    let ext = as_path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
+    let (stem, ext) = split_extension(name, is_dir);
     (2..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .map(|n| {
+            let counter = format!(" ({n})");
+            let mut out = truncate(&stem, NAME_MAX - counter.len() - ext.len());
+            out.push(counter);
+            out.push(&ext);
+            dir.join(out)
+        })
         .find(|p| !exists_nofollow(p))
         .expect("an unused name exists")
 }
@@ -378,8 +402,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("a.txt"), "x").unwrap();
         fs::write(tmp.path().join("a (2).txt"), "x").unwrap();
-        assert_eq!(unique_dest(tmp.path(), OsStr::new("a.txt")), tmp.path().join("a (3).txt"));
-        assert_eq!(unique_dest(tmp.path(), OsStr::new("new")), tmp.path().join("new"));
+        assert_eq!(unique_dest(tmp.path(), OsStr::new("a.txt"), false), tmp.path().join("a (3).txt"));
+        assert_eq!(unique_dest(tmp.path(), OsStr::new("new"), false), tmp.path().join("new"));
     }
 
     #[test]

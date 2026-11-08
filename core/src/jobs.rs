@@ -236,7 +236,7 @@ impl Worker<'_> {
                     self.p.add_done(tree_size(src));
                     return Ok(());
                 }
-                target = unique_dest(dest_dir, name);
+                target = unique_dest(dest_dir, name, is_real_dir(src));
             } else if is_real_dir(src) && is_real_dir(&target) {
                 return self.merge(src, &target);
             } else {
@@ -245,7 +245,7 @@ impl Worker<'_> {
                         self.p.add_done(tree_size(src));
                         return Ok(());
                     }
-                    Resolution::KeepBoth => target = unique_dest(dest_dir, name),
+                    Resolution::KeepBoth => target = unique_dest(dest_dir, name, is_real_dir(src)),
                     Resolution::Replace => return self.replace(src, &target),
                 }
             }
@@ -733,6 +733,39 @@ mod tests {
         let p = spawn(JobKind::Copy, vec![flat.join("s")], out.clone(), Policy::Always(Resolution::Replace));
         assert_eq!(wait(&p), JobState::Done);
         assert_eq!(read(out.join("s")), "flat");
+    }
+
+    #[test]
+    fn keep_both_names_keep_the_whole_extension_and_fit_the_name_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "n".repeat(250));
+        fs::create_dir(tmp.path().join("v1.2")).unwrap();
+        for name in ["archive.tar.gz", ".bashrc", "photo.JPG", "notes.v2", &long] {
+            fs::write(tmp.path().join(name), "x").unwrap();
+        }
+        let list = ["v1.2", "archive.tar.gz", ".bashrc", "photo.JPG", "notes.v2", &long].iter().map(|n| tmp.path().join(n)).collect();
+        let p = spawn(JobKind::Copy, list, tmp.path().to_path_buf(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        let names = names_in(tmp.path());
+        for want in ["v1.2 (2)", "archive (2).tar.gz", ".bashrc (2)", "photo (2).JPG", "notes (2).v2"] {
+            assert!(names.iter().any(|n| n == want), "{want} is in {names:?}");
+        }
+        assert!(names.iter().any(|n| n.ends_with(" (2).txt") && n.len() <= 255), "the long name got a short copy name");
+    }
+
+    #[test]
+    fn replace_works_for_a_name_at_the_length_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "m".repeat(251));
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&out).unwrap();
+        fs::write(src.join(&long), "new").unwrap();
+        fs::write(out.join(&long), "old").unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join(&long)], out.clone(), Policy::Always(Resolution::Replace));
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(read(out.join(&long)), "new");
+        assert_eq!(names_in(&out), [long]);
     }
 
     #[test]
