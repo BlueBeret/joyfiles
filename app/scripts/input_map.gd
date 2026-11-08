@@ -20,6 +20,8 @@ const ACTIONS := {
 	"jf_page_down": [[AXIS, JOY_AXIS_TRIGGER_RIGHT, 1.0], [KEY, KEY_PAGEDOWN]],
 	"jf_start": [[BTN, JOY_BUTTON_START], [KEY, KEY_F10]],
 	"jf_view": [[BTN, JOY_BUTTON_BACK], [KEY, KEY_H]],
+	"jf_search": [[BTN, JOY_BUTTON_RIGHT_STICK], [KEY, KEY_F]],
+	"jf_jobs": [[BTN, JOY_BUTTON_LEFT_STICK], [KEY, KEY_J]],
 }
 
 const REPEATING := ["jf_up", "jf_down", "jf_left", "jf_right", "jf_page_up", "jf_page_down"]

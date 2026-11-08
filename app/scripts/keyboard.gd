@@ -2,6 +2,7 @@ class_name JoyKeyboard
 extends PanelContainer
 
 signal submitted(text: String)
+signal changed(text: String)
 signal cancelled
 
 const ROWS := [
@@ -47,6 +48,10 @@ func open(title: String, initial: String) -> void:
 	_render()
 
 
+func set_title(title: String) -> void:
+	_title.text = title
+
+
 func handle(action: String) -> void:
 	match action:
 		"jf_up": row = posmod(row - 1, ROWS.size())
@@ -71,6 +76,7 @@ func handle_key(event: InputEventKey) -> void:
 		_:
 			if event.unicode >= 32:
 				text += char(event.unicode)
+				changed.emit(text)
 	_render()
 
 
@@ -79,6 +85,7 @@ func _col() -> int:
 
 
 func _press(key: String) -> void:
+	var before := text
 	match key:
 		"{shift}": shift = not shift
 		"{space}": text += " "
@@ -88,6 +95,8 @@ func _press(key: String) -> void:
 		_:
 			text += key.to_upper() if shift else key
 			shift = false
+	if text != before:
+		changed.emit(text)
 
 
 func _render() -> void:
