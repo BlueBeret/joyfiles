@@ -11,10 +11,8 @@ const TOAST_LIFT := 84
 const PLACES_REFRESH_SECONDS := 3.0
 # a clash prompt never cuts into a menu, a keyboard or a confirm that the user is using
 const PROMPT_MODES := [Mode.FILES, Mode.PLACES]
-# a double tap is two fresh presses, so only time can tell the second tap from a deliberate press
+# a press this soon after a screen change was aimed at the old screen, and only time tells a double tap apart
 const GUARD_SECONDS := 0.15
-# the presses that answer or close a screen, ignored for GUARD_SECONDS after a screen change
-const GUARDED := ["jf_accept", "jf_back"]
 
 var start_path := ""
 var settings_path := "user://settings.cfg"
@@ -189,7 +187,8 @@ func _process(delta: float) -> void:
 
 
 func _on_press(action: String) -> void:
-	if action in GUARDED and _clock < _guard_until:
+	if _clock < _guard_until:
+		pad.block()
 		return
 	fire(action)
 
