@@ -209,6 +209,7 @@ func _run() -> void:
 	await _move_refreshes_source()
 	await _unknown_job()
 	await _places_refresh()
+	await _quit_with_job()
 	_missing_folder()
 	await _opening()
 	_glyphs()
@@ -607,6 +608,33 @@ func _missing_folder() -> void:
 	app.cwd = "Z:\\gone"
 	app.refresh()
 	check(app.cwd == app.places[0]["path"], "a folder with no ancestor that exists falls back to home (%s)" % app.cwd)
+
+
+func _quit_with_job() -> void:
+	var base := root_dir + "/leaving"
+	var quits: Array = []
+	app.quitter = func(): quits.append(1)
+	app.mode = app.Mode.FILES
+	pick_start("Quit")
+	check(quits.size() == 1 and app.mode == app.Mode.FILES, "Quit leaves at once while no job runs")
+
+	write_size(base + "/src/big.bin", 8 * 1024 * 1024)
+	DirAccess.make_dir_recursive_absolute(base + "/dst")
+	app.navigate(base + "/src")
+	pick("Select all")
+	pick("Copy")
+	app.navigate(base + "/dst")
+	pick("Paste")
+	pick_start("Quit")
+	check(app.mode == app.Mode.CONFIRM and quits.size() == 1, "Quit asks first while a job runs")
+	check(app._confirm_label.text.begins_with("A job is still running."), "the question names the running job: %s" % app._confirm_label.text)
+	press("jf_back")
+	check(app.mode == app.Mode.FILES and quits.size() == 1, "B keeps the app open")
+	pick_start("Quit")
+	press("jf_accept")
+	check(quits.size() == 2 and app.mode == app.Mode.FILES, "A on the question quits")
+	await until(jobs_done, "the job ends")
+	app.quitter = app.get_tree().quit
 
 
 func _opening() -> void:
