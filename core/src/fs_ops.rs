@@ -242,6 +242,52 @@ pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+// a byte that is not valid text travels as U+F700 plus the byte, and a real U+F7xx is sent as its escaped bytes
+#[cfg(unix)]
+const ESCAPE: std::ops::RangeInclusive<u32> = 0xF700..=0xF7FF;
+
+// a valid text path comes out unchanged, so GDScript only sees escapes for names that are not valid text
+#[cfg(unix)]
+pub fn path_to_text(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let escape = |b: u8, out: &mut String| out.push(char::from_u32(ESCAPE.start() + u32::from(b)).unwrap_or('\u{fffd}'));
+    let mut out = String::with_capacity(path.as_os_str().len());
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if ESCAPE.contains(&(c as u32)) {
+                c.encode_utf8(&mut [0; 4]).bytes().for_each(|b| escape(b, &mut out));
+            } else {
+                out.push(c);
+            }
+        }
+        chunk.invalid().iter().for_each(|&b| escape(b, &mut out));
+    }
+    out
+}
+
+#[cfg(unix)]
+pub fn path_from_text(text: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut bytes = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        match c as u32 {
+            n if ESCAPE.contains(&n) => bytes.push((n - ESCAPE.start()) as u8),
+            _ => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+        }
+    }
+    PathBuf::from(OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+pub fn path_to_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(not(unix))]
+pub fn path_from_text(text: &str) -> PathBuf {
+    PathBuf::from(text)
+}
+
 // one item an operation could not handle, the operation goes on with the rest
 #[derive(Debug, Clone, PartialEq)]
 pub struct Failure {
@@ -441,6 +487,27 @@ mod tests {
         let listed = list_dir(tmp.path(), false, SortKey::Name, false).unwrap();
         assert_eq!(names(listed), ["zdir", "A.txt", "b.txt"]);
         assert_eq!(list_dir(tmp.path(), true, SortKey::Name, false).unwrap().len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_valid_text_survives_the_trip_through_text() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let e9 = tmp.path().join(OsStr::from_bytes(b"caf\xe9.txt"));
+        let e8 = tmp.path().join(OsStr::from_bytes(b"caf\xe8.txt"));
+        fs::write(&e9, "x").unwrap();
+        fs::write(&e8, "y").unwrap();
+        let listed = list_dir(tmp.path(), true, SortKey::Name, false).unwrap();
+        let texts: Vec<String> = listed.iter().map(|e| path_to_text(&e.path)).collect();
+        assert_ne!(texts[0], texts[1], "two names stay two keys");
+        let mut back: Vec<PathBuf> = texts.iter().map(|t| path_from_text(t)).collect();
+        back.sort();
+        assert_eq!(back, [e8, e9]);
+        assert!(listed.iter().all(|e| e.name == "caf\u{fffd}.txt"), "the display name stays readable");
+        let odd = tmp.path().join("plain \u{f701} name");
+        assert_eq!(path_from_text(&path_to_text(&odd)), odd);
+        assert_eq!(path_to_text(&tmp.path().join("héllo wörld.txt")), format!("{}/héllo wörld.txt", tmp.path().display()));
     }
 
     #[test]

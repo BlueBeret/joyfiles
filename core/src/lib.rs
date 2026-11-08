@@ -29,12 +29,13 @@ pub struct JoyCore {
     next_scan: i64,
 }
 
+// every path crosses the binding in this form, so a name that is not valid text still names one file
 fn path_of(p: &GString) -> PathBuf {
-    PathBuf::from(p.to_string())
+    fs_ops::path_from_text(&p.to_string())
 }
 
 fn gstr(p: &Path) -> GString {
-    GString::from(p.to_string_lossy().as_ref())
+    GString::from(fs_ops::path_to_text(p).as_str())
 }
 
 fn result_dict(r: Result<PathBuf, String>) -> VarDictionary {
@@ -85,7 +86,8 @@ impl JoyCore {
                 vdict! { "ok" => true, "entries" => &arr, "error" => "" }
             }
             Err(e) => {
-                let name = Path::new(&path.to_string()).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+                let dir = path_of(&path);
+                let name = dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy().into_owned();
                 let error = format!("Could not open \"{name}\": {}.", fs_ops::reason(&e));
                 vdict! { "ok" => false, "entries" => &VarArray::new(), "error" => error.as_str() }
             }
