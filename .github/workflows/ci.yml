@@ -73,8 +73,8 @@ jobs:
       - name: Smoke test
         run: |
           scripts/import.sh
-          mkdir -p "$RUNNER_TEMP/smoke"
-          JF_TEST_DIR="$RUNNER_TEMP/smoke" godot --headless --path app -s tests/smoke.gd > smoke.log
+          mkdir -p "$RUNNER_TEMP/smoke" "$RUNNER_TEMP/xdg"
+          XDG_DATA_HOME="$RUNNER_TEMP/xdg" JF_TEST_DIR="$RUNNER_TEMP/smoke" godot --headless --path app -s tests/smoke.gd > smoke.log
           cat smoke.log
           grep -q '^RESULT OK' smoke.log
 

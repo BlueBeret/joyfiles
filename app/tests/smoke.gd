@@ -112,6 +112,11 @@ func start_app(path: String) -> Control:
 
 
 func _run() -> void:
+	var refusal := _trash_refusal()
+	if refusal != "":
+		print("RESULT FAILED (%s)" % refusal)
+		quit(1)
+		return
 	root_dir = OS.get_environment("JF_TEST_DIR")
 	settings_file = root_dir.get_base_dir() + "/jf_smoke_settings.cfg"
 	DirAccess.remove_absolute(settings_file)
@@ -228,6 +233,17 @@ func _run() -> void:
 	DirAccess.remove_absolute(settings_file)
 	print("RESULT %s (%d failures)" % ["OK" if failures == 0 else "FAILED", failures])
 	quit(failures)
+
+
+# the checks move files to the trash, so the run needs a trash folder that is not the real one
+func _trash_refusal() -> String:
+	if OS.get_name() != "Linux":
+		return "only Linux can move the trash to a scratch folder, so the smoke test does not run here"
+	var data_home := OS.get_environment("XDG_DATA_HOME").simplify_path()
+	var real := OS.get_environment("HOME").path_join(".local/share").simplify_path()
+	if data_home == "" or (data_home + "/").begins_with(real + "/"):
+		return "set XDG_DATA_HOME to a scratch folder, so the trash checks never use the real trash"
+	return ""
 
 
 func _conflicts() -> void:
