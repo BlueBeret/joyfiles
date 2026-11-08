@@ -70,11 +70,26 @@ static func _event_for(binding: Array) -> InputEvent:
 	return e
 
 
+# the key a key event names, from its physical code or else its keycode, as a virtual keyboard sends only the keycode
+static func key_of(e: InputEventKey) -> int:
+	return e.physical_keycode if e.physical_keycode != KEY_NONE else e.keycode
+
+
 static func action_of(e: InputEvent) -> String:
-	if e is InputEventKey and e.physical_keycode == KEY_TAB and (e.alt_pressed or e.ctrl_pressed or e.meta_pressed):
-		return ""
+	if e is InputEventKey:
+		return _key_action(e)
 	for action: String in ACTIONS:
 		if e.is_action(action, false):
+			return action
+	return ""
+
+
+static func _key_action(e: InputEventKey) -> String:
+	var code := key_of(e)
+	if code == KEY_TAB and (e.alt_pressed or e.ctrl_pressed or e.meta_pressed):
+		return ""
+	for action: String in ACTIONS:
+		if ACTIONS[action].has([KEY, code]):
 			return action
 	return ""
 
@@ -149,7 +164,7 @@ func _source_of(e: InputEvent) -> String:
 	if e is InputEventJoypadButton:
 		return "b%d:%d" % [e.device, e.button_index]
 	if e is InputEventKey:
-		return "k%d" % (e.physical_keycode if e.physical_keycode != KEY_NONE else e.keycode)
+		return "k%d" % key_of(e)
 	return ""
 
 

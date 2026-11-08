@@ -23,7 +23,7 @@ func _init() -> void:
 
 
 func set_full(value: String) -> void:
-	full = value
+	full = JoyPathText.printable(value)
 	_fit()
 
 

@@ -40,6 +40,7 @@ func run() -> void:
 	await _round3_keyboard()
 	await _round3_close()
 	await _round3_missing_place()
+	await _round4_input()
 	app.queue_free()
 	await runner.process_frame
 
@@ -65,14 +66,14 @@ func settle() -> void:
 	await step(12)
 
 
-func fresh(path: String) -> void:
+func fresh(path: String, places := [{"label": "Data", "path": data, "kind": "home"}]) -> void:
 	if app != null:
 		app.queue_free()
 		await runner.process_frame
 	app = load("res://main.tscn").instantiate()
 	app.start_path = path
 	app.settings_path = data + "/settings.cfg"
-	app.places_source = func() -> Array: return [{"label": "Data", "path": data, "kind": "home"}]
+	app.places_source = func() -> Array: return places
 	app.opener = func(p: String) -> int:
 		opened.append(p)
 		return OK
@@ -767,3 +768,59 @@ func _round3_missing_place() -> void:
 	await tap(JOY_BUTTON_DPAD_DOWN)
 	await tap(JOY_BUTTON_A)
 	check(app.mode == app.Mode.PLACES and app.cwd == data + "/many", "A on a place that is gone stays in Places (mode %d, %s)" % [app.mode, app.cwd.trim_prefix(data)])
+
+
+# a key event that carries only the keycode, like a virtual keyboard sends
+func key_code_only(code: int) -> void:
+	var e := InputEventKey.new()
+	e.keycode = code
+	e.pressed = true
+	Input.parse_input_event(e)
+	await step(2)
+	e = e.duplicate()
+	e.pressed = false
+	Input.parse_input_event(e)
+	await step(2)
+
+
+func _round4_input() -> void:
+	await fresh(data + "/many")
+	app.jobs[999] = {"watch": [], "state": "running"}
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	await step(2)
+	check(app.mode == app.Mode.CONFIRM and app._panels[app.Mode.CONFIRM].visible, "a window close shows the quit question at once")
+	await settle()
+	await tap(JOY_BUTTON_B)
+	app.jobs.clear()
+	await fresh(data + "/many")
+	app.jobs[999] = {"watch": [], "state": "running"}
+	await settle()
+	await tap(JOY_BUTTON_X)
+	check(app._panels[app.Mode.MENU].visible, "the menu shows before the close request")
+	app.notification(Node.NOTIFICATION_WM_CLOSE_REQUEST)
+	await step(2)
+	check(app._panels[app.Mode.CONFIRM].visible and not app._panels[app.Mode.MENU].visible, "a window close over the menu shows the question and hides the menu")
+	app.jobs.clear()
+
+	await fresh(data + "/many")
+	await settle()
+	await key_code_only(KEY_DOWN)
+	check(app.cursor == 1, "a Down key with only a keycode moves the cursor (%d)" % app.cursor)
+	check(JoyInput.action_of(_key_event(KEY_ENTER, false)) == "jf_accept" and JoyInput.action_of(_key_event(KEY_ENTER, true)) == "jf_accept", "Enter maps with a keycode or a physical code")
+	var tab := _key_event(KEY_TAB, false)
+	tab.alt_pressed = true
+	check(JoyInput.action_of(tab) == "", "Alt with a keycode only Tab stays ignored")
+
+	await fresh(data + "/gone_start", [{"label": "Gone", "path": data + "/gone_home", "kind": "folder"}])
+	check(app.cwd == data + "/gone_home" and app._path_label.full != "" and app._row_parts[0]["name"].full == "This folder cannot be read.", "a start folder and a home that cannot be read still show a path and a reason (%s, %s)" % [app._path_label.full, app._row_parts[0]["name"].full])
+	app.refresh()
+	check(app._toast_label.text.begins_with("The folder gone_home is not available") and not app._toast_label.text.contains("folder  "), "Refresh names the folder when no folder was open (%s)" % app._toast_label.text)
+
+
+func _key_event(code: int, physical: bool) -> InputEventKey:
+	var e := InputEventKey.new()
+	if physical:
+		e.physical_keycode = code
+	else:
+		e.keycode = code
+	return e

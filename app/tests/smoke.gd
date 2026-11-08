@@ -234,6 +234,7 @@ func _run() -> void:
 	await _fitting()
 	_contrast()
 	await _round3_layout()
+	await _round4_text()
 	app.queue_free()
 	await frames()
 	var input_suite: GDScript = load("res://tests/input.gd")
@@ -1441,6 +1442,89 @@ func _round3_layout() -> void:
 	app.mode = app.Mode.FILES
 	app.reports.clear()
 	app.places = [{"label": "Home", "path": root_dir, "kind": "home"}]
+	app.navigate(root_dir)
+	app._render()
+
+
+# every name that reaches the screen goes through JoyPathText.printable, so no text reorders or hides
+func _round4_text() -> void:
+	var evil := "evil\u202Etxt.exe"
+	var shown := "evil<U+202E>txt.exe"
+	var odd := root_dir + "/odd4"
+	write(odd + "/" + evil, "x")
+	write(odd + "/\u3164", "x")
+	write(odd + "/\u2800", "x")
+	write(odd + "/combining_" + "\u0301".repeat(40) + ".txt", "x")
+	write(odd + "/\uFEFFbom.txt", "x")
+	app.settings.show_hidden = false
+	app.navigate(odd)
+	app._render()
+	await frames(2)
+	var rows: Array = app._row_parts.map(func(p: Dictionary) -> String: return p["name"].text)
+	check(rows.has("<U+3164>") and rows.has("<U+2800>"), "blank looking names show as marks: %s" % [rows])
+	check(rows.any(func(n: String) -> bool: return n.begins_with("combining_\u0301\u0301\u0301<+37 marks>")), "a stack of marks keeps three and counts the rest: %s" % [rows])
+	check(JoyPathText.printable("a\u0301\u0301\u0301b") == "a\u0301\u0301\u0301b", "three marks on one letter stay as they are")
+	check(JoyPathText.printable("\u00A0") == "<U+00A0>" and JoyPathText.printable("x\u3164y") == "x<U+3164>y", "a no break space and a filler inside a name show as marks")
+	check(JoyPathText.printable(JoyPathText.printable(evil)) == shown, "printable gives the same text when it runs twice")
+	check(app.entries.any(func(e: Dictionary) -> bool: return e["name"] == "\uFEFFbom.txt" and FileAccess.file_exists(e["path"])), "a name with a leading U+FEFF keeps it and its path exists")
+	check(rows.any(func(n: String) -> bool: return n == "<U+FEFF>bom.txt"), "the list shows a leading U+FEFF as a mark: %s" % [rows])
+
+	app.cursor = app.entries.map(func(e: Dictionary) -> String: return e["name"]).find(evil)
+	app.opener = func(_path: String) -> int: return OK
+	app._open_current()
+	check(app._toast_label.text.contains(shown) and not app._toast_label.text.contains("\u202E"), "the open toast shows the override as a mark (%s)" % app._toast_label.text)
+	app.toast("line1\nline2")
+	check(app._toast_label.text == "line1<U+000A>line2", "a toast with a line break stays on one line")
+	app._set_clipboard(PackedStringArray([odd + "/" + evil]), false)
+	check(app.clipboard["label"] == shown, "the clipboard label is printable (%s)" % app.clipboard["label"])
+	app._ask_trash(PackedStringArray([odd + "/" + evil]))
+	check(app._confirm_label.text == "Move %s to the trash?" % shown, "the trash question is printable (%s)" % app._confirm_label.text)
+	app.mode = app.Mode.FILES
+
+	var info := {"name": evil, "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 0}
+	app.conflict_panel.open(info)
+	check(app.conflict_panel._title.text == "\"%s\" already exists here." % shown, "the clash title is printable (%s)" % app.conflict_panel._title.text)
+	app.jobs[5] = {"watch": [], "state": "running", "kind": "copy", "current": evil, "done_bytes": 1, "total_bytes": 10, "conflict": info}
+	app._render_status()
+	check(app._status.text == "Copying paused: " + shown, "the footer status is printable (%s)" % app._status.text)
+	app.jobs[5]["conflict"] = {}
+	app.jobs[5]["current"] = "a\nb" + evil
+	app.jobs_panel.update(app.jobs, {})
+	check(app.jobs_panel._rows[5]["title"].text == "Copying a<U+000A>b" + shown, "a job row is printable (%s)" % app.jobs_panel._rows[5]["title"].text)
+	app.jobs.clear()
+	app._add_report("Copy: 1 item failed", [{"path": odd + "/x\u202Ey", "error": "Could not read \"%s\"" % evil}])
+	app.jobs_panel.viewing = app.reports.keys()[0]
+	app.jobs_panel.update({}, app.reports)
+	check(app.jobs_panel.failure_texts == ["Could not read \"%s\"" % shown] and app.jobs_panel._detail_rows[0]["message"].text == app.jobs_panel.failure_texts[0], "a failure message is printable (%s)" % [app.jobs_panel.failure_texts])
+	app.jobs_panel.viewing = -1
+	app.reports.clear()
+
+	app._open_props(odd + "/no\u202Esuch")
+	check(app.props_panel.shown["Error"].contains("no<U+202E>such") and not app.props_panel.shown["Error"].contains("\u202E"), "the props error is printable (%s)" % app.props_panel.shown["Error"])
+	app.mode = app.Mode.FILES
+	app.props_panel.close()
+	app.preview._entries = [{"name": "pic\u202Egnp.png", "path": odd + "/none.png", "size": 1}]
+	app.preview.index = 0
+	app.preview._thumbs = app.thumbs
+	app.preview.refresh()
+	check(app.preview._title.text == "pic<U+202E>gnp.png", "the preview title is printable (%s)" % app.preview._title.text)
+
+	var places := [{"label": "Home", "path": root_dir, "kind": "home"}, {"label": "evil\u202ETXT", "path": odd, "kind": "drive"}]
+	app.places = places
+	app._render()
+	check(app._places_box.get_child(2).text.contains("evil<U+202E>TXT"), "a place label is printable (%s)" % app._places_box.get_child(2).text)
+	app.places = [{"label": "Home", "path": root_dir, "kind": "home"}]
+	app._render()
+
+	app.navigate(odd)
+	app._ask_rename(odd + "/" + evil)
+	check(app._keyboard.text == shown, "the rename field shows the printable name (%s)" % app._keyboard.text)
+	app._on_keyboard_submitted(app._keyboard.text)
+	check(FileAccess.file_exists(odd + "/" + evil) and not FileAccess.file_exists(odd + "/" + shown), "an unedited rename keeps the exact name")
+	app.mode = app.Mode.FILES
+
+	for pair: Array in [[1125899906842623, "1.0 PB"], [5 * 1125899906842624, "5.0 PB"], [1099511627775, "1.0 TB"]]:
+		check(Theme_.human_size(pair[0]) == pair[1], "%d bytes read as %s (%s)" % [pair[0], pair[1], Theme_.human_size(pair[0])])
 	app.navigate(root_dir)
 	app._render()
 

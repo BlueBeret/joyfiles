@@ -176,11 +176,38 @@ func _failure_shots() -> void:
 	FileAccess.set_unix_permissions(locked + "/closed", owner_all)
 
 
+func _odd_name_shots() -> void:
+	var odd := base + "/odd"
+	for n in ["evil\u202Etxt.exe", "line1\nline2.txt", "combining_" + "\u0301".repeat(40) + ".txt", "\u3164", "\u2800", "zz_last.txt"]:
+		write_text(odd + "/" + n, "x")
+	var home: Dictionary = app.places[0]
+	app.places_source = func() -> Array: return [home, {"label": "evil\u202ETXT drive", "path": odd, "kind": "drive"}]
+	app.refresh_places()
+	app.navigate(odd)
+	app._render()
+	await snap("odd_names_list")
+	cursor_to("evil\u202Etxt.exe")
+	app.opener = func(_path: String) -> int: return OK
+	press(["jf_accept"])
+	await snap("odd_names_open_toast")
+	pick("Move to trash")
+	await snap("odd_names_trash_question")
+	press(["jf_back"])
+	app._add_report("Copy: 1 item failed", [{"path": odd + "/x\u202Ey", "error": "Could not read \"evil\u202Etxt.exe\""}])
+	press(["jf_jobs"])
+	await snap("odd_names_jobs")
+	press(["jf_back"])
+	app.reports.clear()
+	app.places_source = app.core.places
+	app.refresh_places()
+
+
 func _run() -> void:
 	out = OS.get_environment("JF_SHOT_DIR")
 	base = OS.get_environment("JF_TEST_DIR")
 	root.mode = Window.MODE_WINDOWED
-	root.size = Vector2i(1280, 800)
+	var size_text := OS.get_environment("JF_SHOT_SIZE")
+	root.size = Vector2i(int(size_text.get_slice("x", 0)), int(size_text.get_slice("x", 1))) if size_text.contains("x") else Vector2i(1280, 800)
 	await frames(5)
 	make_content()
 	app = load("res://main.tscn").instantiate()
@@ -298,4 +325,5 @@ func _run() -> void:
 	press(["jf_back"])
 	await until(func(): return app.jobs.is_empty(), 300)
 	await _failure_shots()
+	await _odd_name_shots()
 	quit()

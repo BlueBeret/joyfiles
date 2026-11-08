@@ -54,6 +54,8 @@ var jobs := {}
 # one entry per ended operation that left failed items, kept until the user dismisses it
 var reports := {}
 var last_error := ""
+# the start folder and the home folder both failed to list, so the screen names home and says so
+var _unreadable := false
 var conflict_panel: JoyConflict
 var jobs_panel: JoyJobs
 var props_panel: JoyProps
@@ -159,8 +161,9 @@ func _ready() -> void:
 	places = places_source.call()
 	var arg_path := _arg_path()
 	var home: String = places[0]["path"]
-	if not navigate(arg_path if arg_path != "" else (start_path if start_path != "" else home)):
-		navigate(home)
+	if not navigate(arg_path if arg_path != "" else (start_path if start_path != "" else home)) and not navigate(home):
+		cwd = home
+		_unreadable = true
 	_render()
 
 
@@ -198,6 +201,7 @@ func _notification(what: int) -> void:
 		pad.release_all()
 	elif what == NOTIFICATION_WM_CLOSE_REQUEST:
 		_ask_quit()
+		_render()
 
 
 func _on_joy_connection_changed(_device: int, _connected: bool) -> void:
@@ -361,6 +365,10 @@ func _list(path: String, quiet := false) -> Variant:
 			toast(result["error"], true)
 		return null
 	var listed: Array = result["entries"]
+	# the core name loses a leading U+FEFF in the Godot string, but the path keeps it, so the path gives the true name
+	for e: Dictionary in listed:
+		if not JoyPathText.is_opaque(e["path"]):
+			e["name"] = e["path"].get_file()
 	_only_hidden = listed.is_empty() and not settings.show_hidden and not core.list_dir(path, true, "name", false)["entries"].is_empty()
 	return listed
 
@@ -375,6 +383,7 @@ func navigate(path: String, focus_name := "") -> bool:
 
 func _enter(path: String, listed: Array, focus_name := "") -> void:
 	cwd = path
+	_unreadable = false
 	all_entries = listed
 	filter = ""
 	selected.clear()
@@ -389,6 +398,7 @@ func refresh(focus_name := "") -> void:
 		_leave_missing_folder()
 		return
 	all_entries = listed
+	_unreadable = false
 	if not selected.is_empty():
 		var present := {}
 		for e: Dictionary in all_entries:
@@ -421,11 +431,11 @@ func _focus_of(path: String) -> String:
 	return path if JoyPathText.is_opaque(path) or path.get_file() == "" else path.get_file()
 
 
-# a name from the list is already readable, and any other name loses its escape characters
+# the text of a name that the screen may draw
 func _name_of(path: String) -> String:
 	for e: Dictionary in all_entries:
 		if e["path"] == path:
-			return e["name"]
+			return JoyPathText.printable(e["name"])
 	return JoyPathText.printable(path.get_file())
 
 
@@ -637,10 +647,14 @@ func _ask_quit() -> void:
 	if jobs.is_empty():
 		quitter.call()
 		return
-	_confirm_label.text = "A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size()
+	_set_confirm("A job is still running. Quit and cancel it?" if jobs.size() == 1 else "%d jobs are still running. Quit and cancel them?" % jobs.size())
 	_on_confirm = quitter
 	if mode != Mode.CONFIRM:
 		_open(Mode.CONFIRM)
+
+
+func _set_confirm(text: String) -> void:
+	_confirm_label.text = JoyPathText.printable(text)
 
 
 func _open_sort_menu() -> void:
@@ -711,7 +725,7 @@ func _ask_filter() -> void:
 
 func _ask_trash(paths: PackedStringArray) -> void:
 	var what := _label_of(paths)
-	_confirm_label.text = "Move %s to the trash?" % what
+	_set_confirm("Move %s to the trash?" % what)
 	_on_confirm = func():
 		_announce_trash(core.trash(paths), what)
 		refresh()
@@ -878,7 +892,8 @@ func _on_props_closed() -> void:
 	_close()
 
 
-func toast(text: String, is_error := false) -> void:
+func toast(raw: String, is_error := false) -> void:
+	var text := JoyPathText.printable(raw)
 	last_error = text if is_error else ""
 	if _toast_blocked():
 		_toast_queue.append([text, is_error])
@@ -1194,6 +1209,8 @@ func _render_rows() -> void:
 
 
 func _empty_text() -> String:
+	if _unreadable:
+		return "This folder cannot be read."
 	if filter != "":
 		return "No items match the filter."
 	return "This folder has only hidden items." if _only_hidden else "This folder is empty."

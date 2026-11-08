@@ -191,7 +191,7 @@ static func update_hints(holder: Container, pairs: Array) -> void:
 
 
 static func human_size(bytes: int) -> String:
-	var units := ["B", "KB", "MB", "GB", "TB"]
+	var units := ["B", "KB", "MB", "GB", "TB", "PB"]
 	var value := float(bytes)
 	var i := 0
 	# a value that rounds to 1024.0 moves up a unit, so no text shows 1024.0 KB

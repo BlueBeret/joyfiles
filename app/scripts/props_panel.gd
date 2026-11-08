@@ -132,8 +132,8 @@ func _exact_size(bytes: int) -> String:
 
 
 func _put(field: String, text: String) -> void:
-	shown[field] = text
-	_labels[field].text = text
+	shown[field] = JoyPathText.printable(text)
+	_labels[field].text = shown[field]
 	_show_rows()
 
 

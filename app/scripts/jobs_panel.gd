@@ -244,7 +244,7 @@ func _fill_row(parts: Dictionary, job: Dictionary, focused: bool) -> void:
 
 
 func _fill_report_row(parts: Dictionary, report: Dictionary, focused: bool) -> void:
-	parts["title"].text = report["title"]
+	parts["title"].text = JoyPathText.printable(report["title"])
 	parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(focused, Color.TRANSPARENT, 8, 12, 12))
 
 
@@ -255,13 +255,13 @@ func _render_detail() -> void:
 		return
 	var report: Dictionary = _reports[viewing]
 	var failures: Array = report["failures"]
-	failure_texts = failures.map(func(f: Dictionary) -> String: return f["error"])
+	failure_texts = failures.map(func(f: Dictionary) -> String: return JoyPathText.printable(f["error"]))
 	failure_cursor = clampi(failure_cursor, 0, maxi(failures.size() - 1, 0))
 	if failure_cursor < failure_top:
 		failure_top = failure_cursor
 	elif failure_cursor >= failure_top + DETAIL_ROWS:
 		failure_top = failure_cursor - DETAIL_ROWS + 1
-	_detail_title.text = report["title"]
+	_detail_title.text = JoyPathText.printable(report["title"])
 	_detail_count.text = "%s of %s" % [Theme_.with_commas(failure_cursor + 1), Theme_.with_commas(failures.size())]
 	for i in DETAIL_ROWS:
 		var parts: Dictionary = _detail_rows[i]
@@ -269,6 +269,6 @@ func _render_detail() -> void:
 		parts["row"].visible = at < failures.size()
 		if at >= failures.size():
 			continue
-		parts["message"].text = failures[at]["error"]
+		parts["message"].text = failure_texts[at]
 		parts["path"].set_full(JoyPathText.printable(failures[at]["path"]))
 		parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(at == failure_cursor))
