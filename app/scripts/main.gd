@@ -18,6 +18,7 @@ var start_path := ""
 var settings_path := "user://settings.cfg"
 var opener := Callable()
 var places_source := Callable()
+var quitter := Callable()
 var core := JoyCore.new()
 var settings: JoySettings
 var thumbs := JoyThumbs.new()
@@ -86,6 +87,8 @@ func _ready() -> void:
 		opener = _shell_open
 	if not places_source.is_valid():
 		places_source = core.places
+	if not quitter.is_valid():
+		quitter = get_tree().quit
 	_build_ui()
 	_handlers = {
 		Mode.FILES: _files_action,
@@ -477,7 +480,7 @@ func _app_menu() -> Array:
 		["Sort...", _open_sort_menu],
 		["Hide hidden files" if settings.show_hidden else "Show hidden files", _toggle_hidden],
 		["Refresh", refresh],
-		["Quit Joyfiles", func(): get_tree().quit()],
+		["Quit Joyfiles", func(): quitter.call()],
 	]
 
 
