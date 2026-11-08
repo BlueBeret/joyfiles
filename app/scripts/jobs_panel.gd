@@ -205,6 +205,7 @@ func _make_row() -> Dictionary:
 	box.add_theme_constant_override("separation", 6)
 	row.add_child(box)
 	var line := HBoxContainer.new()
+	line.add_theme_constant_override("separation", 16)
 	box.add_child(line)
 	var title := Theme_.fit("", Theme_.TEXT, Theme_.SIZE_BODY, JoyFitLabel.Cut.MIDDLE)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
