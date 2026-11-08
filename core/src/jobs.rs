@@ -175,9 +175,8 @@ struct Worker<'a> {
     sticky: Option<Resolution>,
     // an explicit stack, so a deep merge cannot overflow the thread stack
     tasks: Vec<Task>,
-    // folders that got new names, and sources of a move that go once those folders are synced
-    to_sync: BTreeSet<PathBuf>,
-    to_remove: Vec<PathBuf>,
+    unsettled: Vec<Unsettled>,
+    unsettled_bytes: u64,
 }
 
 // a plain copy promises nothing on power loss, a durable copy is on the drive before an old item goes, and a move removes each source only after that
@@ -188,8 +187,25 @@ enum Copying {
     Moving,
 }
 
-// the sources of a move go in batches, so a big move needs few folder syncs and little extra space
-const SETTLE_BATCH: usize = 256;
+// a durable copy settles in batches, so a whole batch reaches the drive with one sync before any name or source changes
+enum Unsettled {
+    File { src: PathBuf, part: PathBuf, dest: PathBuf },
+    Link { src: PathBuf, dest: PathBuf },
+    // runs after the files of the folder took their names, so a read only folder gets its mode only once it is full
+    Close { src: PathBuf, dest: PathBuf, meta: fs::Metadata },
+}
+
+impl Unsettled {
+    fn dest(&self) -> &Path {
+        match self {
+            Unsettled::File { dest, .. } | Unsettled::Link { dest, .. } | Unsettled::Close { dest, .. } => dest,
+        }
+    }
+}
+
+// a batch ends at this many items or bytes, so a big move needs few syncs and frees source space as it goes
+const SETTLE_ITEMS: usize = 1000;
+const SETTLE_BYTES: u64 = 512 << 20;
 
 enum Task {
     Transfer { src: PathBuf, dest_dir: PathBuf },
@@ -214,7 +230,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks, to_sync: BTreeSet::new(), to_remove: Vec::new() };
+    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0 };
     while let Some(task) = worker.tasks.pop() {
         match task {
             Task::Transfer { src, dest_dir } => {
@@ -250,17 +266,48 @@ impl Worker<'_> {
         self.p.failures.lock().unwrap().push(Failure { path: path.to_path_buf(), message });
     }
 
-    // the folders of the copies go to the drive first, and only then do the sources of a move go
-    fn settle(&mut self) {
-        let dirs = std::mem::take(&mut self.to_sync);
-        let sources = std::mem::take(&mut self.to_remove);
-        if let Some(err) = dirs.iter().find_map(|dir| sync_dir(dir).err()) {
-            for src in &sources {
-                self.note(src, &err);
+    // the bytes of the parts reach the drive, the parts take their names, the names reach the drive, and only then does a moved source go
+    fn settle(&mut self, how: Copying) {
+        let batch = std::mem::take(&mut self.unsettled);
+        self.unsettled_bytes = 0;
+        let dirs: BTreeSet<PathBuf> = batch.iter().filter_map(|u| u.dest().parent()).map(Path::to_path_buf).collect();
+        if let Err(e) = sync_drives(&dirs, false) {
+            for item in batch {
+                match item {
+                    Unsettled::File { src, part, .. } => {
+                        let _ = fs::remove_file(&part);
+                        self.note(&src, &e);
+                    }
+                    Unsettled::Close { dest, meta, .. } => keep_metadata(&dest, &meta),
+                    Unsettled::Link { .. } => {}
+                }
             }
             return;
         }
-        for src in sources {
+        let mut leaving = Vec::new();
+        for item in batch {
+            match item {
+                Unsettled::File { src, part, dest } => match commit_part(&part, &dest) {
+                    Ok(()) => leaving.push(src),
+                    Err(e) => self.note(&src, &e),
+                },
+                Unsettled::Link { src, .. } => leaving.push(src),
+                Unsettled::Close { src, dest, meta } => {
+                    keep_metadata(&dest, &meta);
+                    leaving.push(src);
+                }
+            }
+        }
+        if let Err(e) = sync_drives(&dirs, true) {
+            for src in &leaving {
+                self.note(src, &e);
+            }
+            return;
+        }
+        if how != Copying::Moving {
+            return;
+        }
+        for src in leaving {
             // a source folder stays when a child of it was skipped or failed
             let removed = if is_real_dir(&src) { fs::remove_dir(&src) } else { remove_item(&src) };
             match removed {
@@ -405,13 +452,13 @@ impl Worker<'_> {
     fn copy_tree(&mut self, src: &Path, dest: &Path, how: Copying) -> io::Result<()> {
         let mut pending = vec![Step::Copy(src.to_path_buf(), dest.to_path_buf())];
         let result = self.run_steps(&mut pending, how);
+        self.settle(how);
         // a cancel still gives each folder made so far the rights and times of its source
         for step in pending.into_iter().rev() {
             if let Step::Close { dest, meta, .. } = step {
                 keep_metadata(&dest, &meta);
             }
         }
-        self.settle();
         result
     }
 
@@ -423,15 +470,13 @@ impl Worker<'_> {
                         self.fail(&src, &e)?;
                     }
                 }
-                Step::Close { src, dest, meta } => {
-                    keep_metadata(&dest, &meta);
-                    if how == Copying::Moving {
-                        self.to_remove.push(src);
-                    }
-                }
+                Step::Close { src, dest, meta } => match how {
+                    Copying::Plain => keep_metadata(&dest, &meta),
+                    _ => self.unsettled.push(Unsettled::Close { src, dest, meta }),
+                },
             }
-            if self.to_remove.len() >= SETTLE_BATCH {
-                self.settle();
+            if self.unsettled.len() >= SETTLE_ITEMS || self.unsettled_bytes >= SETTLE_BYTES {
+                self.settle(how);
             }
         }
         Ok(())
@@ -439,8 +484,7 @@ impl Worker<'_> {
 
     fn copy_one(&mut self, src: &Path, dest: &Path, how: Copying, pending: &mut Vec<Step>) -> io::Result<()> {
         let meta = fs::symlink_metadata(src)?;
-        let is_dir = meta.is_dir();
-        if is_dir {
+        if meta.is_dir() {
             if how == Copying::Moving && is_mount_point(src) {
                 return Err(mount_point_error());
             }
@@ -453,17 +497,20 @@ impl Worker<'_> {
         } else if meta.file_type().is_symlink() {
             copy_symlink(src, dest)?;
             self.p.add_done(meta.len());
+            if how != Copying::Plain {
+                self.unsettled.push(Unsettled::Link { src: src.to_path_buf(), dest: dest.to_path_buf() });
+            }
         } else if meta.is_file() {
-            copy_file(self.p, src, dest, self.owner, how != Copying::Plain)?;
+            let part = write_copy(self.p, src, dest, self.owner, how != Copying::Plain)?;
+            if how == Copying::Plain {
+                commit_part(&part, dest)?;
+            } else {
+                self.unsettled_bytes += meta.len();
+                self.unsettled.push(Unsettled::File { src: src.to_path_buf(), part, dest: dest.to_path_buf() });
+            }
         } else {
             // opening a pipe for reading blocks until a writer comes, so pipes, sockets and devices are skipped
             return Err(io::Error::new(io::ErrorKind::Unsupported, "it is not a regular file"));
-        }
-        if how != Copying::Plain {
-            self.to_sync.insert(dest.parent().unwrap_or(Path::new(".")).to_path_buf());
-        }
-        if how == Copying::Moving && !is_dir {
-            self.to_remove.push(src.to_path_buf());
         }
         Ok(())
     }
@@ -487,13 +534,45 @@ fn mount_point_error() -> io::Error {
 #[cfg(test)]
 const SYNC_FAILS: &str = "sync-fails-here";
 
+fn refused_in_tests(_dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if _dir.components().any(|c| c.as_os_str() == SYNC_FAILS) {
+        return Err(io::Error::other("the drive did not confirm the write"));
+    }
+    Ok(())
+}
+
+// one call syncs a whole Linux drive, which costs far less than one sync per file of a big batch
+const SYNC_EACH_FILE: bool = !cfg!(target_os = "linux");
+
+#[cfg(target_os = "linux")]
+fn sync_drives(dirs: &BTreeSet<PathBuf>, _names: bool) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let mut synced = BTreeSet::new();
+    for dir in dirs {
+        refused_in_tests(dir)?;
+        let folder = File::open(dir)?;
+        if synced.insert(folder.metadata()?.dev()) && unsafe { libc::syncfs(folder.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+// each file was synced as it was written, so only the folders that got new names remain
+#[cfg(not(target_os = "linux"))]
+fn sync_drives(dirs: &BTreeSet<PathBuf>, names: bool) -> io::Result<()> {
+    if names {
+        dirs.iter().try_for_each(|dir| sync_dir(dir))?;
+    }
+    Ok(())
+}
+
 // a new name is on the drive only once its folder is synced, and a drive that cannot sync a folder answers EINVAL
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    if dir.components().any(|c| c.as_os_str() == SYNC_FAILS) {
-        return Err(io::Error::other("the drive did not confirm the write"));
-    }
+    refused_in_tests(dir)?;
     match File::open(dir).and_then(|f| f.sync_all()) {
         Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
         done => done,
@@ -622,20 +701,25 @@ fn temp_beside(item: &Path, owner: Owner, role: Role) -> PathBuf {
     parts::temp_path(item.parent().unwrap_or(Path::new(".")), item.file_name().unwrap_or_default(), owner, role)
 }
 
-// the bytes go to a temporary name first, so a crash or an error never leaves a short file under the real name
-fn copy_file(p: &Progress, src: &Path, dest: &Path, owner: Owner, durable: bool) -> io::Result<()> {
+// the bytes go to a part name first, so a crash or an error never leaves a short file under the real name
+fn write_copy(p: &Progress, src: &Path, dest: &Path, owner: Owner, durable: bool) -> io::Result<PathBuf> {
     let mut input = File::open(src)?;
     let part = temp_beside(dest, owner, Role::Part);
-    let result = write_part(p, &mut input, &part, durable).and_then(|()| {
-        if exists_nofollow(dest) {
-            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    match write_part(p, &mut input, &part, durable && SYNC_EACH_FILE) {
+        Ok(()) => Ok(part),
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            Err(e)
         }
-        fs::rename(&part, dest)
-    });
-    if result.is_err() {
-        let _ = fs::remove_file(&part);
     }
-    result
+}
+
+fn commit_part(part: &Path, dest: &Path) -> io::Result<()> {
+    let placed = if exists_nofollow(dest) { Err(io::ErrorKind::AlreadyExists.into()) } else { fs::rename(part, dest) };
+    if placed.is_err() {
+        let _ = fs::remove_file(part);
+    }
+    placed
 }
 
 fn write_part(p: &Progress, input: &mut File, part: &Path, durable: bool) -> io::Result<()> {
@@ -989,7 +1073,8 @@ mod tests {
         assert!(matches!(wait(&p), JobState::Failed(_)));
         assert_eq!(read(here.path().join("f.txt")), "f", "the source stays when its copy is not confirmed");
         assert_eq!(read(here.path().join("d/sub/b.txt")), "b");
-        assert_eq!(read(dest.join("d/sub/b.txt")), "b", "the copy is there as well");
+        assert_eq!(names_in(&dest), ["d"], "an unconfirmed copy never takes its name and leaves no part");
+        assert!(names_in(&dest.join("d/sub")).is_empty());
     }
 
     #[test]
