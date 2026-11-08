@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Joyfiles
+Comment=A file manager built for game controllers
+Exec=joyfiles.x86_64
+Icon=joyfiles
+Terminal=false
+Categories=System;FileTools;FileManager;
