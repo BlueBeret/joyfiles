@@ -353,6 +353,7 @@ impl Worker<'_> {
         }
         if meta.file_type().is_symlink() {
             copy_symlink(src, dest)?;
+            self.p.add_done(meta.len());
         } else if meta.is_file() {
             copy_file(self.p, src, dest)?;
         } else {
@@ -710,6 +711,22 @@ mod tests {
         assert_eq!(p.done_bytes.load(Ordering::Relaxed), 3500);
         assert_eq!(p.total_bytes.load(Ordering::Relaxed), 3500);
         assert!(src.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn progress_reaches_the_total_when_the_tree_holds_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.bin"), vec![1u8; 100]).unwrap();
+        std::os::unix::fs::symlink("a.bin", src.join("link")).unwrap();
+        std::os::unix::fs::symlink("nowhere/at/all", src.join("broken")).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src], out, ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(p.done_bytes.load(Ordering::Relaxed), p.total_bytes.load(Ordering::Relaxed));
     }
 
     #[test]
