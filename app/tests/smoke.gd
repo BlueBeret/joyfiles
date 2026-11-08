@@ -521,8 +521,7 @@ func _preview_replay() -> void:
 	press("jf_accept")
 	DirAccess.remove_absolute(base + "/dest/c.png")
 	app.refresh()
-	press("jf_back")
-	check(app.mode == app.Mode.FILES and app.cursor < app.entries.size(), "B closes the preview of a file that vanished (cursor %d of %d)" % [app.cursor, app.entries.size()])
+	check(app.mode == app.Mode.FILES and app.cursor < app.entries.size(), "the preview of a file that vanished closes on the refresh (cursor %d of %d)" % [app.cursor, app.entries.size()])
 
 
 func _move_refreshes_source() -> void:

@@ -445,6 +445,8 @@ func _apply_filter(focus_name := "") -> void:
 	# a refresh keeps the scroll position, so the cursor stays on the same screen row
 	top = clampi(top, 0, maxi(entries.size() - VISIBLE_ROWS, 0))
 	_clamp_view()
+	if mode == Mode.PREVIEW and not preview.relist(entries):
+		_close()
 
 
 func _set_filter(text: String) -> void:

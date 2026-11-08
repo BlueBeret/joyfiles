@@ -54,6 +54,17 @@ func open(thumbs: JoyThumbs, entries: Array, at: int) -> void:
 	refresh()
 
 
+# the folder list was read again, so follow the shown image into it, or report that it is gone
+func relist(entries: Array) -> bool:
+	var path: String = current()["path"]
+	for i in entries.size():
+		if entries[i]["path"] == path:
+			_entries = entries
+			index = i
+			return true
+	return false
+
+
 func current() -> Dictionary:
 	return _entries[index]
 
