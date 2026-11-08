@@ -184,7 +184,7 @@ struct Worker<'a> {
     // folders this job merged into, so a later item of that name never replaces them
     merged_into: HashSet<ItemKey>,
     // an open handle of each destination folder with a part inside, so a part stays reachable when the folder moves
-    homes: HashMap<PathBuf, File>,
+    homes: HashMap<(u64, u64), File>,
 }
 
 #[cfg(unix)]
@@ -256,7 +256,7 @@ fn changed_error() -> io::Error {
 
 // a durable copy settles in batches, so a whole batch reaches the drive with one sync before any name or source changes
 enum Unsettled {
-    File { src: PathBuf, part: PathBuf, dest: PathBuf, stamp: Stamp },
+    File { src: PathBuf, part: PathBuf, dest: PathBuf, stamp: Stamp, home: Option<(u64, u64)> },
     Link { src: PathBuf, dest: PathBuf, stamp: Stamp },
     // runs after the files of the folder took their names, so a read only folder gets its mode only once it is full
     Close { src: PathBuf, dest: PathBuf, meta: fs::Metadata },
@@ -373,8 +373,8 @@ impl Worker<'_> {
         if let Err(e) = sync_drives(&dirs, false) {
             for item in batch {
                 match item {
-                    Unsettled::File { src, part, .. } => {
-                        self.drop_part(&part);
+                    Unsettled::File { src, part, home, .. } => {
+                        self.drop_part(&part, home);
                         self.note(&src, &folder_moved(io::Error::new(e.kind(), e.to_string()), &part));
                     }
                     Unsettled::Close { dest, meta, .. } => keep_metadata(&dest, &meta),
@@ -386,7 +386,7 @@ impl Worker<'_> {
         let mut leaving = Vec::new();
         for item in batch {
             match item {
-                Unsettled::File { src, part, dest, stamp } => match self.commit(&src, &part, &dest) {
+                Unsettled::File { src, part, dest, stamp, home } => match self.commit(&src, &part, &dest, home) {
                     Ok(Some(_)) => leaving.push((src, Some(stamp))),
                     Ok(None) => {}
                     Err(_) if self.p.cancel.load(Ordering::Relaxed) => {}
@@ -609,31 +609,31 @@ impl Worker<'_> {
     }
 
     // the finished part takes its name, and a name that something else took meanwhile raises the usual question
-    fn commit(&mut self, src: &Path, part: &Path, dest: &Path) -> io::Result<Option<PathBuf>> {
+    fn commit(&mut self, src: &Path, part: &Path, dest: &Path, home: Option<(u64, u64)>) -> io::Result<Option<PathBuf>> {
         let placed = self.place_part(src, part, dest).map_err(|e| folder_moved(e, part));
         match &placed {
             Ok(Some(path)) => self.record(path),
-            _ => self.drop_part(part),
+            _ => self.drop_part(part, home),
         }
         placed
     }
 
     // a part goes by its path, or through the open handle of its folder when that folder moved or went away
-    fn drop_part(&self, part: &Path) {
+    fn drop_part(&self, part: &Path, home: Option<(u64, u64)>) {
         let Err(e) = fs::remove_file(part) else { return };
         if e.kind() == io::ErrorKind::NotFound {
-            if let (Some(home), Some(name)) = (part.parent().and_then(|dir| self.homes.get(dir)), part.file_name()) {
-                unlink_in(home, name);
+            if let (Some(folder), Some(name)) = (home.and_then(|key| self.homes.get(&key)), part.file_name()) {
+                unlink_in(folder, name);
             }
         }
     }
 
-    fn keep_home(&mut self, dir: &Path) {
-        if !self.homes.contains_key(dir) {
-            if let Ok(home) = File::open(dir) {
-                self.homes.insert(dir.to_path_buf(), home);
-            }
-        }
+    // the handle is kept by the identity of the folder, so a new folder under the same path never takes the place of the old one
+    fn keep_home(&mut self, folder: Option<File>) -> Option<(u64, u64)> {
+        let folder = folder?;
+        let key = inode_of(&folder.metadata().ok()?)?;
+        self.homes.entry(key).or_insert(folder);
+        Some(key)
     }
 
     fn place_part(&mut self, src: &Path, part: &Path, dest: &Path) -> io::Result<Option<PathBuf>> {
@@ -763,20 +763,22 @@ impl Worker<'_> {
                 self.unsettled.push(Unsettled::Link { src: src.to_path_buf(), dest: dest.to_path_buf(), stamp: Stamp::of(&meta) });
             }
         } else if meta.is_file() {
-            self.keep_home(dest.parent().unwrap_or(Path::new(".")));
             let part = temp_beside(dest, self.owner, Role::Part);
-            let stamp = match write_copy(self.p, src, &part, how != Copying::Plain) {
+            let mut folder = None;
+            let written = write_copy(self.p, src, &part, how != Copying::Plain, &mut folder);
+            let home = self.keep_home(folder);
+            let stamp = match written {
                 Ok(stamp) => stamp,
                 Err(e) => {
-                    self.drop_part(&part);
+                    self.drop_part(&part, home);
                     return Err(e);
                 }
             };
             if how == Copying::Plain {
-                self.commit(src, &part, dest)?;
+                self.commit(src, &part, dest, home)?;
             } else {
                 self.unsettled_bytes += meta.len();
-                self.unsettled.push(Unsettled::File { src: src.to_path_buf(), part, dest: dest.to_path_buf(), stamp });
+                self.unsettled.push(Unsettled::File { src: src.to_path_buf(), part, dest: dest.to_path_buf(), stamp, home });
             }
         } else {
             // opening a pipe for reading blocks until a writer comes, so pipes, sockets and devices are skipped
@@ -1048,16 +1050,43 @@ fn temp_beside(item: &Path, owner: Owner, role: Role) -> PathBuf {
 }
 
 // the bytes go to a part name first, so a crash or an error never leaves a short file under the real name
-fn write_copy(p: &Progress, src: &Path, part: &Path, durable: bool) -> io::Result<Stamp> {
+fn write_copy(p: &Progress, src: &Path, part: &Path, durable: bool, folder: &mut Option<File>) -> io::Result<Stamp> {
     let mut input = File::open(src)?;
     let stamp = Stamp::of(&input.metadata()?);
-    write_part(p, &mut input, part, durable && SYNC_EACH_FILE)?;
+    write_part(p, &mut input, part, durable && SYNC_EACH_FILE, folder)?;
     Ok(stamp)
 }
 
-fn write_part(p: &Progress, input: &mut File, part: &Path, durable: bool) -> io::Result<()> {
+// a handle counts only when the part is inside that folder, so it stays the right folder even when the path moves
+#[cfg(unix)]
+fn holds(folder: &File, name: &std::ffi::OsStr) -> bool {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else { return false };
+    let mut seen = std::mem::MaybeUninit::<libc::stat>::uninit();
+    unsafe { libc::fstatat(folder.as_raw_fd(), name.as_ptr(), seen.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) == 0 }
+}
+
+#[cfg(not(unix))]
+fn holds(_folder: &File, _name: &std::ffi::OsStr) -> bool {
+    false
+}
+
+// the handle opened before the part was made wins, and a folder that moved in between is found again by its path
+fn holder_of(part: &Path, before: Option<File>) -> Option<File> {
+    let name = part.file_name()?;
+    if let Some(folder) = before.filter(|f| holds(f, name)) {
+        return Some(folder);
+    }
+    File::open(part.parent()?).ok().filter(|f| holds(f, name))
+}
+
+fn write_part(p: &Progress, input: &mut File, part: &Path, durable: bool, folder: &mut Option<File>) -> io::Result<()> {
     let meta = input.metadata()?;
-    let mut output = create_private_file(part, &meta)?;
+    let before = part.parent().and_then(|dir| File::open(dir).ok());
+    let created = create_private_file(part, &meta);
+    *folder = holder_of(part, before);
+    let mut output = created?;
     if !copy_sparse(p, input, &mut output, &meta)? {
         copy_range(p, input, &mut output, u64::MAX)?;
     }
