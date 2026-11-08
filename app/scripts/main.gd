@@ -366,9 +366,17 @@ func _save_settings() -> void:
 		toast("Could not save your settings.", true)
 
 
+func _visible_selection() -> PackedStringArray:
+	var shown := {}
+	for e: Dictionary in entries:
+		shown[e["path"]] = true
+	return PackedStringArray(selected.keys().filter(func(path: String) -> bool: return shown.has(path)))
+
+
 func targets() -> PackedStringArray:
-	if not selected.is_empty():
-		return PackedStringArray(selected.keys())
+	var picked := _visible_selection()
+	if not picked.is_empty():
+		return picked
 	if entries.is_empty():
 		return PackedStringArray()
 	return PackedStringArray([entries[cursor]["path"]])
@@ -390,7 +398,7 @@ func _file_menu() -> Array:
 	items.append(["New folder", _ask_new_folder])
 	if not t.is_empty():
 		items.append(["Move to trash (%d)" % t.size(), func(): _ask_trash(t)])
-	if selected.is_empty():
+	if _visible_selection().is_empty():
 		items.append(["Select all", select_all])
 	else:
 		items.append(["Clear selection", func(): selected.clear()])
