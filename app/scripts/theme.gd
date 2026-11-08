@@ -10,6 +10,27 @@ const MUTED := Color("#8a90a0")
 const FOLDER := Color("#ffc857")
 const DANGER := Color("#ff5d5d")
 const WARN := Color("#ffc857")
+const FONT_DIR := "res://fonts/"
+# the first font covers Latin, Greek and Cyrillic, the others cover scripts and symbols that a device can lack
+const FONT_FILES := ["NotoSans", "NotoSansThai", "NotoSansArabic", "NotoSansHebrew", "NotoSansSymbols2-Subset"]
+const BASE_SIZE := 22
+
+static var _theme: Theme
+
+
+# one theme for the whole window, so every label gets the bundled font and the same default size
+static func theme() -> Theme:
+	if _theme == null:
+		var faces: Array[Font] = []
+		for stem: String in FONT_FILES:
+			faces.append(load("%s%s.ttf" % [FONT_DIR, stem]))
+		var font := FontVariation.new()
+		font.base_font = faces[0]
+		font.fallbacks = faces.slice(1)
+		_theme = Theme.new()
+		_theme.default_font = font
+		_theme.default_font_size = BASE_SIZE
+	return _theme
 
 
 static func box(color: Color, radius := 0, margin := 12) -> StyleBoxFlat:

@@ -87,6 +87,7 @@ var _keyboard: JoyKeyboard
 
 
 func _ready() -> void:
+	theme = Theme_.theme()
 	JoyInput.install()
 	Input.joy_connection_changed.connect(_on_joy_connection_changed)
 	settings = JoySettings.new(settings_path)
