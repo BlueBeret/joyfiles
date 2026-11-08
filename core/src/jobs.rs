@@ -145,6 +145,14 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
 struct Worker<'a> {
     p: &'a Progress,
     sticky: Option<Resolution>,
+    // an explicit stack, so a deep merge cannot overflow the thread stack
+    tasks: Vec<Task>,
+}
+
+enum Task {
+    Transfer { src: PathBuf, dest_dir: PathBuf },
+    // a move removes a merged source folder once its children are gone
+    EndMerge(PathBuf),
 }
 
 fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io::Result<()> {
@@ -159,9 +167,16 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io
         Policy::Ask => None,
         Policy::Always(choice) => Some(choice),
     };
-    let mut worker = Worker { p, sticky };
-    for src in sources {
-        worker.transfer(src, dest_dir)?;
+    let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
+    let mut worker = Worker { p, sticky, tasks };
+    while let Some(task) = worker.tasks.pop() {
+        match task {
+            Task::Transfer { src, dest_dir } => worker.transfer(&src, &dest_dir)?,
+            Task::EndMerge(src) => {
+                // the folder stays when a child was skipped
+                let _ = fs::remove_dir(src);
+            }
+        }
     }
     Ok(())
 }
@@ -199,12 +214,12 @@ impl Worker<'_> {
 
     // two folders with one name join, and only files that clash are asked about
     fn merge(&mut self, src: &Path, target: &Path) -> io::Result<()> {
-        for entry in fs::read_dir(src)? {
-            self.transfer(&entry?.path(), target)?;
-        }
+        let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
         if self.p.kind == JobKind::Move {
-            // the folder stays when a child was skipped
-            let _ = fs::remove_dir(src);
+            self.tasks.push(Task::EndMerge(src.to_path_buf()));
+        }
+        for entry in children.into_iter().rev() {
+            self.tasks.push(Task::Transfer { src: entry.path(), dest_dir: target.to_path_buf() });
         }
         Ok(())
     }
@@ -260,29 +275,39 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 fn tree_size(path: &Path) -> u64 {
-    match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => fs::read_dir(path)
-            .map(|rd| rd.filter_map(Result::ok).map(|e| tree_size(&e.path())).sum())
-            .unwrap_or(0),
-        Ok(m) => m.len(),
-        Err(_) => 0,
+    let mut total = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                if let Ok(rd) = fs::read_dir(&path) {
+                    pending.extend(rd.filter_map(Result::ok).map(|e| e.path()));
+                }
+            }
+            Ok(m) => total += m.len(),
+            Err(_) => {}
+        }
     }
+    total
 }
 
 fn copy_tree(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(src)?;
-    if meta.is_dir() {
-        fs::create_dir(dest)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            copy_tree(p, &entry.path(), &dest.join(entry.file_name()))?;
+    let mut pending = vec![(src.to_path_buf(), dest.to_path_buf())];
+    while let Some((src, dest)) = pending.pop() {
+        let meta = fs::symlink_metadata(&src)?;
+        if meta.is_dir() {
+            fs::create_dir(&dest)?;
+            let children = fs::read_dir(&src)?.collect::<io::Result<Vec<_>>>()?;
+            for entry in children.into_iter().rev() {
+                pending.push((entry.path(), dest.join(entry.file_name())));
+            }
+        } else if meta.file_type().is_symlink() {
+            copy_symlink(&src, &dest)?;
+        } else {
+            copy_file(p, &src, &dest)?;
         }
-        return Ok(());
     }
-    if meta.file_type().is_symlink() {
-        return copy_symlink(src, dest);
-    }
-    copy_file(p, src, dest)
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -389,6 +414,29 @@ mod tests {
         assert_eq!(p.done_bytes.load(Ordering::Relaxed), 3500);
         assert_eq!(p.total_bytes.load(Ordering::Relaxed), 3500);
         assert!(src.exists());
+    }
+
+    #[test]
+    fn copies_merges_and_replaces_a_very_deep_tree() {
+        const DEPTH: usize = 2000;
+        let tmp = tempfile::tempdir().unwrap();
+        let chain = "a/".repeat(DEPTH);
+        let src = tmp.path().join("s");
+        fs::create_dir_all(src.join(&chain)).unwrap();
+        fs::write(src.join(&chain).join("leaf.txt"), "deep").unwrap();
+        let out = tmp.path().join("o");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(read(out.join("s").join(&chain).join("leaf.txt")), "deep");
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), Policy::Always(Resolution::Skip));
+        assert_eq!(wait(&p), JobState::Done, "every folder merges");
+        let flat = tmp.path().join("f");
+        fs::create_dir(&flat).unwrap();
+        fs::write(flat.join("s"), "flat").unwrap();
+        let p = spawn(JobKind::Copy, vec![flat.join("s")], out.clone(), Policy::Always(Resolution::Replace));
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(read(out.join("s")), "flat");
     }
 
     #[test]
