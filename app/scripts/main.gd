@@ -300,7 +300,7 @@ func go_up() -> void:
 
 # a deleted folder or a removed card leaves a stale list, so move to the nearest folder that still lists
 func _leave_missing_folder() -> void:
-	var gone := cwd
+	var gone := cwd.get_file() if cwd.get_file() != "" else cwd
 	var candidates: Array = []
 	var path: String = core.parent_dir(cwd)
 	while path != "":
@@ -311,9 +311,9 @@ func _leave_missing_folder() -> void:
 		var listed: Variant = _list(candidate, true)
 		if listed != null:
 			_enter(candidate, listed)
-			toast("The folder %s is not available. Opened %s." % [gone.get_file(), _pretty_path(candidate)])
+			toast("The folder %s is not available. Opened %s." % [gone, _pretty_path(candidate)])
 			return
-	toast("The folder %s is not available." % gone.get_file(), true)
+	toast("The folder %s is not available." % gone, true)
 
 
 func _pretty_path(path: String) -> String:
