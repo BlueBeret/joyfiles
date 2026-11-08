@@ -604,6 +604,7 @@ func _poll_jobs() -> void:
 	if jobs.is_empty():
 		return
 	var ended := false
+	var refreshed := false
 	for job: Dictionary in core.poll_jobs():
 		var id: int = job["id"]
 		if not jobs.has(id):
@@ -620,10 +621,13 @@ func _poll_jobs() -> void:
 			ended = true
 			if cwd in jobs[id].get("watch", []):
 				refresh()
+				refreshed = true
 			jobs.erase(id)
+	if refreshed:
+		_render()
 	_ask_next_conflict()
 	_render_status()
-	if ended:
+	if ended and not refreshed:
 		_render_hints()
 	if mode == Mode.JOBS:
 		_render_overlay()
