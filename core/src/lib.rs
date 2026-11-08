@@ -131,9 +131,10 @@ impl JoyCore {
         gstr(&path_of(&dir).join(name.to_string()))
     }
 
+    // new_name is in the same text form as a path, so the last part of a listed path renames to itself
     #[func]
     fn rename(&self, path: GString, new_name: GString) -> VarDictionary {
-        result_dict(fs_ops::rename(&path_of(&path), &new_name.to_string()))
+        result_dict(fs_ops::rename(&path_of(&path), path_of(&new_name)))
     }
 
     #[func]

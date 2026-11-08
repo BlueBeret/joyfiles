@@ -668,8 +668,9 @@ func paste() -> void:
 
 
 func _ask_rename(path: String) -> void:
-	_ask_text("Rename", _name_of(path), func(new_name: String):
-		var r: Dictionary = core.rename(path, new_name)
+	var shown := _name_of(path)
+	_ask_text("Rename", shown, func(new_name: String):
+		var r: Dictionary = core.rename(path, path.get_file() if new_name == shown else new_name)
 		if r["ok"]:
 			refresh(r["path"].get_file())
 		else:

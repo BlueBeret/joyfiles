@@ -168,41 +168,48 @@ fn is_hidden(name: &str, _meta: &fs::Metadata) -> bool {
     name.starts_with('.')
 }
 
+// checks the exact name, so a caller that trims must trim first
 pub fn validate_name(name: &str) -> Result<(), String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+    if name.trim().is_empty() || name == "." || name == ".." {
         return Err("The name is not valid.".into());
     }
-    if trimmed.contains(['/', '\\', '\0']) {
+    if name.contains(['/', '\\', '\0']) {
         return Err("The name cannot contain a slash.".into());
     }
     #[cfg(windows)]
-    if trimmed.contains(['<', '>', ':', '"', '|', '?', '*']) {
+    if name.contains(['<', '>', ':', '"', '|', '?', '*']) {
         return Err("The name cannot contain < > : \" | ? *".into());
     }
     #[cfg(windows)]
-    windows_name_check(trimmed)?;
+    windows_name_check(name)?;
     Ok(())
 }
 
-// Windows drops a trailing dot and opens a device for a name such as CON or NUL.txt, so the item would not get the typed name
+// Windows drops a trailing dot or space and opens a device for a name such as CON or NUL.txt, so the item would not get the typed name
 #[cfg(windows)]
 fn windows_name_check(name: &str) -> Result<(), String> {
-    if name.ends_with('.') {
-        return Err("The name cannot end with a dot.".into());
+    if name.ends_with(['.', ' ']) {
+        return Err("The name cannot end with a dot or a space.".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("The name cannot contain a tab or another control character.".into());
     }
     let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
-    let numbered = stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && matches!(stem.as_bytes()[3], b'1'..=b'9');
+    let mut chars = stem.chars();
+    let port = chars.by_ref().take(3).collect::<String>();
+    let numbered = (port == "COM" || port == "LPT") && matches!((chars.next(), chars.next()), (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None));
     if numbered || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str()) {
         return Err(format!("Windows keeps the name \"{stem}\" for a device."));
     }
     Ok(())
 }
 
-pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
-    validate_name(new_name)?;
-    let new_name = new_name.trim();
+// the name stays exactly as given, so OK on an unedited prompt changes nothing
+pub fn rename(path: &Path, new_name: impl AsRef<OsStr>) -> Result<PathBuf, String> {
+    let new_name = new_name.as_ref();
+    validate_name(&new_name.to_string_lossy())?;
     let dest = path.with_file_name(new_name);
+    let new_name = new_name.to_string_lossy();
     let failed = |e: io::Error| format!("Could not rename \"{}\": {}.", display_name(path), reason(&e));
     if dest == path {
         return Ok(dest);
@@ -251,8 +258,8 @@ pub fn display_name(path: &Path) -> String {
 }
 
 pub fn make_dir(parent: &Path, name: &str) -> Result<PathBuf, String> {
-    validate_name(name)?;
     let name = name.trim();
+    validate_name(name)?;
     let dest = parent.join(name);
     fs::create_dir(&dest).map_err(|e| match e.kind() {
         io::ErrorKind::AlreadyExists => format!("\"{name}\" already exists."),
@@ -357,8 +364,8 @@ pub fn reason(e: &io::Error) -> String {
         StorageFull => "the drive is full",
         ReadOnlyFilesystem => "the drive is read only",
         FileTooLarge => "the file is too large for the drive",
-        InvalidFilename => "the name is too long",
-        InvalidInput => "the drive does not accept this name",
+        InvalidFilename if name_too_long(e) => "the name is too long",
+        InvalidFilename | InvalidInput => "the drive does not accept this name",
         DirectoryNotEmpty => "the folder is not empty",
         _ => {
             let raw = e.to_string();
@@ -368,6 +375,17 @@ pub fn reason(e: &io::Error) -> String {
         }
     };
     text.into()
+}
+
+// Windows also reports a name it refuses as an invalid file name, so only the length codes mean too long
+fn name_too_long(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    const CODES: [i32; 1] = [libc::ENAMETOOLONG];
+    #[cfg(windows)]
+    const CODES: [i32; 1] = [206];
+    #[cfg(not(any(unix, windows)))]
+    const CODES: [i32; 0] = [];
+    e.raw_os_error().is_some_and(|code| CODES.contains(&code))
 }
 
 // a broken link still occupies its name, so this check never follows links
@@ -688,7 +706,37 @@ mod tests {
         fs::write(tmp.path().join("b"), "x").unwrap();
         assert!(rename(&a, "x/y").is_err());
         assert!(rename(&a, "b").is_err());
-        assert_eq!(rename(&a, " c ").unwrap(), tmp.path().join("c"));
+        assert!(rename(&a, "   ").is_err());
+        assert_eq!(rename(&a, "c").unwrap(), tmp.path().join("c"));
+    }
+
+    #[test]
+    fn rename_keeps_the_name_exactly_as_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lead = tmp.path().join("  lead.txt");
+        fs::write(&lead, "x").unwrap();
+        assert_eq!(rename(&lead, "  lead.txt"), Ok(lead.clone()), "the same name changes nothing");
+        #[cfg(not(windows))]
+        assert_eq!(rename(&lead, "  trail  "), Ok(tmp.path().join("  trail  ")));
+        #[cfg(windows)]
+        assert!(rename(&lead, "  trail  ").is_err(), "Windows would drop the spaces at the end");
+    }
+
+    // the name text comes back through the same decoding as a path, so an unedited prompt changes nothing
+    #[cfg(unix)]
+    #[test]
+    fn rename_to_the_text_of_its_own_name_changes_nothing() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for raw in [&b"caf\xe8.txt"[..], "pua\u{f741}.txt".as_bytes()] {
+            let item = tmp.path().join(OsStr::from_bytes(raw));
+            fs::write(&item, "x").unwrap();
+            let text = path_to_text(&item);
+            let name = path_from_text(text.rsplit('/').next().unwrap());
+            assert_eq!(rename(&item, &name), Ok(item.clone()));
+            assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+            fs::remove_file(&item).unwrap();
+        }
     }
 
     #[cfg(unix)]
