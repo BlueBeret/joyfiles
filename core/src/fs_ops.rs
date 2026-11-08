@@ -177,6 +177,22 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if trimmed.contains(['<', '>', ':', '"', '|', '?', '*']) {
         return Err("The name cannot contain < > : \" | ? *".into());
     }
+    #[cfg(windows)]
+    windows_name_check(trimmed)?;
+    Ok(())
+}
+
+// Windows drops a trailing dot and opens a device for a name such as CON or NUL.txt, so the item would not get the typed name
+#[cfg(windows)]
+fn windows_name_check(name: &str) -> Result<(), String> {
+    if name.ends_with('.') {
+        return Err("The name cannot end with a dot.".into());
+    }
+    let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    let numbered = stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && matches!(stem.as_bytes()[3], b'1'..=b'9');
+    if numbered || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str()) {
+        return Err(format!("Windows keeps the name \"{stem}\" for a device."));
+    }
     Ok(())
 }
 
@@ -666,6 +682,17 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].path, missing);
         assert_eq!(failures[0].message, "Could not move \"missing\" to the trash: the file or folder does not exist.");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn names_that_windows_would_change_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        for bad in ["x.", "con", "NUL.txt", "com1", "LPT9.log"] {
+            assert!(make_dir(tmp.path(), bad).is_err(), "{bad} is refused");
+        }
+        assert!(names(list_dir(tmp.path(), true, SortKey::Name, false).unwrap()).is_empty());
+        assert!(make_dir(tmp.path(), "console").is_ok());
     }
 
     #[cfg(unix)]
