@@ -411,6 +411,61 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+// removes one item that is not a real folder, and on Windows a folder link needs the folder call
+pub fn remove_item(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if fs::symlink_metadata(path)?.file_type().is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
+    fs::remove_file(path)
+}
+
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        remove_item(path)
+    }
+}
+
+// for a tree the job made or an old item the user chose to replace, a read only folder inside gets write rights first
+pub fn remove_temp_tree(path: &Path) -> io::Result<()> {
+    match remove_tree(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            open_folders(path);
+            remove_tree(path)
+        }
+        done => done,
+    }
+}
+
+// never follows a link, so only folders inside the tree change
+#[cfg(unix)]
+fn open_folders(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&dir) else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(mode | 0o700));
+        }
+        if let Ok(rd) = fs::read_dir(&dir) {
+            pending.extend(rd.filter_map(Result::ok).filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()));
+        }
+    }
+}
+
+// Windows removes a read only item in a tree removal anyway
+#[cfg(not(unix))]
+fn open_folders(_root: &Path) {}
+
 // a drive or a bind mount is the root of a mount, and a move by copy and delete would empty it
 #[cfg(target_os = "linux")]
 pub fn is_mount_point(path: &Path) -> bool {
@@ -444,6 +499,40 @@ fn on_another_drive_than_parent(path: &Path) -> bool {
 #[cfg(not(unix))]
 pub fn is_mount_point(_path: &Path) -> bool {
     false
+}
+
+// a tree removal goes into a mount and empties it, so a folder that holds one is never removed
+#[cfg(target_os = "linux")]
+pub fn holds_mount_point(dir: &Path) -> bool {
+    let (Ok(real), Ok(table)) = (fs::canonicalize(dir), fs::read("/proc/self/mountinfo")) else { return is_mount_point(dir) };
+    table.split(|&b| b == b'\n').filter_map(|line| line.split(|&b| b == b' ').nth(4)).any(|field| unescape_mount_path(field).starts_with(&real))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn holds_mount_point(dir: &Path) -> bool {
+    is_mount_point(dir)
+}
+
+// the mount table writes a space, a tab, a newline and a backslash as a backslash and three octal digits
+#[cfg(target_os = "linux")]
+fn unescape_mount_path(field: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut out = Vec::with_capacity(field.len());
+    let mut i = 0;
+    while i < field.len() {
+        let code = field.get(i + 1..i + 4).and_then(|d| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok());
+        match (field[i], code) {
+            (b'\\', Some(byte)) => {
+                out.push(byte);
+                i += 4;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    PathBuf::from(OsString::from_vec(out))
 }
 
 // true when path is dir itself or lies anywhere below it, whatever links the path text goes through

@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::fs_ops::{Entry, Failure, exists_nofollow, is_mount_point, is_within, reason, same_dir, stat_entry, summary, temp_path, unique_dest};
+use crate::fs_ops::{Entry, Failure, display_name, exists_nofollow, holds_mount_point, is_mount_point, is_within, reason, remove_item, remove_temp_tree, remove_tree, same_dir, stat_entry, summary, temp_path, unique_dest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -268,38 +268,68 @@ impl Worker<'_> {
         Ok(())
     }
 
-    // the new item lands under a staging name first, and each failure path undoes the staging
+    // the old item moves aside and goes only once the new item stands in its place, so a failure before that puts it back
     fn replace(&mut self, src: &Path, target: &Path) -> io::Result<()> {
         if is_real_dir(target) && src.parent().is_some_and(|dir| is_within(dir, target)) {
             return Err(io::Error::other("Cannot replace a folder with something inside it."));
         }
-        let staging = temp_path(target.parent().unwrap_or(Path::new(".")), target.file_name().unwrap_or_default());
-        let renamed = match self.p.kind {
-            JobKind::Move => match fs::rename(src, &staging) {
-                Ok(()) => true,
-                Err(e) => copy_instead_of_rename(src, e).map(|()| false)?,
-            },
-            JobKind::Copy => false,
-        };
-        if !renamed {
-            let failed_before = self.p.failures.lock().unwrap().len();
-            let copied = self.copy_tree(src, &staging, false);
-            if copied.is_err() || self.p.failures.lock().unwrap().len() > failed_before {
-                let _ = remove_tree(&staging);
-                copied?;
-                return Err(io::Error::other("part of it could not be copied, so the old item stays"));
+        if is_real_dir(target) && holds_mount_point(target) {
+            return Err(io::Error::other("it holds a drive or a mount point, so it cannot be replaced"));
+        }
+        let dir = target.parent().unwrap_or(Path::new("."));
+        let name = target.file_name().unwrap_or_default();
+        if self.p.kind == JobKind::Move {
+            let aside = temp_path(dir, name);
+            fs::rename(target, &aside)?;
+            match fs::rename(src, target) {
+                Ok(()) => {
+                    self.p.add_done(tree_size(target));
+                    self.discard(&aside, target);
+                    return Ok(());
+                }
+                Err(e) => {
+                    fs::rename(&aside, target)?;
+                    copy_instead_of_rename(src, e)?;
+                    if is_real_dir(src) && holds_mount_point(src) {
+                        return Err(mount_point_error());
+                    }
+                }
             }
         }
-        if let Err(e) = remove_tree(target).and_then(|()| fs::rename(&staging, target)) {
-            let _ = if renamed { fs::rename(&staging, src) } else { remove_tree(&staging) };
+        let staging = temp_path(dir, name);
+        let failed_before = self.p.failures.lock().unwrap().len();
+        let copied = self.copy_tree(src, &staging, false);
+        if copied.is_err() || self.p.failures.lock().unwrap().len() > failed_before {
+            let _ = remove_temp_tree(&staging);
+            copied?;
+            return Err(io::Error::other("part of it could not be copied, so the old item stays"));
+        }
+        let aside = temp_path(dir, name);
+        if let Err(e) = fs::rename(target, &aside) {
+            let _ = remove_temp_tree(&staging);
             return Err(e);
         }
-        if renamed {
-            self.p.add_done(tree_size(target));
-        } else if self.p.kind == JobKind::Move {
+        if let Err(e) = fs::rename(&staging, target) {
+            let _ = fs::rename(&aside, target);
+            let _ = remove_temp_tree(&staging);
+            return Err(e);
+        }
+        self.discard(&aside, target);
+        if self.p.kind == JobKind::Move {
             remove_tree(src)?;
         }
         Ok(())
+    }
+
+    // what cannot be removed of the old item comes back under a visible name, so it never hides on the drive
+    fn discard(&self, aside: &Path, target: &Path) {
+        let Err(e) = remove_temp_tree(aside) else { return };
+        let dir = target.parent().unwrap_or(Path::new("."));
+        let name = display_name(target);
+        let rest = unique_dest(dir, target.file_name().unwrap_or_default(), is_real_dir(aside));
+        let left = if fs::rename(aside, &rest).is_ok() { rest } else { aside.to_path_buf() };
+        let message = format!("Could not remove all of the old \"{name}\": {}. What is left of it is \"{}\".", reason(&e), display_name(&left));
+        self.p.failures.lock().unwrap().push(Failure { path: left, message });
     }
 
     fn resolve(&mut self, src: &Path, target: &Path) -> io::Result<Resolution> {
@@ -522,18 +552,6 @@ fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
-// removes one item that is not a real folder, and on Windows a folder link needs the folder call
-fn remove_item(path: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileTypeExt;
-        if fs::symlink_metadata(path)?.file_type().is_symlink_dir() {
-            return fs::remove_dir(path);
-        }
-    }
-    fs::remove_file(path)
-}
-
 // the bytes go to a temporary name first, so a crash or an error never leaves a short file under the real name
 fn copy_file(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
     let mut input = File::open(src)?;
@@ -623,14 +641,6 @@ fn copy_sparse(p: &Progress, input: &mut File, output: &mut File, meta: &fs::Met
 #[cfg(not(target_os = "linux"))]
 fn copy_sparse(_p: &Progress, _input: &mut File, _output: &mut File, _meta: &fs::Metadata) -> io::Result<bool> {
     Ok(false)
-}
-
-fn remove_tree(path: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(path)?.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        remove_item(path)
-    }
 }
 
 #[cfg(test)]
@@ -735,7 +745,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_replace_that_cannot_remove_the_old_item_keeps_the_source_and_leaves_no_hidden_item() {
+    fn a_replace_of_an_old_item_with_a_read_only_folder_inside_ends_with_only_the_new_item() {
         use std::os::unix::fs::PermissionsExt;
         let set_mode = |p: &Path, m| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
         for (kind, far) in [(JobKind::Copy, false), (JobKind::Move, false), (JobKind::Move, true)] {
@@ -755,11 +765,10 @@ mod tests {
                 return;
             }
             let p = spawn(kind, vec![src.join("a")], out.clone(), Policy::Always(Resolution::Replace));
-            let JobState::Failed(text) = wait(&p) else { panic!("the replace fails") };
-            assert!(text.contains("\"a\""), "the error names the item: {text}");
-            assert_eq!(read(src.join("a")), "new", "{kind:?} keeps the source");
-            assert_eq!(names_in(&out), ["a"], "no hidden staging item stays");
-            set_mode(&out.join("a/ro"), 0o755);
+            assert_eq!(wait(&p), JobState::Done, "{kind:?} far={far}");
+            assert_eq!(read(out.join("a")), "new");
+            assert_eq!(src.join("a").exists(), kind == JobKind::Copy, "{kind:?} keeps the source only for a copy");
+            assert_eq!(names_in(&out), ["a"], "no hidden item stays");
         }
     }
 
@@ -894,6 +903,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_replace_puts_the_new_item_in_place_before_it_removes_any_of_the_old_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(out.join("a/ro")).unwrap();
+        fs::create_dir(&src).unwrap();
+        fs::write(out.join("a/ro/f"), "x").unwrap();
+        fs::set_permissions(out.join("a/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(out.join("a/g1"), "1").unwrap();
+        fs::write(out.join("a/g2"), "2").unwrap();
+        fs::write(src.join("a"), "NEW").unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join("a")], out.clone(), Policy::Always(Resolution::Replace));
+        let end = wait(&p);
+        if out.join("a").is_dir() {
+            fs::set_permissions(out.join("a/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(names_in(&out.join("a")), ["g1", "g2", "ro"], "a replace that failed keeps the whole old item: {end:?}");
+        } else {
+            assert_eq!(end, JobState::Done);
+            assert_eq!(read(out.join("a")), "NEW");
+        }
+        assert_eq!(names_in(&out), ["a"], "no hidden item stays");
+    }
+
+    #[test]
+    fn a_moved_item_is_never_hidden_while_the_old_one_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(out.join("a")).unwrap();
+        fs::create_dir(&src).unwrap();
+        for i in 0..20000 {
+            fs::write(out.join("a").join(i.to_string()), "").unwrap();
+        }
+        fs::write(src.join("a"), "new").unwrap();
+        let p = spawn(JobKind::Move, vec![src.join("a")], out.clone(), Policy::Always(Resolution::Replace));
+        while exists_nofollow(&src.join("a")) {
+            assert_eq!(p.state(), JobState::Running, "the job is still busy while the source is there");
+        }
+        assert_eq!(fs::read_to_string(out.join("a")).ok().as_deref(), Some("new"), "the moment the source name goes, the new item has its place");
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(names_in(&out), ["a"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_replace_leaves_no_hidden_folder_even_with_a_read_only_folder_inside() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(src.join("d/ro")).unwrap();
+        fs::create_dir(&out).unwrap();
+        fs::write(src.join("d/ro/f"), "f").unwrap();
+        fs::set_permissions(src.join("d/ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::write(out.join("d"), "old file").unwrap();
+        let Some(()) = unreadable(&src.join("d/bad")) else { return };
+        let p = spawn(JobKind::Copy, vec![src.join("d")], out.clone(), Policy::Always(Resolution::Replace));
+        assert!(matches!(wait(&p), JobState::Failed(_)));
+        assert_eq!(read(out.join("d")), "old file");
+        assert_eq!(names_in(&out), ["d"], "the staging folder is gone");
+        fs::set_permissions(src.join("d/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_move_that_cannot_take_the_item_away_copies_nothing() {
         use std::os::unix::fs::PermissionsExt;
         let set_mode = |p: &Path, m| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
@@ -971,6 +1043,15 @@ mod tests {
         assert_eq!(names_in(&far.join("x")), ["f"]);
         assert_eq!(names_in(&data), ["p1", "sub"]);
         assert_eq!(read(drive.join("d")), "on the drive");
+        fs::write(base.join("x2"), "plain file").unwrap();
+        fs::create_dir(out.join("x")).unwrap();
+        fs::rename(&x, out.join("x2")).unwrap();
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let p = spawn(kind, vec![base.join("x2")], out.clone(), Policy::Always(Resolution::Replace));
+            assert!(matches!(wait(&p), JobState::Failed(_)), "{kind:?} does not replace a folder that holds a mount");
+            assert_eq!(names_in(&data), ["p1", "sub"], "the mounted folder keeps its content");
+            assert_eq!(names_in(&out.join("x2")), ["m"], "the old folder stays whole");
+        }
     }
 
     #[cfg(unix)]
