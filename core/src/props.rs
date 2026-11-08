@@ -1,9 +1,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::fs_ops::{reason, stat_entry, type_label};
 
@@ -43,15 +44,33 @@ pub struct SizeScan {
     pub folders: AtomicU64,
     pub done: AtomicBool,
     pub cancel: AtomicBool,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl SizeScan {
+    // returns false when the scan still runs at the deadline
+    pub fn wait_finished(&self, deadline: Instant) -> bool {
+        while !self.done.load(Ordering::Relaxed) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(handle) = self.thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        true
+    }
 }
 
 pub fn spawn_size_scan(path: PathBuf) -> Arc<SizeScan> {
     let scan = Arc::new(SizeScan::default());
     let worker = Arc::clone(&scan);
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         scan_tree(&worker, &path);
         worker.done.store(true, Ordering::Relaxed);
     });
+    *scan.thread.lock().unwrap() = Some(handle);
     scan
 }
 

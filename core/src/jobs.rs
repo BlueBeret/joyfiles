@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::fs_ops::{Entry, Failure, exists_nofollow, summary, is_within, reason, same_dir, stat_entry, temp_path, unique_dest};
 
@@ -70,11 +71,26 @@ pub struct Progress {
     failures: Mutex<Vec<Failure>>,
     gate: Mutex<Gate>,
     wake: Condvar,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Progress {
     pub fn state(&self) -> JobState {
         self.state.lock().unwrap().clone()
+    }
+
+    // returns false when the worker still runs at the deadline, for example on a drive that stopped answering
+    pub fn wait_finished(&self, deadline: Instant) -> bool {
+        while self.state() == JobState::Running {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(handle) = self.thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        true
     }
 
     pub fn failures(&self) -> Vec<Failure> {
@@ -134,9 +150,10 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
         failures: Mutex::new(Vec::new()),
         gate: Mutex::new(Gate::default()),
         wake: Condvar::new(),
+        thread: Mutex::new(None),
     });
     let worker = Arc::clone(&progress);
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let end = match run(&worker, &sources, &dest_dir, policy) {
             Ok(()) => summary(&worker.failures()).map_or(JobState::Done, JobState::Failed),
             Err(_) if worker.cancel.load(Ordering::Relaxed) => JobState::Cancelled,
@@ -144,6 +161,7 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
         };
         *worker.state.lock().unwrap() = end;
     });
+    *progress.thread.lock().unwrap() = Some(handle);
     progress
 }
 
@@ -669,6 +687,22 @@ mod tests {
         assert_eq!(read(out.join("ro/f.txt")), "f");
         fs::set_permissions(out.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_job_cancelled_midway_leaves_nothing_once_its_worker_has_finished() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("big.bin"), vec![0u8; 64 << 20]).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![tmp.path().join("big.bin")], out.clone(), ASK);
+        while p.done_bytes.load(Ordering::Relaxed) == 0 && p.state() == JobState::Running {
+            thread::yield_now();
+        }
+        p.request_cancel();
+        assert!(p.wait_finished(Instant::now() + Duration::from_secs(10)));
+        assert_eq!(p.state(), JobState::Cancelled);
+        assert!(names_in(&out).is_empty(), "the temporary file is gone");
     }
 
     #[test]

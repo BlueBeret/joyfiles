@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use godot::prelude::*;
 
@@ -27,6 +28,25 @@ pub struct JoyCore {
     next_job: i64,
     scans: HashMap<i64, Arc<SizeScan>>,
     next_scan: i64,
+}
+
+// a worker thread runs code from this library, so it must end before Godot unloads the library at exit
+impl Drop for JoyCore {
+    fn drop(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for p in self.jobs.values() {
+            p.request_cancel();
+        }
+        for s in self.scans.values() {
+            s.cancel.store(true, Ordering::Relaxed);
+        }
+        for p in self.jobs.values() {
+            p.wait_finished(deadline);
+        }
+        for s in self.scans.values() {
+            s.wait_finished(deadline);
+        }
+    }
 }
 
 // every path crosses the binding in this form, so a name that is not valid text still names one file
