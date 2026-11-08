@@ -177,6 +177,8 @@ struct Worker<'a> {
     tasks: Vec<Task>,
     unsettled: Vec<Unsettled>,
     unsettled_bytes: u64,
+    // merged source folders of a move, removed after the last batch settled
+    merged: Vec<PathBuf>,
     // what this job placed, so a later item with a name that clashes on a drive that ignores case never replaces it
     created: HashSet<ItemKey>,
 }
@@ -229,8 +231,8 @@ const SETTLE_BYTES: u64 = 512 << 20;
 
 enum Task {
     Transfer { src: PathBuf, dest_dir: PathBuf },
-    // the merged folder takes the rights and times of the source, and a move removes the source once its children are gone
-    EndMerge { src: PathBuf, target: PathBuf, meta: fs::Metadata },
+    // a move removes a merged source folder once its children are gone
+    EndMerge(PathBuf),
 }
 
 fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner: Owner) -> io::Result<()> {
@@ -250,27 +252,41 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, created: HashSet::new() };
-    while let Some(task) = worker.tasks.pop() {
-        match task {
-            Task::Transfer { src, dest_dir } => {
-                if let Err(e) = worker.transfer(&src, &dest_dir) {
-                    worker.fail(&src, &e)?;
-                }
-            }
-            Task::EndMerge { src, target, meta } => {
-                keep_metadata(&target, &meta);
-                if p.kind == JobKind::Move {
-                    // the folder stays when a child was skipped
-                    let _ = fs::remove_dir(src);
-                }
-            }
-        }
-    }
-    Ok(())
+    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new() };
+    let result = worker.run_tasks();
+    worker.finish();
+    result
 }
 
 impl Worker<'_> {
+    fn run_tasks(&mut self) -> io::Result<()> {
+        while let Some(task) = self.tasks.pop() {
+            match task {
+                Task::Transfer { src, dest_dir } => {
+                    if let Err(e) = self.transfer(&src, &dest_dir) {
+                        self.fail(&src, &e)?;
+                    }
+                }
+                Task::EndMerge(src) => self.merged.push(src),
+            }
+            if self.unsettled.len() >= SETTLE_ITEMS || self.unsettled_bytes >= SETTLE_BYTES {
+                self.settle(Copying::Moving);
+            }
+        }
+        Ok(())
+    }
+
+    // one settle covers the items of all top level items, and a merged folder goes only once its children are gone
+    fn finish(&mut self) {
+        if !self.unsettled.is_empty() {
+            self.settle(Copying::Moving);
+        }
+        for src in std::mem::take(&mut self.merged) {
+            // the folder stays when a child was skipped
+            let _ = fs::remove_dir(src);
+        }
+    }
+
     // records the error and lets the job go on, unless the user cancelled
     fn fail(&self, path: &Path, err: &io::Error) -> io::Result<()> {
         if self.p.cancel.load(Ordering::Relaxed) {
@@ -373,9 +389,11 @@ impl Worker<'_> {
 
     // two folders with one name join, and only files that clash are asked about
     fn merge(&mut self, src: &Path, target: &Path) -> io::Result<()> {
-        let meta = fs::symlink_metadata(src)?;
+        if self.p.kind == JobKind::Move && is_mount_point(src) {
+            return Err(mount_point_error());
+        }
         let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
-        self.tasks.push(Task::EndMerge { src: src.to_path_buf(), target: target.to_path_buf(), meta });
+        self.tasks.push(Task::EndMerge(src.to_path_buf()));
         for entry in children.into_iter().rev() {
             self.tasks.push(Task::Transfer { src: entry.path(), dest_dir: target.to_path_buf() });
         }
@@ -405,6 +423,10 @@ impl Worker<'_> {
                 }
             }
         }
+        // a staged copy settles on its own, so the open batch of a move settles first and keeps its meaning
+        if !self.unsettled.is_empty() {
+            self.settle(Copying::Moving);
+        }
         let staging = temp_beside(target, self.owner, Role::Part);
         let failed_before = self.p.failures.lock().unwrap().len();
         let copied = self.copy_tree(src, &staging, Copying::Durable);
@@ -426,17 +448,23 @@ impl Worker<'_> {
 
     // the old item moves aside, the new one takes its name, and the old one goes only once that name is on the drive
     fn swap_in(&self, new: &Path, target: &Path) -> io::Result<()> {
-        let aside = temp_beside(target, self.owner, Role::Old);
-        fs::rename(target, &aside)?;
+        let aside = parts::park_path(target.parent().unwrap_or(Path::new(".")), target.file_name().unwrap_or_default(), self.owner)?;
+        let done = self.swap_with(new, target, &aside);
+        parts::clear_hold(&aside, target);
+        done
+    }
+
+    fn swap_with(&self, new: &Path, target: &Path, aside: &Path) -> io::Result<()> {
+        fs::rename(target, aside)?;
         if let Err(e) = rename_noreplace(new, target) {
-            if let Err(back) = rename_noreplace(&aside, target) {
-                self.surface(&aside, target, "Could not put back the old", &back);
+            if let Err(back) = rename_noreplace(aside, target) {
+                self.surface(aside, target, "Could not put back the old", &back);
             }
             return Err(e);
         }
         let dir = target.parent().unwrap_or(Path::new("."));
-        if let Err(e) = sync_dir(dir).and_then(|()| remove_temp_tree(&aside)) {
-            self.surface(&aside, target, "Could not remove all of the old", &e);
+        if let Err(e) = sync_dir(dir).and_then(|()| remove_temp_tree(aside)) {
+            self.surface(aside, target, "Could not remove all of the old", &e);
         }
         Ok(())
     }
@@ -484,7 +512,11 @@ impl Worker<'_> {
                 let other = unique_dest(dest.parent().unwrap_or(Path::new(".")), dest.file_name().unwrap_or_default(), false);
                 rename_noreplace(part, &other).map(|()| Some(other))
             }
-            Resolution::Replace => self.swap_in(part, dest).map(|()| Some(dest.to_path_buf())),
+            Resolution::Replace => {
+                // a plain copy never synced its part, and the old item goes right after the swap
+                fs::OpenOptions::new().write(true).open(part).and_then(|f| f.sync_all())?;
+                self.swap_in(part, dest).map(|()| Some(dest.to_path_buf()))
+            }
         }
     }
 
@@ -527,7 +559,10 @@ impl Worker<'_> {
     fn copy_tree(&mut self, src: &Path, dest: &Path, how: Copying) -> io::Result<()> {
         let mut pending = vec![Step::Copy(src.to_path_buf(), dest.to_path_buf())];
         let result = self.run_steps(&mut pending, how);
-        self.settle(how);
+        // a move leaves its batch open, so the next top level item joins it
+        if how != Copying::Moving {
+            self.settle(how);
+        }
         // a cancel still gives each folder made so far the rights and times of its source
         for step in pending.into_iter().rev() {
             if let Step::Close { dest, meta, .. } = step {
@@ -572,6 +607,7 @@ impl Worker<'_> {
             }
         } else if meta.file_type().is_symlink() {
             copy_symlink(src, dest)?;
+            keep_link_times(dest, &meta);
             self.record(dest);
             self.p.add_done(meta.len());
             if how != Copying::Plain {
@@ -611,11 +647,21 @@ fn mount_point_error() -> io::Error {
 #[cfg(all(test, unix))]
 const SYNC_FAILS: &str = "sync-fails-here";
 
+#[cfg(all(test, unix))]
+const SYNC_COUNTED: &str = "sync-counted-here";
+
+#[cfg(all(test, unix))]
+static SYNC_CALLS: Mutex<std::collections::BTreeMap<PathBuf, usize>> = Mutex::new(std::collections::BTreeMap::new());
+
 #[cfg(unix)]
 fn refused_in_tests(_dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     if _dir.components().any(|c| c.as_os_str() == SYNC_FAILS) {
         return Err(io::Error::other("the drive did not confirm the write"));
+    }
+    #[cfg(test)]
+    if _dir.components().any(|c| c.as_os_str() == SYNC_COUNTED) {
+        *SYNC_CALLS.lock().unwrap().entry(_dir.to_path_buf()).or_default() += 1;
     }
     Ok(())
 }
@@ -625,17 +671,34 @@ const SYNC_EACH_FILE: bool = !cfg!(target_os = "linux");
 
 #[cfg(target_os = "linux")]
 fn sync_drives(dirs: &BTreeSet<PathBuf>, _names: bool) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     let mut synced = BTreeSet::new();
     for dir in dirs {
         refused_in_tests(dir)?;
-        let folder = File::open(dir)?;
-        if synced.insert(folder.metadata()?.dev()) && unsafe { libc::syncfs(folder.as_raw_fd()) } != 0 {
-            return Err(io::Error::last_os_error());
+        let dev = fs::metadata(dir)?.dev();
+        if synced.insert(dev) {
+            syncfs_near(dir)?;
         }
     }
     Ok(())
+}
+
+// a folder without read rights cannot be opened, so the nearest folder above it on the same drive stands in
+#[cfg(target_os = "linux")]
+fn syncfs_near(dir: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let dev = fs::metadata(dir)?.dev();
+    let mut denied = None;
+    for above in dir.ancestors().take_while(|a| fs::metadata(a).is_ok_and(|m| m.dev() == dev)) {
+        match File::open(above) {
+            Ok(folder) if unsafe { libc::syncfs(folder.as_raw_fd()) } == 0 => return Ok(()),
+            Ok(_) => return Err(io::Error::last_os_error()),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => denied = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(denied.unwrap_or_else(|| io::Error::from(io::ErrorKind::NotFound)))
 }
 
 // each file was synced as it was written, so only the folders that got new names remain
@@ -653,6 +716,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     refused_in_tests(dir)?;
     match File::open(dir).and_then(|f| f.sync_all()) {
         Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
+        #[cfg(target_os = "linux")]
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => syncfs_near(dir),
         done => done,
     }
 }
@@ -711,6 +776,21 @@ fn create_private_file(path: &Path, meta: &fs::Metadata) -> io::Result<File> {
 fn create_private_file(path: &Path, _meta: &fs::Metadata) -> io::Result<File> {
     File::create_new(path)
 }
+
+// the link itself gets the times, never the item it points to
+#[cfg(unix)]
+fn keep_link_times(dest: &Path, meta: &fs::Metadata) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(path) = std::ffi::CString::new(dest.as_os_str().as_bytes()) else { return };
+    let stamp = |secs: i64, nanos: i64| libc::timespec { tv_sec: secs as libc::time_t, tv_nsec: nanos as libc::c_long };
+    let times = [stamp(meta.atime(), meta.atime_nsec()), stamp(meta.mtime(), meta.mtime_nsec())];
+    unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+}
+
+// the new link keeps its creation time on Windows
+#[cfg(not(unix))]
+fn keep_link_times(_dest: &Path, _meta: &fs::Metadata) {}
 
 fn file_times(meta: &fs::Metadata) -> io::Result<fs::FileTimes> {
     let times = fs::FileTimes::new().set_modified(meta.modified()?);
@@ -1395,24 +1475,121 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_merge_gives_the_folder_the_rights_and_times_of_the_source() {
+    fn a_merge_leaves_the_rights_and_the_time_of_the_existing_folder_alone() {
         use std::os::unix::fs::PermissionsExt;
         for kind in [JobKind::Copy, JobKind::Move] {
             let tmp = tempfile::tempdir().unwrap();
             let src = tmp.path().join("src/d");
             fs::create_dir_all(&src).unwrap();
             fs::write(src.join("f"), "f").unwrap();
-            File::open(&src).unwrap().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_577_934_245)).unwrap();
+            let long_ago = std::time::UNIX_EPOCH + Duration::from_secs(1_577_934_245);
+            File::open(&src).unwrap().set_modified(long_ago).unwrap();
             fs::set_permissions(&src, fs::Permissions::from_mode(0o700)).unwrap();
-            let want = mode_and_mtime(&src);
             let out = tmp.path().join("out");
             fs::create_dir_all(out.join("d")).unwrap();
             fs::set_permissions(out.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
             let p = spawn(kind, vec![src.clone()], out.clone(), ASK);
             assert_eq!(wait(&p), JobState::Done);
-            assert_eq!(mode_and_mtime(&out.join("d")), want, "{kind:?}");
+            let (mode, time) = mode_and_mtime(&out.join("d"));
+            assert_eq!(mode, 0o755, "{kind:?} keeps the mode of the target");
+            assert!(time > long_ago, "{kind:?} keeps the date of the target");
             assert_eq!(read(out.join("d/f")), "f");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_move_by_merge_refuses_a_mount_root_and_keeps_its_files() {
+        use crate::fs_ops::FAKE_MOUNT;
+        let tmp = tempfile::tempdir().unwrap();
+        let card = tmp.path().join("src").join(FAKE_MOUNT);
+        fs::create_dir_all(&card).unwrap();
+        fs::write(card.join("photo.jpg"), "precious").unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir_all(out.join(FAKE_MOUNT)).unwrap();
+        let p = spawn(JobKind::Move, vec![card.clone()], out.clone(), ASK);
+        let JobState::Failed(text) = wait(&p) else { panic!("the move is refused") };
+        assert!(text.contains("a drive or a mount point"), "{text}");
+        assert_eq!(read(card.join("photo.jpg")), "precious");
+        assert!(names_in(&out.join(FAKE_MOUNT)).is_empty(), "nothing leaves the mount");
+        let p = spawn(JobKind::Copy, vec![card.clone()], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done, "a copy of a mount root stays allowed");
+        assert_eq!(read(out.join(FAKE_MOUNT).join("photo.jpg")), "precious");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_gives_a_link_the_date_of_the_source_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        std::os::unix::fs::symlink("target", src.join("lnk")).unwrap();
+        let old = std::ffi::CString::new(src.join("lnk").to_string_lossy().as_bytes()).unwrap();
+        let stamp = libc::timespec { tv_sec: 1_577_934_245, tv_nsec: 0 };
+        let set = unsafe { libc::utimensat(libc::AT_FDCWD, old.as_ptr(), [stamp, stamp].as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        assert_eq!(set, 0);
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.clone()], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        let time = |p: &Path| fs::symlink_metadata(p).unwrap().modified().unwrap();
+        assert_eq!(time(&out.join("src/lnk")), time(&src.join("lnk")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_to_another_drive_works_into_a_folder_without_read_rights() {
+        use std::os::unix::fs::PermissionsExt;
+        let here = tempfile::tempdir().unwrap();
+        let Some(there) = other_drive(here.path()) else { return };
+        let drop = there.path().join("drop");
+        fs::create_dir(&drop).unwrap();
+        fs::set_permissions(&drop, fs::Permissions::from_mode(0o300)).unwrap();
+        fs::write(here.path().join("f.txt"), "data").unwrap();
+        let p = spawn(JobKind::Move, vec![here.path().join("f.txt")], drop.clone(), ASK);
+        let state = wait(&p);
+        fs::set_permissions(&drop, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(state, JobState::Done);
+        assert_eq!(read(drop.join("f.txt")), "data");
+        assert!(!here.path().join("f.txt").exists());
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn a_move_across_drives_syncs_once_for_many_top_level_items() {
+        let here = tempfile::tempdir().unwrap();
+        let Some(there) = other_drive(here.path()) else { return };
+        let out = there.path().join(SYNC_COUNTED);
+        fs::create_dir(&out).unwrap();
+        let list: Vec<PathBuf> = (0..60)
+            .map(|i| {
+                let file = here.path().join(format!("f{i}.txt"));
+                fs::write(&file, format!("data {i}")).unwrap();
+                file
+            })
+            .collect();
+        let p = spawn(JobKind::Move, list, out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 60);
+        assert!(fs::read_dir(here.path()).unwrap().next().is_none(), "every source went after its copy");
+        let calls = SYNC_CALLS.lock().unwrap().get(&out).copied().unwrap_or(0);
+        assert!((1..=4).contains(&calls), "the drive was synced {calls} times");
+    }
+
+    #[test]
+    fn a_replace_of_a_file_with_the_longest_name_keeps_the_name_and_leaves_no_hidden_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = format!("{}.txt", "n".repeat(251));
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join(&name), "new").unwrap();
+        fs::write(out.join(&name), "old").unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join(&name)], out.clone(), Policy::Always(Resolution::Replace));
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(names_in(&out), [name.clone()]);
+        assert_eq!(read(out.join(&name)), "new");
     }
 
     #[cfg(target_os = "linux")]

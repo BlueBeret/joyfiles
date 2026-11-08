@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,6 +50,14 @@ impl Owner {
         }
         self.job == 0 || LIVE.lock().unwrap().contains(&self.job)
     }
+
+    // true only when a check proves the owner ended, and a system with no cheap check never proves it
+    fn has_ended(self) -> bool {
+        if self.pid != std::process::id() {
+            return cfg!(target_os = "linux") && !process_alive(self.pid);
+        }
+        !self.is_live()
+    }
 }
 
 static LIVE: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
@@ -80,7 +89,7 @@ impl Drop for LiveJob {
 pub fn temp_path(dir: &Path, name: &OsStr, owner: Owner, role: Role) -> PathBuf {
     (1u64..)
         .map(|n| {
-            let tag = format!(".{}-{}-{n}{}", owner.pid, owner.job, role.suffix());
+            let tag = tag(owner, role, n);
             let mut temp = OsString::from(".");
             temp.push(truncate(name, NAME_MAX - 1 - tag.len()));
             temp.push(tag);
@@ -88,6 +97,38 @@ pub fn temp_path(dir: &Path, name: &OsStr, owner: Owner, role: Role) -> PathBuf 
         })
         .find(|p| !exists_nofollow(p))
         .expect("an unused name exists")
+}
+
+fn tag(owner: Owner, role: Role, n: u64) -> String {
+    format!(".{}-{}-{n}{}", owner.pid, owner.job, role.suffix())
+}
+
+// the old item keeps its whole name, so a name too long for the tag goes into a hidden folder with a short name
+pub fn park_path(dir: &Path, name: &OsStr, owner: Owner) -> io::Result<PathBuf> {
+    let room = |n| 1 + name.len() + tag(owner, Role::Old, n).len() <= NAME_MAX;
+    for n in (1u64..).take_while(|&n| room(n)) {
+        let whole = temp_path_numbered(dir, name, owner, n);
+        if !exists_nofollow(&whole) {
+            return Ok(whole);
+        }
+    }
+    let hold = temp_path(dir, OsStr::new(""), owner, Role::Old);
+    fs::create_dir(&hold)?;
+    Ok(hold.join(name))
+}
+
+// the hidden folder of a long name goes once its item left, and it stays when something else is inside
+pub fn clear_hold(parked: &Path, home: &Path) {
+    if let Some(hold) = parked.parent().filter(|hold| Some(*hold) != home.parent()) {
+        let _ = fs::remove_dir(hold);
+    }
+}
+
+fn temp_path_numbered(dir: &Path, name: &OsStr, owner: Owner, n: u64) -> PathBuf {
+    let mut temp = OsString::from(".");
+    temp.push(name);
+    temp.push(tag(owner, Role::Old, n));
+    dir.join(temp)
 }
 
 struct TempName {
@@ -141,9 +182,13 @@ fn process_alive(_pid: u32) -> bool {
     false
 }
 
-fn is_stale(path: &Path, owner: Option<Owner>, min_age: Duration) -> bool {
+// an old item is user data that waits for a replace, so an owner that ended frees it at once, whatever the date of the data
+fn is_stale(path: &Path, owner: Option<Owner>, role: Role, min_age: Duration) -> bool {
     if owner.is_some_and(Owner::is_live) {
         return false;
+    }
+    if role == Role::Old && owner.is_some_and(Owner::has_ended) {
+        return true;
     }
     let changed = fs::symlink_metadata(path).and_then(|m| m.modified());
     changed.is_ok_and(|at| SystemTime::now().duration_since(at).is_ok_and(|age| age >= min_age))
@@ -158,7 +203,11 @@ pub fn sweep(dir: &Path, min_age: Duration, stop: &AtomicBool) {
         }
         let Some(temp) = parse(&entry.file_name()) else { continue };
         let path = entry.path();
-        if !is_stale(&path, temp.owner, min_age) || (entry.file_type().is_ok_and(|t| t.is_dir()) && holds_mount_point(&path)) {
+        if !is_stale(&path, temp.owner, temp.role, min_age) || (entry.file_type().is_ok_and(|t| t.is_dir()) && holds_mount_point(&path)) {
+            continue;
+        }
+        if temp.role == Role::Old && temp.owner.is_some() && temp.stem.is_empty() {
+            release_hold(&path, dir);
             continue;
         }
         let home = dir.join(&temp.stem);
@@ -167,6 +216,17 @@ pub fn sweep(dir: &Path, min_age: Duration, stop: &AtomicBool) {
             let _ = remove_temp_tree(&path);
         }
     }
+}
+
+// the item inside gets its name back, or goes when a new item took that name
+fn release_hold(hold: &Path, dir: &Path) {
+    let Ok(inside) = fs::read_dir(hold) else { return };
+    for entry in inside.filter_map(Result::ok) {
+        if rename_noreplace(&entry.path(), &dir.join(entry.file_name())).is_err() {
+            let _ = remove_temp_tree(&entry.path());
+        }
+    }
+    let _ = fs::remove_dir(hold);
 }
 
 #[cfg(test)]
@@ -242,5 +302,42 @@ mod tests {
         assert_eq!(names_in(dir), want);
         assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "old data", "the parked item got its name back");
         assert_eq!(fs::read_to_string(dir.join("taken.txt")).unwrap(), "new data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_gives_a_parked_item_with_the_longest_name_its_whole_name_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let ended = LiveJob::start().owner();
+        let long = "n".repeat(251) + ".txt";
+        for name in [long.as_str(), "short.txt"] {
+            fs::write(dir.join(name), "old data").unwrap();
+            let parked = park_path(dir, OsStr::new(name), ended).unwrap();
+            let top = parked.strip_prefix(dir).unwrap().components().next().unwrap().as_os_str().to_owned();
+            assert!(is_temp_name(&top), "the list never shows the parked item");
+            fs::rename(dir.join(name), &parked).unwrap();
+        }
+        sweep(dir, SAFE_AGE, &AtomicBool::new(false));
+        let mut want = vec![long.clone(), "short.txt".to_string()];
+        want.sort();
+        assert_eq!(names_in(dir), want);
+        assert_eq!(fs::read_to_string(dir.join(&long)).unwrap(), "old data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_frees_an_old_item_of_an_ended_job_at_once_and_keeps_that_of_a_live_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = LiveJob::start();
+        let ended = LiveJob::start().owner();
+        let gone = temp_path(dir, OsStr::new("edited.txt"), ended, Role::Old);
+        let kept = temp_path(dir, OsStr::new("busy.txt"), live.owner(), Role::Old);
+        fs::write(&gone, "edited a minute ago").unwrap();
+        fs::write(&kept, "x").unwrap();
+        sweep(dir, SAFE_AGE, &AtomicBool::new(false));
+        assert_eq!(fs::read_to_string(dir.join("edited.txt")).unwrap(), "edited a minute ago");
+        assert!(kept.exists(), "the live job keeps its old item");
     }
 }

@@ -221,12 +221,13 @@ pub fn rename(path: &Path, new_name: impl AsRef<OsStr>) -> Result<PathBuf, Strin
             return Err(format!("\"{new_name}\" already exists."));
         }
         // a drive that ignores case treats a direct rename to the new case as a rename that changes nothing
-        let temp = parts::temp_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default(), parts::Owner::rename(), parts::Role::Old);
-        fs::rename(path, &temp).map_err(failed)?;
-        if let Err(e) = fs::rename(&temp, &dest) {
+        let temp = parts::park_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default(), parts::Owner::rename()).map_err(failed)?;
+        let moved = fs::rename(path, &temp).and_then(|()| fs::rename(&temp, &dest));
+        if moved.is_err() && exists_nofollow(&temp) {
             let _ = fs::rename(&temp, path);
-            return Err(failed(e));
         }
+        parts::clear_hold(&temp, path);
+        moved.map_err(failed)?;
         return Ok(dest);
     }
     fs::rename(path, &dest).map_err(failed)?;
@@ -338,11 +339,25 @@ pub fn trash_items(paths: &[PathBuf]) -> Vec<Failure> {
     paths
         .iter()
         .filter_map(|path| {
-            let e = trash::delete(path).err()?;
-            let message = format!("Could not move \"{}\" to the trash: {}.", display_name(path), trash_reason(&e));
+            let why = match trash_refusal(path) {
+                Some(why) => why.to_string(),
+                None => trash_reason(&trash::delete(path).err()?),
+            };
+            let message = format!("Could not move \"{}\" to the trash: {why}.", display_name(path));
             Some(Failure { path: path.clone(), message })
         })
         .collect()
+}
+
+// the trash copies a folder it cannot rename, and a mount root would copy into itself or empty a drive
+fn trash_refusal(path: &Path) -> Option<&'static str> {
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    if is_mount_point(path) {
+        return Some("it is a drive or a mount point, so it cannot go to the trash");
+    }
+    holds_mount_point(path).then_some("it holds a drive or a mount point, so it cannot go to the trash")
 }
 
 // the Display text of a trash error is a debug dump, so the reason comes from the variant
@@ -527,10 +542,18 @@ fn open_folders(root: &Path) {
 #[cfg(not(unix))]
 fn open_folders(_root: &Path) {}
 
+// tests cannot mount, so a folder with this name counts as a mount root
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) const FAKE_MOUNT: &str = "fake-mount-root";
+
 // a drive or a bind mount is the root of a mount, and a move by copy and delete would empty it
 #[cfg(target_os = "linux")]
 pub fn is_mount_point(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    if path.file_name().is_some_and(|name| name == FAKE_MOUNT) {
+        return true;
+    }
     let Ok(text) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
     let mut info: libc::statx = unsafe { std::mem::zeroed() };
     let found = unsafe { libc::statx(libc::AT_FDCWD, text.as_ptr(), libc::AT_SYMLINK_NOFOLLOW, 0, &mut info) } == 0;
@@ -598,7 +621,45 @@ fn unescape_mount_path(field: &[u8]) -> PathBuf {
 
 // true when path is dir itself or lies anywhere below it, whatever links the path text goes through
 pub fn is_within(path: &Path, dir: &Path) -> bool {
-    fs::canonicalize(path).is_ok_and(|real| real.ancestors().any(|a| same_dir(a, dir)))
+    let Ok(real) = fs::canonicalize(path) else { return false };
+    real.ancestors().any(|a| same_dir(a, dir)) || inside_by_mounts(&real, dir)
+}
+
+// a bind mount of a folder below dir has another path chain, so the place in the drive decides
+#[cfg(target_os = "linux")]
+fn inside_by_mounts(real: &Path, dir: &Path) -> bool {
+    let (Ok(table), Ok(dir)) = (fs::read("/proc/self/mountinfo"), fs::canonicalize(dir)) else { return false };
+    inside_by_table(&table, real, &dir)
+}
+
+#[cfg(target_os = "linux")]
+fn inside_by_table(table: &[u8], real: &Path, dir: &Path) -> bool {
+    match (drive_place(table, real), drive_place(table, dir)) {
+        (Some((drive, spot)), Some((other, base))) => drive == other && spot.starts_with(base),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn inside_by_mounts(_real: &Path, _dir: &Path) -> bool {
+    false
+}
+
+// the drive and the path inside it, found from the deepest mount above the path
+#[cfg(target_os = "linux")]
+fn drive_place(table: &[u8], real: &Path) -> Option<(Vec<u8>, PathBuf)> {
+    let mut best: Option<(usize, Vec<u8>, PathBuf)> = None;
+    for line in table.split(|&b| b == b'\n') {
+        let mut fields = line.split(|&b| b == b' ').skip(2);
+        let (Some(drive), Some(root), Some(at)) = (fields.next(), fields.next(), fields.next()) else { continue };
+        let at = unescape_mount_path(at);
+        let Ok(rest) = real.strip_prefix(&at) else { continue };
+        let depth = at.components().count();
+        if best.as_ref().is_none_or(|(d, ..)| depth >= *d) {
+            best = Some((depth, drive.to_vec(), unescape_mount_path(root).join(rest)));
+        }
+    }
+    best.map(|(_, drive, spot)| (drive, spot))
 }
 
 // most drives allow 255 bytes in one name
@@ -1009,5 +1070,30 @@ mod tests {
         assert_eq!(read_to(&upper), "x");
         assert_eq!(rename(&upper, "B.txt"), Err("\"B.txt\" already exists.".into()), "another file that differs in case stays");
         assert_eq!(read_to(&tmp.path().join("b.txt")), "y");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_trash_call_refuses_a_mount_root_and_a_folder_that_holds_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(FAKE_MOUNT);
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("keep.txt"), "x").unwrap();
+        let failures = trash_items(&[root.clone()]);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].message.contains("a drive or a mount point"), "{}", failures[0].message);
+        assert_eq!(fs::read_to_string(root.join("keep.txt")).unwrap(), "x");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bind_mount_of_a_folder_below_a_folder_counts_as_inside_it() {
+        let table = b"30 1 0:25 / /t/tm rw - tmpfs none rw\n31 30 0:25 /src/sub /t/out rw - tmpfs none rw\n32 1 0:26 / /t/other rw - tmpfs none rw\n";
+        let inside = |real: &str, dir: &str| inside_by_table(table, Path::new(real), Path::new(dir));
+        assert!(inside("/t/out", "/t/tm/src"), "a bind mount of src/sub lies inside src");
+        assert!(inside("/t/out/deeper", "/t/tm/src/sub"));
+        assert!(!inside("/t/out", "/t/tm/elsewhere"), "another folder of the same drive");
+        assert!(!inside("/t/out", "/t/other/src"), "another drive");
+        assert!(!inside("/t/tm/src", "/t/out"), "the parent is not inside the bind mount");
     }
 }
