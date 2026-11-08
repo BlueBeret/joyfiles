@@ -64,8 +64,8 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
     }
 }
 
-// the raw name breaks ties last, so names that differ only in case keep a fixed order
-fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String, String) {
+// the raw name bytes break ties last, so names that differ only in case or in bytes that are not text keep a fixed order
+fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String, OsString) {
     let (number, kind) = match key {
         SortKey::Name => (0, String::new()),
         SortKey::Size => (e.size as i64, String::new()),
@@ -73,7 +73,7 @@ fn sort_key(e: &Entry, key: SortKey) -> (bool, i64, String, String, String) {
         SortKey::Type if e.is_dir => (0, String::new()),
         SortKey::Type => (0, extension_of(&e.name)),
     };
-    (!e.is_dir, number, kind, natural_key(&e.name), e.name.clone())
+    (!e.is_dir, number, kind, natural_key(&e.name), e.path.file_name().unwrap_or(e.path.as_os_str()).to_owned())
 }
 
 // a run of digits becomes a zero mark, its length and its digits, so "Level 2" sorts before "Level 10"
@@ -548,6 +548,24 @@ mod tests {
         let odd = tmp.path().join("plain \u{f701} name");
         assert_eq!(path_from_text(&path_to_text(&odd)), odd);
         assert_eq!(path_to_text(&tmp.path().join("héllo wörld.txt")), format!("{}/héllo wörld.txt", tmp.path().display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_that_show_the_same_text_keep_one_order_whatever_the_folder_order() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let e8 = tmp.path().join(OsStr::from_bytes(b"caf\xe8.txt"));
+        let e9 = tmp.path().join(OsStr::from_bytes(b"caf\xe9.txt"));
+        fs::write(&e8, "x").unwrap();
+        fs::write(&e9, "x").unwrap();
+        for key in [SortKey::Name, SortKey::Size, SortKey::Modified, SortKey::Type] {
+            let mut one = vec![stat_entry(&e8).unwrap(), stat_entry(&e9).unwrap()];
+            let mut other = vec![stat_entry(&e9).unwrap(), stat_entry(&e8).unwrap()];
+            sort_entries(&mut one, key, false);
+            sort_entries(&mut other, key, false);
+            assert_eq!(one, other, "{key:?} gives one order");
+        }
     }
 
     #[test]
