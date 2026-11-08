@@ -3,6 +3,9 @@ extends PanelContainer
 
 signal closed
 
+const IMAGE_BOX := Vector2(1080, 520)
+const MIN_SIDE := 4.0
+
 var index := 0
 var showing_full := false
 var commands: Array = []
@@ -34,11 +37,13 @@ func _init() -> void:
 	var frame := PanelContainer.new()
 	frame.add_theme_stylebox_override("panel", Theme_.box(Theme_.BG, 8, 8))
 	box.add_child(frame)
+	var area := Control.new()
+	area.custom_minimum_size = IMAGE_BOX
+	frame.add_child(area)
 	_image = TextureRect.new()
-	_image.custom_minimum_size = Vector2(1080, 520)
 	_image.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	_image.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	frame.add_child(_image)
+	_image.stretch_mode = TextureRect.STRETCH_SCALE
+	area.add_child(_image)
 	_info = Theme_.label("", Theme_.MUTED, Theme_.SIZE_BODY)
 	box.add_child(_info)
 	_hints = HBoxContainer.new()
@@ -80,8 +85,9 @@ func refresh() -> void:
 	var small := _thumbs.entry(path, JoyThumbs.THUMB_SIDE)
 	showing_full = full.has("tex")
 	_image.texture = full["tex"] if showing_full else small.get("tex")
+	_place_image()
 	_title.set_full(e["name"])
-	var parts: Array = ["%d of %d" % [index + 1, _entries.size()], Theme_.human_size(e["size"])]
+	var parts: Array = ["%s of %s" % [Theme_.with_commas(index + 1), Theme_.with_commas(_entries.size())], Theme_.human_size(e["size"])]
 	if full.has("size"):
 		parts.append("%d x %d" % [full["size"].x, full["size"].y])
 	elif full.is_empty() and _thumbs.cache.has(JoyThumbs.key_of(path, JoyThumbs.PREVIEW_SIDE)):
@@ -91,6 +97,18 @@ func refresh() -> void:
 	_info.text = "  |  ".join(parts)
 	_thumbs.want(_wanted_paths(), JoyThumbs.PREVIEW_SIDE)
 	Theme_.update_hints(_hints, JoyCommands.hints(commands))
+
+
+# a small image grows with sharp pixels, and a thin image keeps a visible line
+func _place_image() -> void:
+	var tex := _image.texture
+	_image.visible = tex != null
+	if tex == null:
+		return
+	var rect := Theme_.fit_rect(tex.get_size(), IMAGE_BOX, MIN_SIDE)
+	_image.position = rect.position
+	_image.size = rect.size
+	_image.texture_filter = Theme_.filter_for(tex.get_size(), rect.size) if showing_full else CanvasItem.TEXTURE_FILTER_LINEAR
 
 
 func _loadable(e: Dictionary) -> bool:
