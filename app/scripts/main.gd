@@ -343,6 +343,7 @@ func _enter(path: String, listed: Array, focus_name := "") -> void:
 	all_entries = listed
 	filter = ""
 	selected.clear()
+	top = 0
 	_apply_filter(focus_name)
 
 
@@ -441,7 +442,8 @@ func _apply_filter(focus_name := "") -> void:
 			if entries[i]["name"] == focus_name or entries[i]["path"] == focus_name:
 				cursor = i
 				break
-	top = 0
+	# a refresh keeps the scroll position, so the cursor stays on the same screen row
+	top = clampi(top, 0, maxi(entries.size() - VISIBLE_ROWS, 0))
 	_clamp_view()
 
 
