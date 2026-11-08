@@ -141,9 +141,10 @@ func _shell_open(path: String) -> int:
 # input
 
 func _unhandled_input(event: InputEvent) -> void:
-	if mode == Mode.KEYBOARD and event is InputEventKey and event.pressed:
-		_keyboard.handle_key(event)
-		_render()
+	if mode == Mode.KEYBOARD and event is InputEventKey:
+		if pad.typed(event):
+			_keyboard.handle_key(event)
+			_render()
 		get_viewport().set_input_as_handled()
 		return
 	var action := pad.press(event)

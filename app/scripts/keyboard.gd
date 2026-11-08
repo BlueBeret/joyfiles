@@ -13,6 +13,12 @@ const ROWS := [
 	["{shift}", "{space}", "{del}", "{cancel}", "{done}"],
 ]
 const LABELS := {"{shift}": "Shift", "{space}": "Space", "{del}": "Delete", "{cancel}": "Cancel", "{done}": "Done"}
+# control and format characters, which a name must not carry because some of them, like U+202E, disguise it
+const UNTYPABLE := [
+	[0x00, 0x1F], [0x7F, 0x9F], [0xAD, 0xAD], [0x0600, 0x0605], [0x061C, 0x061C], [0x06DD, 0x06DD],
+	[0x070F, 0x070F], [0x180E, 0x180E], [0x200B, 0x200F], [0x2028, 0x202E], [0x2060, 0x206F],
+	[0xFEFF, 0xFEFF], [0xFFF9, 0xFFFB], [0xE0001, 0xE007F],
+]
 
 var text := ""
 var shift := false
@@ -74,10 +80,15 @@ func handle_key(event: InputEventKey) -> void:
 		KEY_ESCAPE: _press("{cancel}")
 		KEY_BACKSPACE: _press("{del}")
 		_:
-			if event.unicode >= 32:
+			if typable(event.unicode):
 				text += char(event.unicode)
+				shift = false
 				changed.emit(text)
 	_render()
+
+
+static func typable(code: int) -> bool:
+	return code > 0 and not UNTYPABLE.any(func(r: Array) -> bool: return code >= r[0] and code <= r[1])
 
 
 func _col() -> int:

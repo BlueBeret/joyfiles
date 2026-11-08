@@ -96,6 +96,18 @@ func press(e: InputEvent) -> String:
 	return _down(src, action_of(e))
 
 
+# a key types only when it went down while the keyboard was open, so the key that opened it cannot type
+func typed(e: InputEventKey) -> bool:
+	var src := _source_of(e)
+	if not e.pressed:
+		_up(src)
+		return false
+	if _stale.has(src) or (e.is_echo() and not _live.has(src)):
+		return false
+	_live[src] = ""
+	return true
+
+
 # a lost focus or an unplugged pad never sends the releases, so forget every held control
 func release_all() -> void:
 	_live.clear()
