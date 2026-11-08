@@ -380,6 +380,19 @@ func _properties() -> void:
 	check(shown["Size"] == "1.5 KB (2 files, 1 folder)", "the scan totals every file below (%s)" % shown["Size"])
 	press("jf_back")
 
+	write(root_dir + "/scanlock/locked/in.txt", "x")
+	FileAccess.set_unix_permissions(root_dir + "/scanlock/locked", 0)
+	app.navigate(root_dir)
+	cursor_to("scanlock")
+	pick("Properties")
+	await until(func(): return app.props_panel.scan_done, "the scan of a tree with a closed folder finishes")
+	if app.core.props(root_dir + "/scanlock/locked")["items"] >= 0:
+		print("SKIP this account can read a folder without permission")
+	else:
+		check(shown["Size"].ends_with("1 item could not be read") and not shown["Size"].contains("folder could"), "the unreadable count says items (%s)" % shown["Size"])
+	press("jf_back")
+	FileAccess.set_unix_permissions(root_dir + "/scanlock/locked", FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER | FileAccess.UNIX_EXECUTE_OWNER)
+
 
 func _sorting() -> void:
 	var base := root_dir + "/sorting"
