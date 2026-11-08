@@ -6,7 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::fs_ops::{Entry, Failure, display_name, exists_nofollow, holds_mount_point, is_mount_point, is_within, reason, remove_item, remove_temp_tree, remove_tree, same_dir, stat_entry, summary, temp_path, unique_dest};
+use crate::fs_ops::{Entry, Failure, display_name, exists_nofollow, holds_mount_point, is_mount_point, is_within, reason, remove_item, remove_temp_tree, remove_tree, same_dir, stat_entry, summary, unique_dest};
+use crate::parts::{self, LiveJob, Owner, Role, SAFE_AGE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -153,12 +154,14 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
         thread: Mutex::new(None),
     });
     let worker = Arc::clone(&progress);
+    let live = LiveJob::start();
     let handle = thread::spawn(move || {
-        let end = match run(&worker, &sources, &dest_dir, policy) {
+        let end = match run(&worker, &sources, &dest_dir, policy, live.owner()) {
             Ok(()) => summary(&worker.failures()).map_or(JobState::Done, JobState::Failed),
             Err(_) if worker.cancel.load(Ordering::Relaxed) => JobState::Cancelled,
             Err(e) => JobState::Failed(e.to_string()),
         };
+        drop(live);
         *worker.state.lock().unwrap() = end;
     });
     *progress.thread.lock().unwrap() = Some(handle);
@@ -167,6 +170,7 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
 
 struct Worker<'a> {
     p: &'a Progress,
+    owner: Owner,
     sticky: Option<Resolution>,
     // an explicit stack, so a deep merge cannot overflow the thread stack
     tasks: Vec<Task>,
@@ -178,7 +182,7 @@ enum Task {
     EndMerge { src: PathBuf, target: PathBuf, meta: fs::Metadata },
 }
 
-fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io::Result<()> {
+fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner: Owner) -> io::Result<()> {
     if !dest_dir.is_dir() {
         return Err(io::Error::other("The destination folder does not exist."));
     }
@@ -187,6 +191,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io
             return Err(io::Error::other("Cannot put a folder inside itself."));
         }
     }
+    parts::sweep(dest_dir, SAFE_AGE, &p.cancel);
     let total = sources.iter().map(|s| tree_size(s)).sum();
     p.total_bytes.store(total, Ordering::Relaxed);
     let sticky = match policy {
@@ -194,7 +199,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy) -> io
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: src.clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, sticky, tasks };
+    let mut worker = Worker { p, owner, sticky, tasks };
     while let Some(task) = worker.tasks.pop() {
         match task {
             Task::Transfer { src, dest_dir } => {
@@ -276,10 +281,8 @@ impl Worker<'_> {
         if is_real_dir(target) && holds_mount_point(target) {
             return Err(io::Error::other("it holds a drive or a mount point, so it cannot be replaced"));
         }
-        let dir = target.parent().unwrap_or(Path::new("."));
-        let name = target.file_name().unwrap_or_default();
         if self.p.kind == JobKind::Move {
-            let aside = temp_path(dir, name);
+            let aside = temp_beside(target, self.owner, Role::Old);
             fs::rename(target, &aside)?;
             match fs::rename(src, target) {
                 Ok(()) => {
@@ -296,7 +299,7 @@ impl Worker<'_> {
                 }
             }
         }
-        let staging = temp_path(dir, name);
+        let staging = temp_beside(target, self.owner, Role::Part);
         let failed_before = self.p.failures.lock().unwrap().len();
         let copied = self.copy_tree(src, &staging, false);
         if copied.is_err() || self.p.failures.lock().unwrap().len() > failed_before {
@@ -304,7 +307,7 @@ impl Worker<'_> {
             copied?;
             return Err(io::Error::other("part of it could not be copied, so the old item stays"));
         }
-        let aside = temp_path(dir, name);
+        let aside = temp_beside(target, self.owner, Role::Old);
         if let Err(e) = fs::rename(target, &aside) {
             let _ = remove_temp_tree(&staging);
             return Err(e);
@@ -413,7 +416,7 @@ impl Worker<'_> {
             copy_symlink(src, dest)?;
             self.p.add_done(meta.len());
         } else if meta.is_file() {
-            copy_file(self.p, src, dest)?;
+            copy_file(self.p, src, dest, self.owner)?;
         } else {
             // opening a pipe for reading blocks until a writer comes, so pipes, sockets and devices are skipped
             return Err(io::Error::new(io::ErrorKind::Unsupported, "it is not a regular file"));
@@ -552,10 +555,14 @@ fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
     }
 }
 
+fn temp_beside(item: &Path, owner: Owner, role: Role) -> PathBuf {
+    parts::temp_path(item.parent().unwrap_or(Path::new(".")), item.file_name().unwrap_or_default(), owner, role)
+}
+
 // the bytes go to a temporary name first, so a crash or an error never leaves a short file under the real name
-fn copy_file(p: &Progress, src: &Path, dest: &Path) -> io::Result<()> {
+fn copy_file(p: &Progress, src: &Path, dest: &Path, owner: Owner) -> io::Result<()> {
     let mut input = File::open(src)?;
-    let part = temp_path(dest.parent().unwrap_or(Path::new(".")), dest.file_name().unwrap_or_default());
+    let part = temp_beside(dest, owner, Role::Part);
     let result = write_part(p, &mut input, &part).and_then(|()| {
         if exists_nofollow(dest) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
@@ -899,6 +906,24 @@ mod tests {
         }
         assert_eq!(dir_mode, 0o700, "the new folder is private from the start");
         assert!(part_modes.iter().all(|m| m & 0o077 == 0), "the unfinished file is private: {part_modes:?}");
+    }
+
+    #[test]
+    fn a_job_clears_stale_leftovers_in_its_destination_but_never_one_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let leftover = out.join(".big.bin.joyfiles-part");
+        let busy = LiveJob::start();
+        let in_use = parts::temp_path(&out, std::ffi::OsStr::new("busy.bin"), busy.owner(), Role::Part);
+        for path in [&leftover, &in_use] {
+            fs::write(path, vec![0u8; 4096]).unwrap();
+            File::options().write(true).open(path).unwrap().set_modified(std::time::SystemTime::now() - 2 * SAFE_AGE).unwrap();
+        }
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let p = spawn(JobKind::Copy, vec![tmp.path().join("a.txt")], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!(names_in(&out), [in_use.file_name().unwrap().to_string_lossy().into_owned(), "a.txt".into()]);
     }
 
     #[cfg(unix)]

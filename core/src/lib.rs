@@ -1,12 +1,14 @@
 pub mod fs_ops;
 pub mod jobs;
+pub mod parts;
 pub mod places;
 pub mod props;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use godot::prelude::*;
@@ -28,6 +30,8 @@ pub struct JoyCore {
     next_job: i64,
     scans: HashMap<i64, Arc<SizeScan>>,
     next_scan: i64,
+    sweeper: Option<thread::JoinHandle<()>>,
+    stop_sweep: Arc<AtomicBool>,
 }
 
 // a worker thread runs code from this library, so it must end before Godot unloads the library at exit
@@ -46,6 +50,26 @@ impl Drop for JoyCore {
         for s in self.scans.values() {
             s.wait_finished(deadline);
         }
+        self.stop_sweep.store(true, Ordering::Relaxed);
+        if let Some(sweeper) = self.sweeper.take() {
+            while !sweeper.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if sweeper.is_finished() {
+                let _ = sweeper.join();
+            }
+        }
+    }
+}
+
+impl JoyCore {
+    // one pass at a time, so a refresh while a big leftover is removed starts nothing new
+    fn sweep_later(&mut self, dir: PathBuf) {
+        if self.sweeper.as_ref().is_some_and(|s| !s.is_finished()) {
+            return;
+        }
+        let stop = Arc::clone(&self.stop_sweep);
+        self.sweeper = Some(thread::spawn(move || parts::sweep(&dir, parts::SAFE_AGE, &stop)));
     }
 }
 
@@ -88,10 +112,12 @@ fn failures_array(failures: &[Failure]) -> VarArray {
 
 #[godot_api]
 impl JoyCore {
+    // an opened folder also gets a background pass that clears what a crash left behind
     #[func]
-    fn list_dir(&self, path: GString, show_hidden: bool, sort: GString, descending: bool) -> VarDictionary {
+    fn list_dir(&mut self, path: GString, show_hidden: bool, sort: GString, descending: bool) -> VarDictionary {
         match fs_ops::list_dir(&path_of(&path), show_hidden, SortKey::parse(&sort.to_string()), descending) {
             Ok(entries) => {
+                self.sweep_later(path_of(&path));
                 let mut arr = VarArray::new();
                 for e in entries {
                     arr.push(&vdict! {

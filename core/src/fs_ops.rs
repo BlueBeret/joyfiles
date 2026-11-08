@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::parts;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub name: String,
@@ -38,7 +40,7 @@ impl SortKey {
 pub fn list_dir(dir: &Path, show_hidden: bool, key: SortKey, descending: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for item in fs::read_dir(dir)?.filter_map(Result::ok) {
-        if is_part_name(&item.file_name().to_string_lossy()) {
+        if parts::is_temp_name(&item.file_name()) {
             continue;
         }
         match read_entry(&item.path()) {
@@ -219,7 +221,7 @@ pub fn rename(path: &Path, new_name: impl AsRef<OsStr>) -> Result<PathBuf, Strin
             return Err(format!("\"{new_name}\" already exists."));
         }
         // a drive that ignores case treats a direct rename to the new case as a rename that changes nothing
-        let temp = temp_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default());
+        let temp = parts::temp_path(path.parent().unwrap_or(Path::new(".")), path.file_name().unwrap_or_default(), parts::Owner::rename(), parts::Role::Old);
         fs::rename(path, &temp).map_err(failed)?;
         if let Err(e) = fs::rename(&temp, &dest) {
             let _ = fs::rename(&temp, path);
@@ -541,11 +543,10 @@ pub fn is_within(path: &Path, dir: &Path) -> bool {
 }
 
 // most drives allow 255 bytes in one name
-const NAME_MAX: usize = 255;
-const PART_SUFFIX: &str = ".joyfiles-part";
+pub(crate) const NAME_MAX: usize = 255;
 
 // a name valid as text is cut on a character boundary, because some drives refuse broken text
-fn truncate(name: &OsStr, max: usize) -> OsString {
+pub(crate) fn truncate(name: &OsStr, max: usize) -> OsString {
     if name.len() <= max {
         return name.to_owned();
     }
@@ -561,28 +562,6 @@ fn truncate(name: &OsStr, max: usize) -> OsString {
     #[cfg(not(unix))]
     let cut = truncate(OsStr::new(&*name.to_string_lossy()), max);
     cut
-}
-
-// a killed copy leaves such a file behind, and the user never sees it as an item, even with hidden files shown
-fn is_part_name(name: &str) -> bool {
-    name.strip_prefix('.').and_then(|rest| rest.strip_suffix(PART_SUFFIX)).is_some_and(|stem| !stem.is_empty())
-}
-
-// a hidden name in the same folder, so a rename puts the finished item in place in one step
-pub fn temp_path(dir: &Path, name: &OsStr) -> PathBuf {
-    let stem = truncate(name, NAME_MAX - 1 - PART_SUFFIX.len() - 8);
-    (1..)
-        .map(|n| {
-            let mut temp = OsString::from(".");
-            temp.push(&stem);
-            if n > 1 {
-                temp.push(format!(".{n}"));
-            }
-            temp.push(PART_SUFFIX);
-            dir.join(temp)
-        })
-        .find(|p| !exists_nofollow(p))
-        .expect("an unused name exists")
 }
 
 // "archive.tar.gz" gives ("archive", ".tar.gz"), and a folder, a dot file or "v1.2" keeps the whole name as the stem
@@ -658,14 +637,15 @@ mod tests {
     #[test]
     fn a_leftover_part_file_never_shows_in_the_list() {
         let tmp = tempfile::tempdir().unwrap();
-        for name in ["real.txt", ".hidden", ".joyfiles-part", ".x.joyfiles-part-not", "..joyfiles-part"] {
+        for name in ["real.txt", ".hidden", ".joyfiles-part", ".x.joyfiles-part-not", "..joyfiles-part", ".legacy.bin.joyfiles-part"] {
             fs::write(tmp.path().join(name), "x").unwrap();
         }
-        let first = temp_path(tmp.path(), OsStr::new("a.txt"));
-        fs::write(&first, "x").unwrap();
-        fs::write(temp_path(tmp.path(), OsStr::new("a.txt")), "x").unwrap();
-        fs::create_dir(temp_path(tmp.path(), OsStr::new("dir"))).unwrap();
-        assert_eq!(first.file_name().unwrap(), ".a.txt.joyfiles-part");
+        let job = parts::LiveJob::start();
+        let temp = |name: &str, role| parts::temp_path(tmp.path(), OsStr::new(name), job.owner(), role);
+        fs::write(temp("a.txt", parts::Role::Part), "x").unwrap();
+        fs::write(temp("a.txt", parts::Role::Part), "x").unwrap();
+        fs::create_dir(temp("dir", parts::Role::Part)).unwrap();
+        fs::write(temp("b.txt", parts::Role::Old), "x").unwrap();
         let shown = names(list_dir(tmp.path(), true, SortKey::Name, false).unwrap());
         assert_eq!(shown, ["..joyfiles-part", ".hidden", ".joyfiles-part", ".x.joyfiles-part-not", "real.txt"]);
         assert_eq!(names(list_dir(tmp.path(), false, SortKey::Name, false).unwrap()), ["real.txt"]);
