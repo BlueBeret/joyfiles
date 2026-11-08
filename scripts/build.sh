@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# builds the Rust core and copies the libraries into app/bin/
+# builds the Rust core, copies the libraries into app/bin/ and imports the Godot project
 set -euo pipefail
 
 usage() {
@@ -9,6 +9,8 @@ usage: scripts/build.sh [--release] [--only linux|windows]
 Without --only, the script builds Linux and builds Windows when the
 x86_64-pc-windows-gnu rust target and x86_64-w64-mingw32-gcc exist.
 With --only, the named target is required and a missing tool is an error.
+The script then imports the Godot project, so the class cache is fresh and no script
+fails with a Parse error after a fresh checkout or a merge that adds a class_name script.
 
 environment:
   JF_JOBS   cargo job count (default 2)
@@ -85,4 +87,11 @@ if [[ "$only" != linux ]]; then
 	else
 		echo "skip windows: $missing"
 	fi
+fi
+
+# a stale class cache makes every script that uses a new class_name fail with Parse error
+if [[ -s "$bin_dir/libjoyfiles_core.so" ]]; then
+	"$root/scripts/import.sh"
+else
+	echo "skip import: app/bin has no Linux library, run scripts/import.sh after you build it"
 fi
