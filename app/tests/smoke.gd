@@ -533,6 +533,7 @@ func _move_refreshes_source() -> void:
 	await until(jobs_done, "the move ends")
 	check(text_of(base + "/dst/x.txt") == "new" and not FileAccess.file_exists(base + "/src/x.txt"), "the move replaced the file and emptied the source")
 	check(names().is_empty(), "the source folder refreshes when a move ends (%s)" % [names()])
+	check(app._row_parts[0]["name"].text == "This folder is empty.", "the rows show the emptied source (%s)" % app._row_parts[0]["name"].text)
 
 
 func _unknown_job() -> void:
