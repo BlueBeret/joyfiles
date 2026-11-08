@@ -28,10 +28,15 @@ func load_file() -> void:
 	var cfg := ConfigFile.new()
 	if cfg.load(path) != OK:
 		return
-	show_hidden = bool(cfg.get_value(SECTION, "show_hidden", false))
-	var key := str(cfg.get_value(SECTION, "sort_key", "name"))
+	show_hidden = _typed(cfg, "show_hidden", TYPE_BOOL, false)
+	var key: String = _typed(cfg, "sort_key", TYPE_STRING, "name")
 	sort_key = key if SORTS.has(key) else "name"
-	sort_desc = bool(cfg.get_value(SECTION, "sort_desc", false))
+	sort_desc = _typed(cfg, "sort_desc", TYPE_BOOL, false)
+
+
+func _typed(cfg: ConfigFile, key: String, type: int, fallback: Variant) -> Variant:
+	var value: Variant = cfg.get_value(SECTION, key, fallback)
+	return value if typeof(value) == type else fallback
 
 
 func save() -> Error:
