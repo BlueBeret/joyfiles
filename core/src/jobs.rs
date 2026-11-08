@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::fs_ops::{Entry, Failure, exists_nofollow, summary, is_within, reason, same_dir, stat_entry, temp_path, unique_dest};
+use crate::fs_ops::{Entry, Failure, exists_nofollow, is_mount_point, is_within, reason, same_dir, stat_entry, summary, temp_path, unique_dest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -274,7 +274,13 @@ impl Worker<'_> {
             return Err(io::Error::other("Cannot replace a folder with something inside it."));
         }
         let staging = temp_path(target.parent().unwrap_or(Path::new(".")), target.file_name().unwrap_or_default());
-        let renamed = self.p.kind == JobKind::Move && fs::rename(src, &staging).is_ok();
+        let renamed = match self.p.kind {
+            JobKind::Move => match fs::rename(src, &staging) {
+                Ok(()) => true,
+                Err(e) => copy_instead_of_rename(src, e).map(|()| false)?,
+            },
+            JobKind::Copy => false,
+        };
         if !renamed {
             let failed_before = self.p.failures.lock().unwrap().len();
             let copied = self.copy_tree(src, &staging, false);
@@ -312,9 +318,14 @@ impl Worker<'_> {
     }
 
     fn place(&mut self, src: &Path, target: &Path) -> io::Result<()> {
-        if self.p.kind == JobKind::Move && fs::rename(src, target).is_ok() {
-            self.p.add_done(tree_size(target));
-            return Ok(());
+        if self.p.kind == JobKind::Move {
+            match fs::rename(src, target) {
+                Ok(()) => {
+                    self.p.add_done(tree_size(target));
+                    return Ok(());
+                }
+                Err(e) => copy_instead_of_rename(src, e)?,
+            }
         }
         self.copy_tree(src, target, self.p.kind == JobKind::Move)
     }
@@ -357,6 +368,9 @@ impl Worker<'_> {
     fn copy_one(&mut self, src: &Path, dest: &Path, delete_source: bool, pending: &mut Vec<Step>) -> io::Result<()> {
         let meta = fs::symlink_metadata(src)?;
         if meta.is_dir() {
+            if delete_source && is_mount_point(src) {
+                return Err(mount_point_error());
+            }
             create_private_dir(dest, &meta)?;
             pending.push(Step::Close { src: src.to_path_buf(), dest: dest.to_path_buf(), meta });
             let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
@@ -379,6 +393,21 @@ impl Worker<'_> {
         }
         Ok(())
     }
+}
+
+// only a move across drives turns into copy and delete, so a rename that failed for another reason never leaves a full copy
+fn copy_instead_of_rename(src: &Path, err: io::Error) -> io::Result<()> {
+    if is_mount_point(src) {
+        return Err(mount_point_error());
+    }
+    match err.kind() {
+        io::ErrorKind::CrossesDevices => Ok(()),
+        _ => Err(err),
+    }
+}
+
+fn mount_point_error() -> io::Error {
+    io::Error::other("it is a drive or a mount point, so it cannot be moved")
 }
 
 enum Step {
@@ -861,6 +890,87 @@ mod tests {
         }
         assert_eq!(dir_mode, 0o700, "the new folder is private from the start");
         assert!(part_modes.iter().all(|m| m & 0o077 == 0), "the unfinished file is private: {part_modes:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_that_cannot_take_the_item_away_copies_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let set_mode = |p: &Path, m| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("locked_dir")).unwrap();
+        fs::write(src.join("locked_dir/f"), "in a read only folder").unwrap();
+        fs::create_dir_all(src.join("ro")).unwrap();
+        fs::write(src.join("ro/g"), "in a read only parent").unwrap();
+        set_mode(&src.join("locked_dir"), 0o555);
+        set_mode(&src.join("ro"), 0o555);
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        if fs::write(src.join("ro/probe"), "").is_err() {
+            for item in [src.join("locked_dir"), src.join("ro/g")] {
+                let p = spawn(JobKind::Move, vec![item.clone()], out.clone(), ASK);
+                assert!(matches!(wait(&p), JobState::Failed(_)), "{item:?} cannot move");
+                assert!(names_in(&out).is_empty(), "nothing was copied for {item:?}");
+            }
+            assert_eq!(read(src.join("locked_dir/f")), "in a read only folder");
+            assert_eq!(read(src.join("ro/g")), "in a read only parent");
+        }
+        set_mode(&src.join("locked_dir"), 0o755);
+        set_mode(&src.join("ro"), 0o755);
+    }
+
+    // mounts need their own mount namespace, so the test runs itself again under unshare and skips where that is not allowed
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_move_never_empties_a_mount_point() {
+        let Some(base) = std::env::var_os("JF_MOUNT_TEST_DIR").map(PathBuf::from) else {
+            let tmp = tempfile::tempdir().unwrap();
+            let name = "jobs::tests::a_move_never_empties_a_mount_point";
+            let me = std::env::current_exe().unwrap();
+            let run = std::process::Command::new("unshare").arg("-rm").arg(me).args(["--exact", name, "--test-threads=1"]).env("JF_MOUNT_TEST_DIR", tmp.path()).output();
+            match run {
+                Ok(out) if out.status.code() == Some(101) => panic!("{}", String::from_utf8_lossy(&out.stdout)),
+                Ok(out) if !out.status.success() => eprintln!("skipped: no mount namespace here: {}", String::from_utf8_lossy(&out.stderr)),
+                Err(e) => eprintln!("skipped: unshare did not start: {e}"),
+                Ok(_) => {}
+            }
+            return;
+        };
+        let mount = |what: &Path, at: &Path, kind: Option<&str>| {
+            use std::os::unix::ffi::OsStrExt;
+            let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            let fstype = kind.map(|k| std::ffi::CString::new(k).unwrap());
+            let flags = if kind.is_none() { libc::MS_BIND } else { 0 };
+            let done = unsafe { libc::mount(c(what).as_ptr(), c(at).as_ptr(), fstype.as_ref().map_or(std::ptr::null(), |f| f.as_ptr()), flags, std::ptr::null()) };
+            assert_eq!(done, 0, "mount {at:?}: {}", io::Error::last_os_error());
+        };
+        let data = base.join("data");
+        fs::create_dir_all(data.join("sub")).unwrap();
+        fs::write(data.join("p1"), "precious").unwrap();
+        let (card, drive, x, out, far) = (base.join("card"), base.join("drive"), base.join("x"), base.join("out"), base.join("far"));
+        for dir in [&card, &drive, &x.join("m"), &out, &far] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(x.join("f"), "plain").unwrap();
+        mount(&data, &card, None);
+        mount(Path::new("none"), &drive, Some("tmpfs"));
+        fs::write(drive.join("d"), "on the drive").unwrap();
+        mount(&data, &x.join("m"), None);
+        mount(Path::new("none"), &far, Some("tmpfs"));
+        for (item, dest) in [(&card, &out), (&drive, &out), (&card, &far)] {
+            let p = spawn(JobKind::Move, vec![item.clone()], dest.clone(), ASK);
+            let JobState::Failed(text) = wait(&p) else { panic!("moving {item:?} fails") };
+            assert_eq!(names_in(&data), ["p1", "sub"], "the mounted folder keeps its content");
+            assert!(names_in(dest).is_empty(), "nothing was copied from {item:?}");
+            assert!(text.contains("mount point"), "the error says why: {text}");
+        }
+        let p = spawn(JobKind::Move, vec![x.clone()], far.clone(), ASK);
+        assert!(matches!(wait(&p), JobState::Failed(_)), "the mount inside the folder stays");
+        assert_eq!(read(far.join("x/f")), "plain", "the plain file still moves");
+        assert_eq!(names_in(&far.join("x")), ["f"]);
+        assert_eq!(names_in(&data), ["p1", "sub"]);
+        assert_eq!(read(drive.join("d")), "on the drive");
     }
 
     #[cfg(unix)]

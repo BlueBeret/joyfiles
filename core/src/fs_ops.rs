@@ -411,6 +411,41 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
+// a drive or a bind mount is the root of a mount, and a move by copy and delete would empty it
+#[cfg(target_os = "linux")]
+pub fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(text) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    let mut info: libc::statx = unsafe { std::mem::zeroed() };
+    let found = unsafe { libc::statx(libc::AT_FDCWD, text.as_ptr(), libc::AT_SYMLINK_NOFOLLOW, 0, &mut info) } == 0;
+    let root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    if found && info.stx_attributes_mask & root != 0 {
+        return info.stx_attributes & root != 0;
+    }
+    on_another_drive_than_parent(path)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn is_mount_point(path: &Path) -> bool {
+    on_another_drive_than_parent(path)
+}
+
+// a mount shows as a folder whose drive differs from the drive of its parent, but a bind mount of the same drive does not
+#[cfg(unix)]
+fn on_another_drive_than_parent(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(path), fs::metadata(path.join(".."))) {
+        (Ok(item), Ok(parent)) => item.is_dir() && (item.dev() != parent.dev() || item.ino() == parent.ino()),
+        _ => false,
+    }
+}
+
+// a Windows mount point is a link, and a move copies and removes it as a link
+#[cfg(not(unix))]
+pub fn is_mount_point(_path: &Path) -> bool {
+    false
+}
+
 // true when path is dir itself or lies anywhere below it, whatever links the path text goes through
 pub fn is_within(path: &Path, dir: &Path) -> bool {
     fs::canonicalize(path).is_ok_and(|real| real.ancestors().any(|a| same_dir(a, dir)))
