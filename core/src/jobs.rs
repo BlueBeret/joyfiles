@@ -317,10 +317,15 @@ impl Worker<'_> {
                         self.fail(&src, &e)?;
                     }
                 }
-                Step::Close(src) => match fs::remove_dir(&src) {
-                    Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.fail(&src, &e)?,
-                    _ => {}
-                },
+                Step::Close { src, dest, meta } => {
+                    keep_metadata(&dest, &meta);
+                    if delete_source {
+                        match fs::remove_dir(&src) {
+                            Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.fail(&src, &e)?,
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -330,9 +335,7 @@ impl Worker<'_> {
         let meta = fs::symlink_metadata(src)?;
         if meta.is_dir() {
             fs::create_dir(dest)?;
-            if delete_source {
-                pending.push(Step::Close(src.to_path_buf()));
-            }
+            pending.push(Step::Close { src: src.to_path_buf(), dest: dest.to_path_buf(), meta });
             let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
             for entry in children.into_iter().rev() {
                 pending.push(Step::Copy(entry.path(), dest.join(entry.file_name())));
@@ -356,8 +359,37 @@ impl Worker<'_> {
 
 enum Step {
     Copy(PathBuf, PathBuf),
-    // a move removes a source folder after its children, and the folder stays when one of them failed
-    Close(PathBuf),
+    // runs after the children, so a read only folder gets its mode only once it is full
+    Close { src: PathBuf, dest: PathBuf, meta: fs::Metadata },
+}
+
+// a drive that cannot hold modes or times still gets the data, so errors here are ignored
+fn keep_metadata(dest: &Path, meta: &fs::Metadata) {
+    if let Ok(times) = file_times(meta) {
+        let _ = open_for_times(dest).and_then(|f| f.set_times(times));
+    }
+    let _ = fs::set_permissions(dest, meta.permissions());
+}
+
+fn file_times(meta: &fs::Metadata) -> io::Result<fs::FileTimes> {
+    let times = fs::FileTimes::new().set_modified(meta.modified()?);
+    Ok(match meta.accessed() {
+        Ok(at) => times.set_accessed(at),
+        Err(_) => times,
+    })
+}
+
+#[cfg(windows)]
+fn open_for_times(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)
+}
+
+#[cfg(not(windows))]
+fn open_for_times(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 fn is_real_dir(path: &Path) -> bool {
@@ -425,7 +457,12 @@ fn write_part(p: &Progress, input: &mut File, part: &Path) -> io::Result<()> {
         output.write_all(&buf[..n])?;
         p.add_done(n as u64);
     }
-    output.set_permissions(input.metadata()?.permissions())
+    let meta = input.metadata()?;
+    if let Ok(times) = file_times(&meta) {
+        let _ = output.set_times(times);
+    }
+    let _ = output.set_permissions(meta.permissions());
+    Ok(())
 }
 
 fn remove_tree(path: &Path) -> io::Result<()> {
@@ -571,6 +608,36 @@ mod tests {
         let p = spawn(JobKind::Copy, vec![PathBuf::from("/proc/self/mem")], tmp.path().to_path_buf(), ASK);
         assert!(matches!(wait(&p), JobState::Failed(_)));
         assert!(names_in(tmp.path()).is_empty(), "no partial file and no temporary file stays");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_keeps_folder_and_file_modes_and_times() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mtime = |p: &Path| fs::metadata(p).unwrap().modified().unwrap();
+        let old = std::time::UNIX_EPOCH + Duration::from_secs(1_577_934_245);
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("priv")).unwrap();
+        fs::create_dir_all(src.join("ro")).unwrap();
+        fs::write(src.join("priv/s.txt"), "secret").unwrap();
+        fs::write(src.join("ro/f.txt"), "f").unwrap();
+        File::options().write(true).open(src.join("priv/s.txt")).unwrap().set_modified(old).unwrap();
+        fs::set_permissions(src.join("priv/s.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        File::open(src.join("priv")).unwrap().set_modified(old).unwrap();
+        fs::set_permissions(src.join("priv"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        let out = tmp.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let p = spawn(JobKind::Copy, vec![src.join("priv"), src.join("ro")], out.clone(), ASK);
+        assert_eq!(wait(&p), JobState::Done);
+        assert_eq!((mode(&out.join("priv")), mode(&out.join("priv/s.txt"))), (0o700, 0o600));
+        assert_eq!((mtime(&out.join("priv")), mtime(&out.join("priv/s.txt"))), (old, old));
+        assert_eq!(mode(&out.join("ro")), 0o555);
+        assert_eq!(read(out.join("ro/f.txt")), "f");
+        fs::set_permissions(out.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
