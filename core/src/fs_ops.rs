@@ -317,6 +317,21 @@ pub fn path_from_text(text: &str) -> PathBuf {
     PathBuf::from(text)
 }
 
+// reads a regular file whole, and an empty result stands for a file that is missing, not regular or longer than max_len
+pub fn read_capped(path: &Path, max_len: u64) -> Vec<u8> {
+    use std::io::Read;
+    let Ok(meta) = fs::metadata(path) else { return Vec::new() };
+    if !meta.is_file() || meta.len() > max_len {
+        return Vec::new();
+    }
+    let Ok(file) = fs::File::open(path) else { return Vec::new() };
+    let mut out = Vec::with_capacity(meta.len() as usize);
+    match file.take(max_len + 1).read_to_end(&mut out) {
+        Ok(_) if out.len() as u64 <= max_len => out,
+        _ => Vec::new(),
+    }
+}
+
 // one item an operation could not handle, the operation goes on with the rest
 #[derive(Debug, Clone, PartialEq)]
 pub struct Failure {
@@ -778,6 +793,18 @@ mod tests {
         fs::write(&path, vec![b'x'; size]).unwrap();
         let when = SystemTime::now() - Duration::from_secs(age_secs);
         File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn reads_bytes_of_a_name_that_is_not_text_and_obeys_the_cap() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let odd = tmp.path().join(OsStr::from_bytes(b"caf\xe9.png"));
+        fs::write(&odd, b"12345").unwrap();
+        assert_eq!(read_capped(&path_from_text(&path_to_text(&odd)), 5), b"12345");
+        assert!(read_capped(&odd, 4).is_empty(), "a file over the cap gives nothing");
+        assert!(read_capped(tmp.path(), 100).is_empty(), "a folder gives nothing");
+        assert!(read_capped(&tmp.path().join("missing"), 100).is_empty());
     }
 
     #[test]

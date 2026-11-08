@@ -110,6 +110,21 @@ fn failures_array(failures: &[Failure]) -> VarArray {
     arr
 }
 
+// holds no state, so a worker thread may call it
+#[derive(GodotClass)]
+#[class(base = RefCounted, init)]
+pub struct JoyFiles;
+
+#[godot_api]
+impl JoyFiles {
+    // path is in the text form of a listed path, and an empty result means the file is missing, not regular or over max_len
+    #[func]
+    fn read_bytes(path: GString, max_len: i64) -> PackedByteArray {
+        let bytes = fs_ops::read_capped(&path_of(&path), max_len.max(0) as u64);
+        PackedByteArray::from(bytes.as_slice())
+    }
+}
+
 #[godot_api]
 impl JoyCore {
     // an opened folder also gets a background pass that clears what a crash left behind

@@ -112,7 +112,7 @@ func _place_image() -> void:
 
 
 func _loadable(e: Dictionary) -> bool:
-	return JoyThumbs.is_image(e["name"]) and not JoyPathText.is_opaque(e["path"])
+	return JoyThumbs.is_image(e["name"])
 
 
 func _neighbor(direction: int) -> int:

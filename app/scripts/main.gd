@@ -527,7 +527,7 @@ func _clamp_view() -> void:
 
 
 func _previewable(e: Dictionary) -> bool:
-	return not e["is_dir"] and JoyThumbs.is_image(e["name"]) and e["size"] <= JoyThumbs.MAX_FILE_BYTES and not JoyPathText.is_opaque(e["path"])
+	return not e["is_dir"] and JoyThumbs.is_image(e["name"]) and e["size"] <= JoyThumbs.MAX_FILE_BYTES
 
 
 func _open_current() -> void:

@@ -36,8 +36,6 @@ func texture(path: String, side: int) -> Texture2D:
 func want(paths: Array, side: int) -> void:
 	_queue.clear()
 	for path: String in paths:
-		if JoyPathText.is_opaque(path):
-			continue
 		var key := key_of(path, side)
 		if not cache.has(key) and not _active.has(key):
 			_queue.append([key, path, side])
@@ -76,9 +74,23 @@ func _trim() -> void:
 		cache.erase(cache.keys()[0])
 
 
+# a name that is not valid text reaches Godot only as bytes, so the core reads it and Godot decodes the buffer
+static func _load(path: String) -> Image:
+	if not JoyPathText.is_opaque(path):
+		return Image.load_from_file(path)
+	var bytes := JoyFiles.read_bytes(path, MAX_FILE_BYTES)
+	var image := Image.new()
+	var err := ERR_FILE_UNRECOGNIZED
+	match path.get_extension().to_lower():
+		"png": err = image.load_png_from_buffer(bytes)
+		"jpg", "jpeg": err = image.load_jpg_from_buffer(bytes)
+		"webp": err = image.load_webp_from_buffer(bytes)
+	return image if err == OK else null
+
+
 # runs on a worker thread, so it touches only its own locals and the locked result list
 func _decode(key: String, path: String, side: int) -> void:
-	var image := Image.load_from_file(path)
+	var image := _load(path)
 	var original := Vector2i.ZERO
 	if image != null and not image.is_empty():
 		original = image.get_size()

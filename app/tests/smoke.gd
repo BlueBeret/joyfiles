@@ -1266,8 +1266,9 @@ func _opaque_paths() -> void:
 	check(odd.size() == 3, "three entries carry a name that is not valid text (%d)" % odd.size())
 	check(names().has("caf\ufffd.png") and names().has("note\ufffd.txt") and names().has("dir\ufffd"), "the list shows the readable name: %s" % [names()])
 	await until(func(): return app.thumbs.entry(base + "/ok.png", JoyThumbs.THUMB_SIDE).has("tex"), "the valid image next to it still gets a thumbnail")
+	var odd_png: String = odd.filter(func(e: Dictionary) -> bool: return e["name"] == "caf\ufffd.png")[0]["path"]
+	await until(func(): return app.thumbs.entry(odd_png, JoyThumbs.THUMB_SIDE).has("tex"), "the image with a name that is not valid text gets a thumbnail")
 	await frames(30)
-	check(not app.thumbs.cache.keys().any(func(k: String) -> bool: return JoyPathText.is_opaque(k)), "no thumbnail is requested for a path that is not valid text")
 	check(counter.count == 0, "listing such a folder raises no engine error (%d)" % counter.count)
 
 	var opened: Array = []
@@ -1276,13 +1277,19 @@ func _opaque_paths() -> void:
 		return OK
 	cursor_to("caf\ufffd.png")
 	press("jf_accept")
-	check(app.mode == app.Mode.FILES and opened.is_empty(), "A on such an image neither previews nor hands the path to the system")
-	check(app.last_error.begins_with("Could not open caf\ufffd.png."), "the toast says why it cannot open: %s" % app.last_error)
+	check(app.mode == app.Mode.PREVIEW and opened.is_empty(), "A on such an image previews it and hands no path to the system")
+	await until(func(): return app.preview._thumbs.entry(odd_png, JoyThumbs.PREVIEW_SIDE).has("tex"), "the preview decodes such an image")
+	check(app.preview.showing_full and app.preview._info.text.contains("16 x 16"), "the preview shows its size: %s" % app.preview._info.text)
+	press("jf_back")
+	cursor_to("note\ufffd.txt")
+	press("jf_accept")
+	check(app.mode == app.Mode.FILES and opened.is_empty(), "A on such a text file neither previews nor hands the path to the system")
+	check(app.last_error.begins_with("Could not open note\ufffd.txt."), "the toast says why it cannot open: %s" % app.last_error)
 	cursor_to("ok.png")
 	press("jf_accept")
 	check(app.mode == app.Mode.PREVIEW, "the valid image still previews")
-	press("jf_right")
-	check(app.preview.current()["name"] == "ok.png", "the preview skips an image whose name is not valid text")
+	press("jf_left")
+	check(app.preview.current()["name"] == "caf\ufffd.png", "the preview steps onto an image whose name is not valid text")
 	press("jf_back")
 	app.opener = func(_path: String) -> int: return OK
 
