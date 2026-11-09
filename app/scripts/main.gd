@@ -370,10 +370,9 @@ func _list(path: String, quiet := false) -> Variant:
 			toast(result["error"], true)
 		return null
 	var listed: Array = result["entries"]
-	# the core name loses a leading U+FEFF in the Godot string, but the path keeps it, so the path gives the true name
+	# the path gives the true name, because the core name loses a leading U+FEFF and turns an invalid byte into one replacement character
 	for e: Dictionary in listed:
-		if not JoyPathText.is_opaque(e["path"]):
-			e["name"] = e["path"].get_file()
+		e["name"] = e["path"].get_file()
 	_only_hidden = listed.is_empty() and not settings.show_hidden and not core.list_dir(path, true, "name", false)["entries"].is_empty()
 	return listed
 
@@ -1215,7 +1214,7 @@ func _render_rows() -> void:
 		row.add_theme_stylebox_override("panel", Theme_.focus_box(is_cursor, Theme_.ROW_SEL if is_selected else Color.TRANSPARENT, 8, 8, 4))
 		var tex: Texture2D = null
 		if _previewable(e):
-			wanted.append(e["path"])
+			wanted.append(e)
 			tex = thumbs.texture(e["path"], JoyThumbs.THUMB_SIDE)
 		part["thumb"].texture = tex
 		part["thumb"].visible = tex != null

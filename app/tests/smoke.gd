@@ -67,7 +67,7 @@ func pick_start(prefix: String) -> void:
 
 func cursor_to(name: String) -> void:
 	for i in app.entries.size():
-		if app.entries[i]["name"] == name:
+		if JoyPathText.printable(app.entries[i]["name"]) == name:
 			app.cursor = i
 
 
@@ -221,6 +221,8 @@ func _run() -> void:
 	await _trash_partial()
 	_props_unknown()
 	await _opaque_paths()
+	_opaque_mixed_name()
+	await _replaced_images()
 	_part_files()
 	_glyphs()
 	_keyboard_fallback()
@@ -508,7 +510,7 @@ func _images() -> void:
 	await until(func(): return wanted.all(func(n): return app.thumbs.entry("%s/%s" % [base, n], side).has("tex")), "png, jpg and webp thumbnails load")
 	check(app.thumbs.entry(base + "/one.png", side)["size"] == Vector2i(64, 48), "the thumbnail keeps the original size for the info line")
 	await until(func(): return app.thumbs.cache.has(JoyThumbs.key_of(base + "/bad.png", side)), "a broken image is tried once")
-	check(app.thumbs.entry(base + "/bad.png", side).is_empty(), "a broken image gives no texture and no crash")
+	check(not app.thumbs.entry(base + "/bad.png", side).has("tex"), "a broken image gives no texture and no crash")
 	var row := names().find("one.png")
 	check(app._row_parts[row]["thumb"].visible, "the list row shows the thumbnail")
 	check(not app._row_parts[names().find("note.txt")]["thumb"].visible, "a text file row shows no thumbnail")
@@ -1265,9 +1267,10 @@ func _opaque_paths() -> void:
 	show(base)
 	var odd: Array = app.entries.filter(func(e: Dictionary) -> bool: return JoyPathText.is_opaque(e["path"]))
 	check(odd.size() == 3, "three entries carry a name that is not valid text (%d)" % odd.size())
-	check(names().has("caf\ufffd.png") and names().has("note\ufffd.txt") and names().has("dir\ufffd"), "the list shows the readable name: %s" % [names()])
+	var readable: Array = names().map(func(n: String) -> String: return JoyPathText.printable(n))
+	check(readable.has("caf\ufffd.png") and readable.has("note\ufffd.txt") and readable.has("dir\ufffd"), "the list shows the readable name: %s" % [readable])
 	await until(func(): return app.thumbs.entry(base + "/ok.png", JoyThumbs.THUMB_SIDE).has("tex"), "the valid image next to it still gets a thumbnail")
-	var odd_png: String = odd.filter(func(e: Dictionary) -> bool: return e["name"] == "caf\ufffd.png")[0]["path"]
+	var odd_png: String = odd.filter(func(e: Dictionary) -> bool: return JoyPathText.printable(e["name"]) == "caf\ufffd.png")[0]["path"]
 	await until(func(): return app.thumbs.entry(odd_png, JoyThumbs.THUMB_SIDE).has("tex"), "the image with a name that is not valid text gets a thumbnail")
 	await frames(30)
 	check(counter.count == 0, "listing such a folder raises no engine error (%d)" % counter.count)
@@ -1290,7 +1293,7 @@ func _opaque_paths() -> void:
 	press("jf_accept")
 	check(app.mode == app.Mode.PREVIEW, "the valid image still previews")
 	press("jf_left")
-	check(app.preview.current()["name"] == "caf\ufffd.png", "the preview steps onto an image whose name is not valid text")
+	check(JoyPathText.printable(app.preview.current()["name"]) == "caf\ufffd.png", "the preview steps onto an image whose name is not valid text")
 	press("jf_back")
 	app.opener = func(_path: String) -> int: return OK
 
@@ -1303,7 +1306,7 @@ func _opaque_paths() -> void:
 	after_rename.sort()
 	before_rename.sort()
 	check(after_rename == before_rename, "OK on an unedited rename keeps the exact name: %s" % [after_rename])
-	check(not (app._toast_panel.visible and app._toast_label.text.contains("is hidden")) and app.entries[app.cursor]["name"] == "note\ufffd.txt", "an unedited rename of such a name gives no hidden notice and keeps the cursor (%s, %s)" % [app._toast_label.text, app.entries[app.cursor]["name"]])
+	check(not (app._toast_panel.visible and app._toast_label.text.contains("is hidden")) and JoyPathText.printable(app.entries[app.cursor]["name"]) == "note\ufffd.txt", "an unedited rename of such a name gives no hidden notice and keeps the cursor (%s, %s)" % [app._toast_label.text, app.entries[app.cursor]["name"]])
 	cursor_to("note\ufffd.txt")
 	pick("Properties")
 	check(app.props_panel.shown["Name"] == "note\ufffd.txt" and app.props_panel.shown["Path"] == base + "/note\ufffd.txt", "properties show the name field and a path with U+FFFD: %s" % [app.props_panel.shown])
@@ -1314,7 +1317,7 @@ func _opaque_paths() -> void:
 	pick("Paste")
 	await until(jobs_done, "the copy of such a file ends")
 	check(app._toast_label.text == "Copied note\ufffd.txt." and app.reports.is_empty(), "the toast names the copy: %s" % app._toast_label.text)
-	check(names() == ["note\ufffd.txt"] and JoyPathText.is_opaque(app.entries[0]["path"]), "the copy kept the exact name: %s" % [names()])
+	check(names().map(JoyPathText.printable) == ["note\ufffd.txt"] and JoyPathText.is_opaque(app.entries[0]["path"]), "the copy kept the exact name: %s" % [names().map(JoyPathText.printable)])
 
 	show(base)
 	cursor_to("dir\ufffd")
@@ -1322,7 +1325,7 @@ func _opaque_paths() -> void:
 	check(names() == ["inner.txt"] and JoyPathText.is_opaque(app.cwd), "A opens a folder whose name is not valid text")
 	check(not JoyPathText.is_opaque(app._path_label.text) and app._path_label.text.contains("\ufffd"), "the header shows U+FFFD for the bad byte (%s)" % app._path_label.text)
 	press("jf_back")
-	check(app.cwd == base and app.entries[app.cursor]["name"] == "dir\ufffd", "B goes up and lands on that folder (cursor on %s)" % app.entries[app.cursor]["name"])
+	check(app.cwd == base and JoyPathText.printable(app.entries[app.cursor]["name"]) == "dir\ufffd", "B goes up and lands on that folder (cursor on %s)" % app.entries[app.cursor]["name"])
 	check(not app._toast_label.text.contains("not available"), "going up from it does not call it a missing folder: %s" % app._toast_label.text)
 	cursor_to("dir\ufffd")
 	pick("Properties")
@@ -1332,6 +1335,44 @@ func _opaque_paths() -> void:
 	press("jf_back")
 	check(counter.count == 0, "none of this raises an engine error (%d)" % counter.count)
 	OS.remove_logger(counter)
+
+
+func _opaque_mixed_name() -> void:
+	if OS.get_name() != "Linux":
+		return
+	var base := root_dir + "/opaque_mix"
+	_png(base + "/ok.png", 8, 8, Color.RED)
+	shell("cp \"$JF_DIR/ok.png\" \"$JF_DIR/caf$(printf '\\351')$(printf '\\357\\235\\201').png\"", base)
+	shell("cp \"$JF_DIR/ok.png\" \"$JF_DIR/x$(printf '\\357\\235\\201')y.png\"", base)
+	show(base)
+	var shown: Array = names().map(func(n: String) -> String: return JoyPathText.printable(n))
+	check(shown.has("caf\ufffd<U+F741>.png"), "a name with a bad byte and a real U+F741 shows the real character: %s" % [shown])
+	check(shown.has("x<U+F741>y.png"), "a name with only a real U+F741 shows it too: %s" % [shown])
+	var odd: Array = app.entries.filter(func(e: Dictionary) -> bool: return JoyPathText.is_opaque(e["path"]))
+	check(odd.size() == 1 and odd[0]["name"] == odd[0]["path"].get_file(), "the name of an opaque path comes from the path")
+
+
+func _replaced_images() -> void:
+	var base := root_dir + "/replaced"
+	var side := JoyThumbs.THUMB_SIDE
+	_png(base + "/a.png", 40, 30, Color.RED)
+	var whole := FileAccess.get_file_as_bytes(base + "/a.png")
+	var half := FileAccess.open(base + "/b.png", FileAccess.WRITE)
+	half.store_buffer(whole.slice(0, 30))
+	half.close()
+	show(base)
+	await until(func(): return app.thumbs.cache.has(JoyThumbs.key_of(base + "/b.png", side)) and app.thumbs.entry(base + "/a.png", side).has("tex"), "the new image and the half written image are tried")
+	check(app.thumbs.entry(base + "/a.png", side)["size"] == Vector2i(40, 30) and not app.thumbs.entry(base + "/b.png", side).has("tex"), "the half written image has no thumbnail yet")
+	_png(base + "/a.png", 20, 10, Color.BLUE)
+	var full := FileAccess.open(base + "/b.png", FileAccess.WRITE)
+	full.store_buffer(whole)
+	full.close()
+	app.refresh()
+	app._render()
+	await until(func(): return app.thumbs.entry(base + "/a.png", side).get("size") == Vector2i(20, 10), "a replaced image gets a new thumbnail")
+	await until(func(): return app.thumbs.entry(base + "/b.png", side).has("tex"), "an image that failed to decode is tried again when the file changes")
+	check(app.thumbs.entry(base + "/b.png", side)["size"] == Vector2i(40, 30), "the finished image shows its real size")
+	check(app.thumbs.cache.size() <= JoyThumbs.CACHE_LIMIT, "the cache stays bounded")
 
 
 func _part_files() -> void:
@@ -1526,7 +1567,7 @@ func _round4_text() -> void:
 	check(app.props_panel.shown["Error"].contains("no<U+202E>such") and not app.props_panel.shown["Error"].contains("\u202E"), "the props error is printable (%s)" % app.props_panel.shown["Error"])
 	app.mode = app.Mode.FILES
 	app.props_panel.close()
-	app.preview._entries = [{"name": "pic\u202Egnp.png", "path": odd + "/none.png", "size": 1}]
+	app.preview._entries = [{"name": "pic\u202Egnp.png", "path": odd + "/none.png", "size": 1, "modified": 0}]
 	app.preview.index = 0
 	app.preview._thumbs = app.thumbs
 	app.preview.refresh()

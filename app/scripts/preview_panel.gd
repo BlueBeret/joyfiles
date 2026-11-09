@@ -90,12 +90,12 @@ func refresh() -> void:
 	var parts: Array = ["%s of %s" % [Theme_.with_commas(index + 1), Theme_.with_commas(_entries.size())], Theme_.human_size(e["size"])]
 	if full.has("size"):
 		parts.append("%d x %d" % [full["size"].x, full["size"].y])
-	elif full.is_empty() and _thumbs.cache.has(JoyThumbs.key_of(path, JoyThumbs.PREVIEW_SIDE)):
+	elif not full.has("tex") and _thumbs.cache.has(JoyThumbs.key_of(path, JoyThumbs.PREVIEW_SIDE)):
 		parts.append("This image cannot be shown.")
 	else:
 		parts.append("Loading...")
 	_info.text = "  |  ".join(parts)
-	_thumbs.want(_wanted_paths(), JoyThumbs.PREVIEW_SIDE)
+	_thumbs.want(_wanted_items(), JoyThumbs.PREVIEW_SIDE)
 	Theme_.update_hints(_hints, JoyCommands.hints(commands))
 
 
@@ -132,9 +132,9 @@ func _step(direction: int) -> void:
 	index = _neighbor(direction)
 
 
-func _wanted_paths() -> Array:
-	var paths: Array = [current()["path"]]
+func _wanted_items() -> Array:
+	var items: Array = [current()]
 	for direction: int in [1, -1]:
 		if _has_step(direction):
-			paths.append(_entries[_neighbor(direction)]["path"])
-	return paths
+			items.append(_entries[_neighbor(direction)])
+	return items

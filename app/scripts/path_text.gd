@@ -4,7 +4,7 @@ extends RefCounted
 # marks that follow one base character, and the rest of a longer run collapses into one count
 const MAX_MARKS := 3
 
-# the core carries a byte that is not valid text as U+F700 plus the byte, and a real U+F7xx as the escaped bytes of its UTF-8 form
+# the core carries a byte that is not valid text as U+F700 plus the byte, and a real U+F7xx as the escaped bytes of its UTF-8 form, so a run splits into characters and bad bytes
 static var _escapes := RegEx.create_from_string("[\\x{F700}-\\x{F7FF}]")
 static var _runs := RegEx.create_from_string("[\\x{F700}-\\x{F7FF}]+")
 # control, format and filler characters, which no row may draw because some reorder the text and some draw nothing
@@ -20,8 +20,9 @@ static func is_opaque(path: String) -> bool:
 	if _escapes.search(path) == null:
 		return false
 	for run in _runs.search_all(path):
-		if _decode(run.get_string()) == null:
-			return true
+		for piece: Array in _split(run.get_string()):
+			if piece[0] == null:
+				return true
 	return false
 
 
@@ -32,21 +33,60 @@ static func native(path: String) -> String:
 	var out := ""
 	var at := 0
 	for run in _runs.search_all(path):
-		var decoded: Variant = _decode(run.get_string())
-		if decoded == null:
-			return path
-		out += path.substr(at, run.get_start() - at) + decoded
+		out += path.substr(at, run.get_start() - at)
+		for piece: Array in _split(run.get_string()):
+			if piece[0] == null:
+				return path
+			out += piece[0]
 		at = run.get_end()
 	return out + path.substr(at)
 
 
-# the text of a run of escapes when its bytes are valid UTF-8, or null when one of them is a byte that is not valid text
-static func _decode(run: String) -> Variant:
+# a run of escapes as [character, escapes] pieces, where the character is null for a byte that is not valid text
+static func _split(run: String) -> Array:
 	var bytes := PackedByteArray()
 	for ch in run:
 		bytes.append(ch.unicode_at(0) - 0xF700)
-	var decoded := bytes.get_string_from_utf8()
-	return decoded if decoded.to_utf8_buffer() == bytes else null
+	var out: Array = []
+	var at := 0
+	while at < bytes.size():
+		var length := _sequence_length(bytes, at)
+		if length == 0:
+			out.append([null, run.substr(at, 1)])
+			at += 1
+		else:
+			out.append([String.chr(_code_point(bytes, at, length)), run.substr(at, length)])
+			at += length
+	return out
+
+
+# the length of the valid UTF-8 sequence that starts at one byte, or 0 when the byte starts none
+static func _sequence_length(bytes: PackedByteArray, at: int) -> int:
+	var lead := bytes[at]
+	var length := 0
+	if lead >= 0xF0 and lead <= 0xF4:
+		length = 4
+	elif lead >= 0xE0 and lead <= 0xEF:
+		length = 3
+	elif lead >= 0xC2 and lead <= 0xDF:
+		length = 2
+	if length == 0 or at + length > bytes.size():
+		return 0
+	for i in range(1, length):
+		if bytes[at + i] & 0xC0 != 0x80:
+			return 0
+	var code := _code_point(bytes, at, length)
+	var least: int = [0, 0, 0x80, 0x800, 0x10000][length]
+	if code < least or code > 0x10FFFF or (code >= 0xD800 and code <= 0xDFFF):
+		return 0
+	return length
+
+
+static func _code_point(bytes: PackedByteArray, at: int, length: int) -> int:
+	var code: int = bytes[at] & (0x7F >> length)
+	for i in range(1, length):
+		code = (code << 6) | (bytes[at + i] & 0x3F)
+	return code
 
 
 # a text that is safe to draw, with every hidden character shown as <U+XXXX>, a blank name made visible and long mark runs cut
@@ -78,17 +118,9 @@ static func scan(text: String) -> Dictionary:
 
 # a real character shows as its mark, and a byte that is not valid text shows as one replacement character
 static func _escape_pieces(run: String) -> Array:
-	var decoded: Variant = _decode(run)
 	var out: Array = []
-	if decoded == null:
-		for ch in run:
-			out.append(["�", ch])
-		return out
-	var at := 0
-	for ch: String in decoded:
-		var length := ch.to_utf8_buffer().size()
-		out.append([_spell(ch), run.substr(at, length)])
-		at += length
+	for piece: Array in _split(run):
+		out.append(["�" if piece[0] == null else _spell(piece[0]), piece[1]])
 	return out
 
 
