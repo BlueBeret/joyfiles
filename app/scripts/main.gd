@@ -79,7 +79,8 @@ var _on_cancel: Callable
 var _on_confirm: Callable
 var _toast_until := 0.0
 var _toast_error := false
-# the toasts that came while a dialog was open, as [text, is_error]
+var _toast_replay := false
+# the toasts that came while a dialog was open, as [text, is_error], plus true for a toast that shows again
 var _toast_queue: Array = []
 var _places_shown: Array = []
 var _places_at := 0.0
@@ -922,7 +923,8 @@ func toast(raw: String, is_error := false) -> void:
 	_show_toast(text, is_error)
 
 
-func _show_toast(text: String, is_error: bool) -> void:
+func _show_toast(text: String, is_error: bool, replay := false) -> void:
+	_toast_replay = replay
 	_toast_label.text = text
 	_toast_label.add_theme_color_override("font_color", Theme_.DANGER if is_error else Theme_.TEXT)
 	_toast_label.custom_minimum_size.x = minf(Theme_.text_width(text, TOAST_FONT) + 8.0, TOAST_MAX_WIDTH)
@@ -940,7 +942,9 @@ func _toast_blocked() -> bool:
 func _sync_toast() -> void:
 	if _toast_blocked():
 		if _toast_until > 0.0:
-			_toast_queue.push_front([_toast_label.text, _toast_error])
+			# a toast that already waited once is not queued again, and a full queue keeps its newer toasts
+			if not _toast_replay and _toast_queue.size() < TOAST_QUEUE_MAX:
+				_toast_queue.push_front([_toast_label.text, _toast_error, true])
 			_toast_until = 0.0
 			_toast_panel.visible = false
 		return
@@ -949,7 +953,7 @@ func _sync_toast() -> void:
 		_toast_panel.visible = false
 	if _toast_until == 0.0 and not _toast_queue.is_empty():
 		var next: Array = _toast_queue.pop_front()
-		_show_toast(next[0], next[1])
+		_show_toast(next[0], next[1], next.size() > 2)
 
 
 # rendering
