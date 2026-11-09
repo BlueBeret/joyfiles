@@ -1082,13 +1082,13 @@ mod tests {
     // a child process gets its own data home on the drive of the items, so nothing reaches a real trash
     #[cfg(target_os = "linux")]
     #[test]
-    fn trash_goes_on_past_a_missing_item_and_names_it() {
+    fn trash_goes_on_past_a_missing_item_and_a_name_too_long_for_the_trash() {
         let Some(home) = std::env::var_os("JF_TRASH_TEST_HOME") else {
             let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
             fs::create_dir_all(&base).unwrap();
             let home = tempfile::tempdir_in(&base).unwrap();
             let me = std::env::current_exe().unwrap();
-            let name = "fs_ops::tests::trash_goes_on_past_a_missing_item_and_names_it";
+            let name = "fs_ops::tests::trash_goes_on_past_a_missing_item_and_a_name_too_long_for_the_trash";
             let out = std::process::Command::new(me).args(["--exact", name, "--test-threads=1"]).env("JF_TRASH_TEST_HOME", home.path()).env("XDG_DATA_HOME", home.path()).output().unwrap();
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
             assert!(fs::read_dir(home.path().join("Trash/files")).unwrap().next().is_none(), "the child emptied its trash");
@@ -1098,14 +1098,18 @@ mod tests {
         let (x1, missing, x2) = (tmp.path().join("x1"), tmp.path().join("missing"), tmp.path().join("x2"));
         fs::write(&x1, "1").unwrap();
         fs::write(&x2, "2").unwrap();
-        let failures = trash_items(&[x1.clone(), missing.clone(), x2.clone()]);
+        let long = tmp.path().join("x".repeat(255));
+        fs::write(&long, "3").unwrap();
+        let failures = trash_items(&[x1.clone(), missing.clone(), x2.clone(), long.clone()]);
         let ours: Vec<_> = trash::os_limited::list().unwrap().into_iter().filter(|i| i.original_parent == tmp.path()).collect();
         trash::os_limited::purge_all(&ours).unwrap();
         assert!(Path::new(&home).join("Trash/files").is_dir(), "the items went to the trash in the test data home");
         assert!(!x1.exists() && !x2.exists(), "both real items went to the trash");
-        assert_eq!(failures.len(), 1);
+        assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].path, missing);
         assert_eq!(failures[0].message, "Could not move \"missing\" to the trash: the file or folder does not exist.");
+        assert!(long.exists(), "the item with the long name stays");
+        assert!(failures[1].message.ends_with("to the trash: the name is too long."), "{}", failures[1].message);
     }
 
     #[test]

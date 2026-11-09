@@ -185,6 +185,14 @@ struct Worker<'a> {
     merged_into: HashSet<ItemKey>,
     // an open handle of each destination folder with a part inside, so a part stays reachable when the folder moves
     homes: HashMap<(u64, u64), File>,
+    // folders this job made, which get the rights and times of their source only when the job ends, so a later merge can still fill them
+    closing: Vec<Closing>,
+}
+
+struct Closing {
+    dest: PathBuf,
+    meta: fs::Metadata,
+    key: Option<ItemKey>,
 }
 
 #[cfg(unix)]
@@ -219,11 +227,13 @@ struct Stamp {
     len: u64,
     modified: Option<SystemTime>,
     inode: Option<(u64, u64)>,
+    // the inode change time, which a program cannot set back as it can the modified time
+    changed: Option<(i64, i64)>,
 }
 
 impl Stamp {
     fn of(meta: &fs::Metadata) -> Self {
-        Stamp { len: meta.len(), modified: meta.modified().ok(), inode: inode_of(meta) }
+        Stamp { len: meta.len(), modified: meta.modified().ok(), inode: inode_of(meta), changed: changed_of(meta) }
     }
 
     fn holds_for(&self, path: &Path) -> bool {
@@ -269,6 +279,17 @@ fn inode_of(_meta: &fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
+#[cfg(unix)]
+fn changed_of(meta: &fs::Metadata) -> Option<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.ctime(), meta.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn changed_of(_meta: &fs::Metadata) -> Option<(i64, i64)> {
+    None
+}
+
 // an error of a part whose folder is gone or is no longer a folder names that cause, since the source is there
 fn folder_moved(e: io::Error, part: &Path) -> io::Error {
     match part.parent() {
@@ -277,7 +298,11 @@ fn folder_moved(e: io::Error, part: &Path) -> io::Error {
     }
 }
 
-fn changed_error() -> io::Error {
+// a source that is gone from its path did not change, so the text names that cause
+fn changed_error(src: &Path) -> io::Error {
+    if fs::symlink_metadata(src).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+        return io::Error::other("the original moved or went away while it was copied");
+    }
     io::Error::other("it changed while it was copied, so the original stays")
 }
 
@@ -330,7 +355,7 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: (*src).clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new(), merged_into: HashSet::new(), homes: HashMap::new() };
+    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new(), merged_into: HashSet::new(), homes: HashMap::new(), closing: Vec::new() };
     for src in reserved {
         worker.note(src, &io::Error::other("its name is one that Joyfiles keeps for temporary items"));
     }
@@ -370,6 +395,21 @@ impl Worker<'_> {
             // the folder stays when a child was skipped
             let _ = fs::remove_dir(src);
         }
+        self.apply_closing(0);
+    }
+
+    fn close_folder(&mut self, dest: PathBuf, meta: fs::Metadata) {
+        let key = item_key(&dest);
+        self.closing.push(Closing { dest, meta, key });
+    }
+
+    // a folder that moved or was replaced since keeps what it has, so the rights never land on another item
+    fn apply_closing(&mut self, from: usize) {
+        for folder in self.closing.drain(from..) {
+            if item_key(&folder.dest) == folder.key {
+                keep_metadata(&folder.dest, &folder.meta);
+            }
+        }
     }
 
     // records the error and lets the job go on, unless the user cancelled
@@ -404,7 +444,7 @@ impl Worker<'_> {
                         self.drop_part(&part, home);
                         self.note(&src, &folder_moved(io::Error::new(e.kind(), e.to_string()), &part));
                     }
-                    Unsettled::Close { dest, meta, .. } => keep_metadata(&dest, &meta),
+                    Unsettled::Close { dest, meta, .. } => self.close_folder(dest, meta),
                     Unsettled::Link { .. } => {}
                 }
             }
@@ -421,8 +461,8 @@ impl Worker<'_> {
                 },
                 Unsettled::Link { src, stamp, .. } => leaving.push((src, Original::File(stamp))),
                 Unsettled::Close { src, dest, meta } => {
-                    keep_metadata(&dest, &meta);
                     leaving.push((src, Original::Folder(inode_of(&meta))));
+                    self.close_folder(dest, meta);
                 }
             }
         }
@@ -437,7 +477,7 @@ impl Worker<'_> {
         }
         for (src, original) in leaving {
             if !original.is_at(&src) {
-                self.note(&src, &changed_error());
+                self.note(&src, &changed_error(&src));
                 continue;
             }
             // a source folder stays when a child of it was skipped or failed
@@ -532,14 +572,17 @@ impl Worker<'_> {
         let before = if self.p.kind == JobKind::Move { snapshot(src) } else { Vec::new() };
         let staging = temp_beside(target, self.owner, Role::Part);
         let failed_before = self.p.failures.lock().unwrap().len();
+        let home = staging.parent().and_then(|dir| File::open(dir).ok());
+        let mark = self.closing.len();
         let copied = self.copy_tree(src, &staging, Copying::Durable, false);
+        self.apply_closing(mark);
         if copied.is_err() || self.p.failures.lock().unwrap().len() > failed_before {
-            let _ = remove_temp_tree(&staging);
+            remove_staging(&staging, home);
             copied?;
             return Err(io::Error::other("part of it could not be copied, so the old item stays"));
         }
         if let Err(e) = self.swap_in(&staging, target) {
-            let _ = remove_temp_tree(&staging);
+            remove_staging(&staging, home);
             return Err(e);
         }
         self.record(target);
@@ -553,7 +596,7 @@ impl Worker<'_> {
             if !original.is_at(&path) {
                 // a folder that went or changed stays quiet, as it holds no bytes of its own
                 if let Original::File(_) = original {
-                    self.note(&path, &changed_error());
+                    self.note(&path, &changed_error(&path));
                 }
                 continue;
             }
@@ -618,13 +661,10 @@ impl Worker<'_> {
         !self.created.is_empty() && path.ancestors().filter_map(item_key).any(|key| self.created.contains(&key))
     }
 
-    // an item that holds data of this job is never replaced, so only Skip or a new name is left for a clash with it
+    // an item that holds data of this job is never replaced, so only Skip or a new name is left for a clash with it, and a sticky Skip applies to it as to any item
     fn held_choice(&self, path: &Path) -> Option<Resolution> {
-        if self.made_here(path) {
-            return Some(Resolution::KeepBoth);
-        }
         let merged = item_key(path).is_some_and(|key| self.merged_into.contains(&key));
-        merged.then(|| if self.sticky == Some(Resolution::Skip) { Resolution::Skip } else { Resolution::KeepBoth })
+        (merged || self.made_here(path)).then(|| if self.sticky == Some(Resolution::Skip) { Resolution::Skip } else { Resolution::KeepBoth })
     }
 
     fn record(&mut self, path: &Path) {
@@ -733,7 +773,7 @@ impl Worker<'_> {
         // a cancel still gives each folder made so far the rights and times of its source
         for step in pending.into_iter().rev() {
             if let Step::Close { dest, meta, .. } = step {
-                keep_metadata(&dest, &meta);
+                self.close_folder(dest, meta);
             }
         }
         result
@@ -748,7 +788,7 @@ impl Worker<'_> {
                     }
                 }
                 Step::Close { src, dest, meta } => match how {
-                    Copying::Plain => keep_metadata(&dest, &meta),
+                    Copying::Plain => self.close_folder(dest, meta),
                     _ => self.unsettled.push(Unsettled::Close { src, dest, meta }),
                 },
             }
@@ -1030,6 +1070,57 @@ fn unlink_in(home: &File, name: &std::ffi::OsStr) {
 #[cfg(not(unix))]
 fn unlink_in(_home: &File, _name: &std::ffi::OsStr) {}
 
+// a staging folder goes through the open handle of its folder, which reaches it wherever that folder moved, and by its path only when no handle holds it
+fn remove_staging(staging: &Path, before: Option<File>) {
+    match (holder_of(staging, before), staging.file_name()) {
+        (Some(folder), Some(name)) => remove_tree_in(&folder, name),
+        _ => {
+            let _ = remove_temp_tree(staging);
+        }
+    }
+}
+
+// the tree below one name of a folder handle goes, and a read only folder inside gets write rights first
+#[cfg(unix)]
+fn remove_tree_in(home: &File, name: &std::ffi::OsStr) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(name) = std::ffi::CString::new(name.as_bytes()) else { return };
+    remove_tree_at(home.as_raw_fd(), &name);
+    fn remove_tree_at(parent: i32, name: &std::ffi::CStr) {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+        if fd < 0 {
+            unsafe { libc::unlinkat(parent, name.as_ptr(), 0) };
+            return;
+        }
+        let folder = unsafe { File::from_raw_fd(fd) };
+        unsafe { libc::fchmod(fd, 0o700) };
+        let listing = unsafe { libc::fdopendir(libc::dup(fd)) };
+        let mut children = Vec::new();
+        if !listing.is_null() {
+            loop {
+                let entry = unsafe { libc::readdir(listing) };
+                if entry.is_null() {
+                    break;
+                }
+                let child = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_owned();
+                if child.to_bytes() != b"." && child.to_bytes() != b".." {
+                    children.push(child);
+                }
+            }
+            unsafe { libc::closedir(listing) };
+        }
+        for child in children {
+            remove_tree_at(folder.as_raw_fd(), &child);
+        }
+        unsafe { libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR) };
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_tree_in(_home: &File, _name: &std::ffi::OsStr) {}
+
 fn tree_size(path: &Path) -> u64 {
     let mut total = 0;
     let mut pending = vec![path.to_path_buf()];
@@ -1109,7 +1200,7 @@ fn write_part(p: &Progress, input: &mut File, part: &Path, durable: bool, folder
     let before = part.parent().and_then(|dir| File::open(dir).ok());
     let created = create_private_file(part, &meta);
     *folder = holder_of(part, before);
-    let mut output = created?;
+    let mut output = created.map_err(|e| folder_moved(e, part))?;
     if !copy_sparse(p, input, &mut output, &meta)? {
         copy_range(p, input, &mut output, u64::MAX)?;
     }
@@ -2339,7 +2430,7 @@ mod tests {
         let p = spawn(JobKind::Copy, vec![], out.clone(), Policy::Always(Resolution::Replace));
         assert_eq!(wait(&p), JobState::Done);
         let live = parts::LiveJob::start();
-        let mut worker = Worker { p: &p, owner: live.owner(), sticky: Some(Resolution::Replace), tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), merged_into: HashSet::new(), created: HashSet::new(), homes: HashMap::new() };
+        let mut worker = Worker { p: &p, owner: live.owner(), sticky: Some(Resolution::Replace), tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), merged_into: HashSet::new(), created: HashSet::new(), homes: HashMap::new(), closing: Vec::new() };
         let placed = worker.place_part(&tmp.path().join("src"), &part, &out.join("x")).unwrap();
         assert_eq!(placed, Some(out.join("x")));
         assert_eq!(read(out.join("x")), "new");
@@ -2355,7 +2446,7 @@ mod tests {
 
     #[cfg(unix)]
     fn hand_worker<'a>(p: &'a Progress, live: &LiveJob) -> Worker<'a> {
-        Worker { p, owner: live.owner(), sticky: None, tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), merged_into: HashSet::new(), created: HashSet::new(), homes: HashMap::new() }
+        Worker { p, owner: live.owner(), sticky: None, tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), merged_into: HashSet::new(), created: HashSet::new(), homes: HashMap::new(), closing: Vec::new() }
     }
 
     #[cfg(unix)]
@@ -2462,6 +2553,130 @@ mod tests {
         worker.finish();
         assert_eq!(read(src.join("b")), "USER", "a file that took the name of the source folder stays");
         assert_eq!(read(src.join("zz/in/x")), "x", "the source folder that moved away keeps its files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_keeps_a_source_that_changed_in_place_with_its_old_modified_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("f0"), "original").unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        worker.copy_tree(&src.join("f0"), &out.join("f0"), Copying::Moving, false).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let kept = fs::metadata(src.join("f0")).unwrap().modified().unwrap();
+        let mut file = fs::OpenOptions::new().write(true).open(src.join("f0")).unwrap();
+        file.write_all(b"INPLACE!").unwrap();
+        file.set_modified(kept).unwrap();
+        worker.finish();
+        assert_eq!(read(src.join("f0")), "INPLACE!", "bytes written in place with the old modified time stay");
+        assert_eq!(p.failures().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_replace_removes_its_staging_folder_through_the_handle_of_a_moved_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let staging = out.join(".top0.1-1-1-1.joyfiles-part");
+        fs::create_dir_all(staging.join("sub/deep")).unwrap();
+        fs::write(staging.join("sub/deep/f"), "x").unwrap();
+        fs::set_permissions(staging.join("sub"), fs::Permissions::from_mode(0o555)).unwrap();
+        let home = File::open(&out).unwrap();
+        let moved = tmp.path().join("out_renamed");
+        fs::rename(&out, &moved).unwrap();
+        remove_staging(&staging, Some(home));
+        assert!(names_in(&moved).is_empty(), "no staging folder stays in the moved folder: {:?}", names_in(&moved));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_read_only_folders_of_one_name_merge_and_get_their_rights_at_the_end() {
+        use std::os::unix::fs::PermissionsExt;
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let tmp = tempfile::tempdir().unwrap();
+            // a folder with the mode 555 only moves by copy, so a move needs another drive
+            let far = other_drive(tmp.path());
+            let (src, out) = (tmp.path().join("src"), far.as_ref().map_or(tmp.path(), |d| d.path()).join("out"));
+            if kind == JobKind::Move && far.is_none() {
+                continue;
+            }
+            for (side, file) in [("a", "f1"), ("b", "f2")] {
+                fs::create_dir_all(src.join(side).join("x")).unwrap();
+                fs::write(src.join(side).join("x").join(file), file).unwrap();
+                fs::set_permissions(src.join(side).join("x"), fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            fs::create_dir(&out).unwrap();
+            let list = vec![src.join("a/x"), src.join("b/x")];
+            let p = spawn(kind, list, out.clone(), Policy::Always(Resolution::KeepBoth));
+            let state = wait(&p);
+            // a move cannot remove the files of a read only source folder, as mv cannot
+            let expected = if kind == JobKind::Copy { 0 } else { 2 };
+            assert_eq!(p.failures().len(), expected, "{kind:?}: {state:?}");
+            assert_eq!(names_in(&out.join("x")), ["f1", "f2"], "both folders merged and no part stays");
+            assert_eq!(fs::metadata(out.join("x")).unwrap().permissions().mode() & 0o777, 0o555, "the rights come at the end");
+            for dir in [out.join("x"), src.join("a/x"), src.join("b/x")] {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_copied_into_a_folder_that_moved_names_the_folder_as_the_cause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("f"), "x").unwrap();
+        let (p, live) = idle_job(&dst);
+        let mut worker = hand_worker(&p, &live);
+        fs::rename(&dst, tmp.path().join("dst_renamed")).unwrap();
+        worker.copy_tree(&src.join("f"), &dst.join("f"), Copying::Moving, false).unwrap();
+        worker.finish();
+        let failed: Vec<String> = p.failures().into_iter().map(|f| f.message).collect();
+        assert!(failed.len() == 1 && failed[0].contains("the destination folder moved or went away"), "{failed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_that_went_away_during_a_move_is_reported_as_gone_and_not_as_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("f0"), "x").unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        worker.copy_tree(&src.join("f0"), &out.join("f0"), Copying::Moving, false).unwrap();
+        fs::rename(src.join("f0"), src.join("renamed")).unwrap();
+        worker.finish();
+        let failed: Vec<String> = p.failures().into_iter().map(|f| f.message).collect();
+        assert!(failed.len() == 1 && failed[0].contains("the original moved or went away"), "{failed:?}");
+        assert_eq!(read(src.join("renamed")), "x", "the renamed source stays");
+    }
+
+    #[test]
+    fn a_sticky_skip_applies_to_an_item_the_same_job_made() {
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+            fs::create_dir_all(src.join("a")).unwrap();
+            fs::create_dir_all(src.join("b")).unwrap();
+            fs::create_dir(&out).unwrap();
+            fs::write(src.join("a/x"), "first").unwrap();
+            fs::write(src.join("b/x"), "second").unwrap();
+            let p = spawn(kind, vec![src.join("a/x"), src.join("b/x")], out.clone(), Policy::Always(Resolution::Skip));
+            assert_eq!(wait(&p), JobState::Done);
+            assert_eq!(names_in(&out), ["x"], "{kind:?}: the second x is skipped");
+            assert_eq!(read(out.join("x")), "first");
+            assert!(src.join("b/x").exists(), "{kind:?}: a skipped source stays");
+            assert_eq!(src.join("a/x").exists(), kind == JobKind::Copy, "{kind:?}: a placed source goes only in a move");
+        }
     }
 
     #[cfg(unix)]
