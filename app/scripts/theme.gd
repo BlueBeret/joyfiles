@@ -218,6 +218,6 @@ static func count(n: int, noun: String) -> String:
 static func human_date(unix: int) -> String:
 	if unix <= 0:
 		return "Unknown"
-	var local := unix + int(Time.get_time_zone_from_system()["bias"]) * 60
+	var local := unix + JoyFiles.utc_offset(unix)
 	var d := Time.get_datetime_dict_from_unix_time(local)
 	return "%04d-%02d-%02d %02d:%02d" % [d["year"], d["month"], d["day"], d["hour"], d["minute"]]

@@ -111,6 +111,12 @@ fn failures_array(failures: &[Failure]) -> VarArray {
     arr
 }
 
+// the local offset from UTC on that date in seconds, so a date in the other season keeps its own offset
+fn local_offset_secs(unix: i64) -> i64 {
+    use chrono::{Local, Offset, TimeZone};
+    Local.timestamp_opt(unix, 0).single().map_or(0, |t| i64::from(t.offset().fix().local_minus_utc()))
+}
+
 // holds no state, so a worker thread may call it
 #[derive(GodotClass)]
 #[class(base = RefCounted, init)]
@@ -123,6 +129,12 @@ impl JoyFiles {
     fn read_bytes(path: GString, max_len: i64) -> PackedByteArray {
         let bytes = fs_ops::read_capped(&path_of(&path), max_len.max(0) as u64);
         PackedByteArray::from(bytes.as_slice())
+    }
+
+    // unix is seconds since 1970 in UTC, and the result is what the local clock adds on that date
+    #[func]
+    fn utc_offset(unix: i64) -> i64 {
+        local_offset_secs(unix)
     }
 }
 
@@ -314,5 +326,17 @@ impl JoyCore {
             self.jobs.remove(&id);
         }
         arr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_offset_secs;
+
+    #[test]
+    fn offset_stays_in_the_range_of_real_zones() {
+        for unix in [0, 1_767_268_800, 1_782_907_200, 4_102_444_800] {
+            assert!(local_offset_secs(unix).abs() <= 14 * 3600);
+        }
     }
 }

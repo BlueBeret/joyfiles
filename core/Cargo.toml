@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 godot = { version = "0.5.5", features = ["experimental-threads"] }
 trash = "5.3"
 dirs = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
