@@ -243,6 +243,7 @@ func _run() -> void:
 	await _round4_text()
 	await _round5_text()
 	await _round6_app()
+	await _round9_app()
 	app.queue_free()
 	await frames()
 	var input_suite: GDScript = load("res://tests/input.gd")
@@ -1698,6 +1699,127 @@ func _round4_text() -> void:
 		check(Theme_.human_size(pair[0]) == pair[1], "%d bytes read as %s (%s)" % [pair[0], pair[1], Theme_.human_size(pair[0])])
 	app.navigate(root_dir)
 	app._render()
+
+
+func _round9_app() -> void:
+	app.mode = app.Mode.FILES
+	await _preview_relist()
+	await _toast_queue_bound()
+	_date_offset()
+	await _failure_cause_first()
+	await _pixel_cap()
+
+
+func _preview_relist() -> void:
+	var base := root_dir + "/r9_preview"
+	for n in ["a", "b", "c"]:
+		_png(base + "/%s.png" % n, 30, 20, Color.RED)
+	show(base)
+	cursor_to("b.png")
+	press("jf_accept")
+	await until(func() -> bool: return app.thumbs.entry(base + "/b.png", JoyThumbs.PREVIEW_SIDE).has("tex"), "the preview decodes b.png")
+	DirAccess.remove_absolute(base + "/b.png")
+	DirAccess.make_dir_recursive_absolute(base + "/b.png")
+	app.refresh()
+	check(app.mode == app.Mode.FILES, "the preview closes when its image became a folder")
+	DirAccess.remove_absolute(base + "/b.png")
+	_png(base + "/b.png", 30, 20, Color.BLUE)
+	app.refresh()
+	cursor_to("b.png")
+	press("jf_accept")
+	await until(func() -> bool: return app.thumbs.entry(base + "/b.png", JoyThumbs.PREVIEW_SIDE).get("stamp", "") == JoyThumbs.stamp_of(app.preview.current()), "the preview decodes the new b.png")
+	DirAccess.remove_absolute(base + "/b.png")
+	shell("truncate -s 49M \"$JF_DIR/b.png\"", base)
+	app.refresh()
+	check(app.mode == app.Mode.FILES, "the preview closes when its image grew over the byte cap")
+	var seen: Dictionary = app.thumbs.entry(base + "/b.png", JoyThumbs.PREVIEW_SIDE)
+	var grown: Dictionary = app.entries.filter(func(e: Dictionary) -> bool: return e["name"] == "b.png")[0]
+	check(seen.get("stamp", "") != JoyThumbs.stamp_of(grown), "the image over the cap is not decoded for the preview")
+	app.thumbs.want([], JoyThumbs.PREVIEW_SIDE)
+
+
+func _toast_queue_bound() -> void:
+	app._toast_queue.clear()
+	app.settings.show_hidden = false
+	for i in 12:
+		pick_start("Hide hidden" if app.settings.show_hidden else "Show hidden")
+		await frames(1)
+	app.settings.show_hidden = false
+	app.refresh()
+	check(app._toast_queue.size() <= app.TOAST_QUEUE_MAX, "twelve menu cycles keep the toast queue at its bound (%d)" % app._toast_queue.size())
+	app._toast_queue.clear()
+	app.toast("shown once")
+	app._sync_toast()
+	press("jf_start")
+	app._sync_toast()
+	check(app._toast_queue.size() == 1, "a shown toast waits once while a dialog is open")
+	press("jf_back")
+	app._sync_toast()
+	press("jf_start")
+	app._sync_toast()
+	check(app._toast_queue.is_empty(), "a toast that already waited is not queued again (%s)" % [app._toast_queue])
+	press("jf_back")
+	app._toast_queue.clear()
+
+
+func _date_offset() -> void:
+	var summer := 1782907200
+	var winter := 1768478400
+	var zone := OS.get_environment("TZ")
+	OS.set_environment("TZ", "Europe/Berlin")
+	# the local zone is cached for one second
+	OS.delay_msec(1100)
+	check(JoyFiles.utc_offset(summer) == 7200 and JoyFiles.utc_offset(winter) == 3600, "the core gives the offset of the date itself (%d, %d)" % [JoyFiles.utc_offset(summer), JoyFiles.utc_offset(winter)])
+	check(Theme_.human_date(summer) == "2026-07-01 14:00" and Theme_.human_date(winter) == "2026-01-15 13:00", "a summer date and a winter date both show local time (%s, %s)" % [Theme_.human_date(summer), Theme_.human_date(winter)])
+	if zone == "":
+		OS.unset_environment("TZ")
+	else:
+		OS.set_environment("TZ", zone)
+
+
+func _failure_cause_first() -> void:
+	var base := root_dir + "/r9_cause"
+	var long_name := "a".repeat(200) + ".txt"
+	write(base + "/src/" + long_name, "x")
+	DirAccess.make_dir_recursive_absolute(base + "/dst")
+	app.navigate(base + "/src")
+	pick("Select all")
+	pick("Copy")
+	DirAccess.remove_absolute(base + "/src/" + long_name)
+	app.navigate(base + "/dst")
+	pick("Paste")
+	await until(jobs_done, "the paste of a vanished long name ends")
+	open_jobs_report()
+	press("jf_accept")
+	await frames(5)
+	var label: Label = app.jobs_panel._detail_rows[0]["message"]
+	check(label.get_line_count() <= label.max_lines_visible, "a long name does not push its cause out of the failure list (%d lines)" % label.get_line_count())
+	check(label.text.ends_with("does not exist.") and label.text.contains("\u2026"), "the failure keeps the cause and cuts the name (%s)" % label.text)
+	press("jf_menu")
+	press("jf_back")
+
+
+func _pixel_cap() -> void:
+	var base := root_dir + "/r9_pixels"
+	var sizes := {"png": Vector2i(37, 23), "jpg": Vector2i(41, 19), "webp": Vector2i(53, 29)}
+	for ext: String in sizes:
+		_png("%s/small.%s" % [base, ext], sizes[ext].x, sizes[ext].y, Color.GREEN)
+		var head := FileAccess.get_file_as_bytes("%s/small.%s" % [base, ext])
+		check(JoyThumbs.header_size(head, ext) == sizes[ext], "the %s header gives the real size (%s)" % [ext, JoyThumbs.header_size(head, ext)])
+	var big := PackedByteArray([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x75, 0x30, 0x00, 0x00, 0x75, 0x30])
+	check(JoyThumbs.header_size(big, "png") == Vector2i(30000, 30000) and JoyThumbs.too_many_pixels(Vector2i(30000, 30000)), "a png header with 30000 x 30000 is over the pixel cap")
+	check(not JoyThumbs.too_many_pixels(Vector2i(8000, 8000)) and not JoyThumbs.too_many_pixels(Vector2i(4500, 4500)), "a large but sane image stays under the cap")
+	var jpeg := PackedByteArray([0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x06, 1, 2, 3, 4, 0xFF, 0xC0, 0x00, 0x11, 8, 0x75, 0x30, 0x75, 0x30, 3])
+	check(JoyThumbs.header_size(jpeg, "jpg") == Vector2i(30000, 30000), "a jpeg header is found behind other segments (%s)" % JoyThumbs.header_size(jpeg, "jpg"))
+	var webp := "RIFF".to_ascii_buffer() + PackedByteArray([0, 0, 0, 0]) + "WEBPVP8X".to_ascii_buffer() + PackedByteArray([10, 0, 0, 0, 0, 0, 0, 0, 0x2F, 0x75, 0, 0x2F, 0x75, 0])
+	check(JoyThumbs.header_size(webp, "webp") == Vector2i(30000, 30000), "a webp canvas size is read (%s)" % JoyThumbs.header_size(webp, "webp"))
+	check(JoyThumbs.header_size(PackedByteArray([1, 2, 3]), "png") == Vector2i.ZERO and JoyThumbs.header_size(PackedByteArray(), "jpg") == Vector2i.ZERO, "a short or foreign header gives no size")
+	var file := FileAccess.open(base + "/bomb.png", FileAccess.WRITE)
+	file.store_buffer(big)
+	file.store_buffer(_png_bytes(Color.RED))
+	file.close()
+	check(JoyThumbs.over_pixel_cap(base + "/bomb.png") and not JoyThumbs.over_pixel_cap(base + "/small.png"), "the file check refuses the bomb and accepts the small image")
+	check(JoyThumbs._load(base + "/bomb.png") == null, "an image over the pixel cap is not decoded")
 
 
 func _bytes(n: int) -> PackedByteArray:
