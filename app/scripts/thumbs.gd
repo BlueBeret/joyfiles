@@ -5,6 +5,9 @@ const EXTS := ["png", "jpg", "jpeg", "webp"]
 const THUMB_SIDE := 96
 const PREVIEW_SIDE := 1280
 const MAX_FILE_BYTES := 48 * 1024 * 1024
+# a file that compresses well can still unpack to a huge image, so the header size is capped as well
+const MAX_PIXELS := 64_000_000
+const HEADER_BYTES := 262144
 const MAX_ACTIVE := 2
 const CACHE_LIMIT := 192
 const CACHE_BYTES := 128 * 1024 * 1024
@@ -100,8 +103,91 @@ func _trim() -> void:
 		cache.erase(oldest)
 
 
+# the width and height that a file header states, or Vector2i.ZERO when the header is not readable
+static func header_size(head: PackedByteArray, ext: String) -> Vector2i:
+	match ext:
+		"png": return _png_size(head)
+		"jpg", "jpeg": return _jpeg_size(head)
+		"webp": return _webp_size(head)
+	return Vector2i.ZERO
+
+
+static func too_many_pixels(size: Vector2i) -> bool:
+	return int(size.x) * int(size.y) > MAX_PIXELS
+
+
+static func _be(head: PackedByteArray, at: int, count: int) -> int:
+	var value := 0
+	for i in count:
+		value = (value << 8) | head[at + i]
+	return value
+
+
+static func _le(head: PackedByteArray, at: int, count: int) -> int:
+	var value := 0
+	for i in count:
+		value |= head[at + i] << (8 * i)
+	return value
+
+
+static func _png_size(head: PackedByteArray) -> Vector2i:
+	if head.size() < 24 or head.slice(0, 8) != PackedByteArray([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) or head.slice(12, 16).get_string_from_ascii() != "IHDR":
+		return Vector2i.ZERO
+	return Vector2i(_be(head, 16, 4), _be(head, 20, 4))
+
+
+# walks the marker segments up to the first frame header
+static func _jpeg_size(head: PackedByteArray) -> Vector2i:
+	if head.size() < 4 or head[0] != 0xFF or head[1] != 0xD8:
+		return Vector2i.ZERO
+	var at := 2
+	while at + 4 <= head.size():
+		if head[at] != 0xFF:
+			return Vector2i.ZERO
+		var marker := head[at + 1]
+		if marker == 0xFF:
+			at += 1
+		elif marker == 0x01 or (marker >= 0xD0 and marker <= 0xD8):
+			at += 2
+		elif marker == 0xD9 or marker == 0xDA:
+			return Vector2i.ZERO
+		elif marker >= 0xC0 and marker <= 0xCF and marker != 0xC4 and marker != 0xC8 and marker != 0xCC:
+			return Vector2i(_be(head, at + 7, 2), _be(head, at + 5, 2)) if at + 9 <= head.size() else Vector2i.ZERO
+		else:
+			at += 2 + _be(head, at + 2, 2)
+	return Vector2i.ZERO
+
+
+static func _webp_size(head: PackedByteArray) -> Vector2i:
+	if head.size() < 30 or head.slice(0, 4).get_string_from_ascii() != "RIFF" or head.slice(8, 12).get_string_from_ascii() != "WEBP":
+		return Vector2i.ZERO
+	match head.slice(12, 16).get_string_from_ascii():
+		"VP8 ":
+			return Vector2i(_le(head, 26, 2) & 0x3FFF, _le(head, 28, 2) & 0x3FFF)
+		"VP8L":
+			var bits := _le(head, 21, 4)
+			return Vector2i((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+		"VP8X":
+			return Vector2i(_le(head, 24, 3) + 1, _le(head, 27, 3) + 1)
+	return Vector2i.ZERO
+
+
+# true when the header of the file states more pixels than the cap, read before any decode
+static func over_pixel_cap(path: String) -> bool:
+	var head := PackedByteArray()
+	if JoyPathText.is_opaque(path):
+		head = JoyFiles.read_bytes(path, MAX_FILE_BYTES)
+	else:
+		var file := FileAccess.open(JoyPathText.native(path), FileAccess.READ)
+		if file != null:
+			head = file.get_buffer(HEADER_BYTES)
+	return too_many_pixels(header_size(head, path.get_extension().to_lower()))
+
+
 # a name that is not valid text reaches Godot only as bytes, so the core reads it and Godot decodes the buffer
 static func _load(path: String) -> Image:
+	if over_pixel_cap(path):
+		return null
 	if not JoyPathText.is_opaque(path):
 		return Image.load_from_file(JoyPathText.native(path))
 	var bytes := JoyFiles.read_bytes(path, MAX_FILE_BYTES)
