@@ -10,6 +10,8 @@ const DETAIL_ROWS := 4
 const DETAIL_ROW_HEIGHT := 108
 # the lists scroll past this height, so the title and the hints always fit in an 800 pixel window
 const LIST_MAX_HEIGHT := 500.0
+# a long name in a failure message gets this much room, so the cause after it always shows
+const NAME_ROOM := 340.0
 
 var cursor := 0
 var ids: Array = []
@@ -248,6 +250,23 @@ func _fill_report_row(parts: Dictionary, report: Dictionary, focused: bool) -> v
 	parts["row"].add_theme_stylebox_override("panel", Theme_.focus_box(focused, Color.TRANSPARENT, 8, 12, 12))
 
 
+# the message with the quoted name cut in the middle, so a 200 character name never pushes the cause out of the label
+static func failure_text(raw: String) -> String:
+	var scanned := JoyPathText.scan(raw)
+	var shown: String = scanned["shown"]
+	var open := shown.find("\"")
+	var close := shown.rfind("\": ")
+	if open < 0 or close <= open:
+		return shown
+	var marks: Array = []
+	for token: Array in scanned["tokens"]:
+		if token[0] > open and token[1] <= close:
+			marks.append([token[0] - open - 1, token[1] - open - 1, token[2]])
+	var name := shown.substr(open + 1, close - open - 1)
+	var cut := JoyFitLabel.cut_text(name, Theme_.theme().default_font, Theme_.SIZE_BODY, NAME_ROOM, JoyFitLabel.Cut.MIDDLE, "", marks)
+	return shown.left(open + 1) + cut + shown.substr(close)
+
+
 func _render_detail() -> void:
 	_detail.visible = viewing >= 0
 	failure_texts = []
@@ -255,7 +274,7 @@ func _render_detail() -> void:
 		return
 	var report: Dictionary = _reports[viewing]
 	var failures: Array = report["failures"]
-	failure_texts = failures.map(func(f: Dictionary) -> String: return JoyPathText.printable(f["error"]))
+	failure_texts = failures.map(func(f: Dictionary) -> String: return failure_text(f["error"]))
 	failure_cursor = clampi(failure_cursor, 0, maxi(failures.size() - 1, 0))
 	if failure_cursor < failure_top:
 		failure_top = failure_cursor
