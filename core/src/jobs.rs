@@ -231,6 +231,33 @@ impl Stamp {
     }
 }
 
+// what a source was when the job copied it, so a move removes only that same item and never one that took its name
+enum Original {
+    File(Stamp),
+    Folder(Option<(u64, u64)>),
+}
+
+impl Original {
+    fn of(meta: &fs::Metadata) -> Self {
+        if meta.is_dir() { Original::Folder(inode_of(meta)) } else { Original::File(Stamp::of(meta)) }
+    }
+
+    fn is_at(&self, path: &Path) -> bool {
+        match self {
+            Original::File(stamp) => stamp.holds_for(path),
+            Original::Folder(inode) => fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && inode_of(&meta) == *inode),
+        }
+    }
+
+    // a folder goes only when it is empty
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        match self {
+            Original::File(_) => remove_item(path),
+            Original::Folder(_) => fs::remove_dir(path),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn inode_of(meta: &fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -387,15 +414,15 @@ impl Worker<'_> {
         for item in batch {
             match item {
                 Unsettled::File { src, part, dest, stamp, home } => match self.commit(&src, &part, &dest, home) {
-                    Ok(Some(_)) => leaving.push((src, Some(stamp))),
+                    Ok(Some(_)) => leaving.push((src, Original::File(stamp))),
                     Ok(None) => {}
                     Err(_) if self.p.cancel.load(Ordering::Relaxed) => {}
                     Err(e) => self.note(&src, &e),
                 },
-                Unsettled::Link { src, stamp, .. } => leaving.push((src, Some(stamp))),
+                Unsettled::Link { src, stamp, .. } => leaving.push((src, Original::File(stamp))),
                 Unsettled::Close { src, dest, meta } => {
                     keep_metadata(&dest, &meta);
-                    leaving.push((src, None));
+                    leaving.push((src, Original::Folder(inode_of(&meta))));
                 }
             }
         }
@@ -408,14 +435,13 @@ impl Worker<'_> {
         if how != Copying::Moving {
             return;
         }
-        for (src, stamp) in leaving {
-            if stamp.is_some_and(|stamp| !stamp.holds_for(&src)) {
+        for (src, original) in leaving {
+            if !original.is_at(&src) {
                 self.note(&src, &changed_error());
                 continue;
             }
             // a source folder stays when a child of it was skipped or failed
-            let removed = if is_real_dir(&src) { fs::remove_dir(&src) } else { remove_item(&src) };
-            match removed {
+            match original.remove(&src) {
                 Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.note(&src, &e),
                 _ => {}
             }
@@ -522,17 +548,16 @@ impl Worker<'_> {
     }
 
     // only what the job copied goes, and an item that changed or came new since stays, so a move never deletes data it did not copy
-    fn remove_copied(&self, copied: Vec<(PathBuf, Option<Stamp>)>) {
-        for (path, stamp) in copied.into_iter().rev() {
-            let removed = match stamp {
-                None => fs::remove_dir(&path),
-                Some(stamp) if stamp.holds_for(&path) => remove_item(&path),
-                Some(_) => {
+    fn remove_copied(&self, copied: Vec<(PathBuf, Original)>) {
+        for (path, original) in copied.into_iter().rev() {
+            if !original.is_at(&path) {
+                // a folder that went or changed stays quiet, as it holds no bytes of its own
+                if let Original::File(_) = original {
                     self.note(&path, &changed_error());
-                    continue;
                 }
-            };
-            match removed {
+                continue;
+            }
+            match original.remove(&path) {
                 Err(e) if !matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound) => self.note(&path, &e),
                 _ => {}
             }
@@ -977,7 +1002,7 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 // the folders and files of a tree in the order they were found, so each folder comes before what it holds
-fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Stamp>)> {
+fn snapshot(root: &Path) -> Vec<(PathBuf, Original)> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
@@ -986,10 +1011,8 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Stamp>)> {
             if let Ok(rd) = fs::read_dir(&path) {
                 pending.extend(rd.filter_map(Result::ok).filter(|e| !parts::is_temp_name(&e.file_name())).map(|e| e.path()));
             }
-            found.push((path, None));
-        } else {
-            found.push((path, Some(Stamp::of(&meta))));
         }
+        found.push((path, Original::of(&meta)));
     }
     found
 }
@@ -2402,6 +2425,25 @@ mod tests {
         assert!(src.join("big.bin").exists(), "the source stays");
         let failed: Vec<String> = p.failures().into_iter().map(|f| f.message).collect();
         assert!(failed.len() == 1 && failed[0].contains("moved or went away"), "{failed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_never_removes_a_file_that_took_the_name_of_a_copied_source_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(src.join("b/in")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("b/in/x"), "x").unwrap();
+        fs::write(src.join("a"), "USER").unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        worker.copy_tree(&src.join("b"), &out.join("b"), Copying::Moving, true).unwrap();
+        fs::rename(src.join("b"), src.join("zz")).unwrap();
+        fs::rename(src.join("a"), src.join("b")).unwrap();
+        worker.finish();
+        assert_eq!(read(src.join("b")), "USER", "a file that took the name of the source folder stays");
+        assert_eq!(read(src.join("zz/in/x")), "x", "the source folder that moved away keeps its files");
     }
 
     #[cfg(unix)]
