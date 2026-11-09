@@ -7,8 +7,9 @@ const PREVIEW_SIDE := 1280
 const MAX_FILE_BYTES := 48 * 1024 * 1024
 const MAX_ACTIVE := 2
 const CACHE_LIMIT := 192
+const CACHE_BYTES := 128 * 1024 * 1024
 
-# each key holds a texture, the original size and the stamp of the decoded file, or only the stamp when the file cannot be decoded
+# each key holds a texture, its bytes, the original size and the stamp of the decoded file, or only the stamp when the file cannot be decoded
 var cache := {}
 var _queue: Array = []
 var _active := {}
@@ -26,7 +27,12 @@ static func key_of(path: String, side: int) -> String:
 
 # the file as the list shows it, so a replaced or finished file gets a new stamp
 static func stamp_of(e: Dictionary) -> String:
-	return "%d|%d" % [e["modified"], e["size"]]
+	return "%d|%d" % [e["modified_ns"], e["size"]]
+
+
+# one rule for the preview and for the decode, so a folder or a file over the cap is never decoded
+static func previewable(e: Dictionary) -> bool:
+	return not e["is_dir"] and is_image(e["name"]) and e["size"] <= MAX_FILE_BYTES
 
 
 func entry(path: String, side: int) -> Dictionary:
@@ -64,7 +70,7 @@ func poll() -> bool:
 		if image == null:
 			cache[key] = {"stamp": result["stamp"]}
 		else:
-			cache[key] = {"tex": ImageTexture.create_from_image(image), "size": result["size"], "stamp": result["stamp"]}
+			cache[key] = {"tex": ImageTexture.create_from_image(image), "bytes": result["bytes"], "size": result["size"], "stamp": result["stamp"]}
 		_trim()
 	_start_more()
 	return not batch.is_empty()
@@ -78,9 +84,20 @@ func _start_more() -> void:
 		_active[job[0]] = {"task": WorkerThreadPool.add_task(_decode.bind(job[0], job[1], job[2], job[3])), "stamp": job[3]}
 
 
+func cache_bytes() -> int:
+	var total := 0
+	for item: Dictionary in cache.values():
+		total += item.get("bytes", 0)
+	return total
+
+
+# the oldest entry leaves first, and the newest stays even when it alone is over the byte limit
 func _trim() -> void:
-	while cache.size() > CACHE_LIMIT:
-		cache.erase(cache.keys()[0])
+	var bytes := cache_bytes()
+	while cache.size() > 1 and (cache.size() > CACHE_LIMIT or bytes > CACHE_BYTES):
+		var oldest: Variant = cache.keys()[0]
+		bytes -= cache[oldest].get("bytes", 0)
+		cache.erase(oldest)
 
 
 # a name that is not valid text reaches Godot only as bytes, so the core reads it and Godot decodes the buffer
@@ -101,14 +118,16 @@ static func _load(path: String) -> Image:
 func _decode(key: String, path: String, side: int, stamp: String) -> void:
 	var image := _load(path)
 	var original := Vector2i.ZERO
+	var bytes := 0
 	if image != null and not image.is_empty():
 		original = image.get_size()
 		var longest := maxi(original.x, original.y)
 		if longest > side:
 			var scale := float(side) / longest
 			image.resize(maxi(1, roundi(original.x * scale)), maxi(1, roundi(original.y * scale)), Image.INTERPOLATE_BILINEAR)
+		bytes = image.get_data().size()
 	else:
 		image = null
 	_lock.lock()
-	_results.append({"key": key, "image": image, "size": original, "stamp": stamp})
+	_results.append({"key": key, "image": image, "bytes": bytes, "size": original, "stamp": stamp})
 	_lock.unlock()

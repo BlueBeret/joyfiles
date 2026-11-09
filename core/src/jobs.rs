@@ -69,7 +69,7 @@ pub struct Progress {
     pub total_bytes: AtomicU64,
     pub cancel: AtomicBool,
     pub state: Mutex<JobState>,
-    pub current: Mutex<String>,
+    pub current: Mutex<PathBuf>,
     failures: Mutex<Vec<Failure>>,
     gate: Mutex<Gate>,
     wake: Condvar,
@@ -148,7 +148,7 @@ pub fn spawn(kind: JobKind, sources: Vec<PathBuf>, dest_dir: PathBuf, policy: Po
         total_bytes: AtomicU64::new(0),
         cancel: AtomicBool::new(false),
         state: Mutex::new(JobState::Running),
-        current: Mutex::new(String::new()),
+        current: Mutex::new(PathBuf::new()),
         failures: Mutex::new(Vec::new()),
         gate: Mutex::new(Gate::default()),
         wake: Condvar::new(),
@@ -453,7 +453,7 @@ impl Worker<'_> {
             return Err(io::Error::other("Cancelled."));
         }
         let name = src.file_name().ok_or_else(|| io::Error::other("The source has no name."))?;
-        *self.p.current.lock().unwrap() = name.to_string_lossy().into_owned();
+        *self.p.current.lock().unwrap() = PathBuf::from(name);
         let mut target = dest_dir.join(name);
         if exists_nofollow(&target) {
             if src.parent().is_some_and(|dir| same_dir(dir, dest_dir)) {

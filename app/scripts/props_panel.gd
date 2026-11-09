@@ -66,12 +66,12 @@ func open(core: JoyCore, path: String, hidden_note := false) -> void:
 	_scroll.scroll_vertical = 0
 	var info: Dictionary = core.props(path)
 	if not info["ok"]:
-		_put("Name", JoyPathText.printable(path.get_file()))
+		_put("Name", JoyPathText.printable(JoyPathText.file_name(path)))
 		_put("Path", JoyPathText.printable(path))
 		_put("Type", "Unknown")
 		_put("Error", info["error"])
 		return
-	_put("Name", JoyPathText.printable(info["name"]))
+	_put("Name", JoyPathText.printable(JoyPathText.file_name(path)))
 	_put("Path", JoyPathText.printable(info["path"]))
 	_put("Type", info["type"] + (" (link)" if info["is_symlink"] else ""))
 	_put("Modified", Theme_.human_date(info["modified"]))

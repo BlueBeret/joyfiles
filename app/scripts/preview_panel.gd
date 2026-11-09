@@ -111,14 +111,10 @@ func _place_image() -> void:
 	_image.texture_filter = Theme_.filter_for(tex.get_size(), rect.size) if showing_full else CanvasItem.TEXTURE_FILTER_LINEAR
 
 
-func _loadable(e: Dictionary) -> bool:
-	return JoyThumbs.is_image(e["name"])
-
-
 func _neighbor(direction: int) -> int:
 	var i := index + direction
 	while i >= 0 and i < _entries.size():
-		if _loadable(_entries[i]):
+		if JoyThumbs.previewable(_entries[i]):
 			return i
 		i += direction
 	return -1

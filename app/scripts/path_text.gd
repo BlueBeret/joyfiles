@@ -90,6 +90,11 @@ static func _code_point(bytes: PackedByteArray, at: int, length: int) -> int:
 
 
 # a text that is safe to draw, with every hidden character shown as <U+XXXX>, a blank name made visible and long mark runs cut
+# the one rule for a displayed name, because the core name loses a leading U+FEFF and turns an invalid byte into one replacement character
+static func file_name(path: String) -> String:
+	return path.get_file()
+
+
 static func printable(text: String) -> String:
 	return scan(text)["shown"]
 

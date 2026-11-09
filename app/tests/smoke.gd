@@ -223,6 +223,10 @@ func _run() -> void:
 	await _opaque_paths()
 	_opaque_mixed_name()
 	await _replaced_images()
+	await _same_second_replace()
+	await _true_names()
+	_cache_bytes()
+	await _preview_skips()
 	_part_files()
 	_glyphs()
 	_keyboard_fallback()
@@ -964,7 +968,7 @@ func _preview_math() -> void:
 	check(thin.size.x >= 4.0 and thin.size.y <= 520.0, "a thin image keeps a visible line (%s)" % thin.size)
 	check(Theme_.filter_for(Vector2(8, 8), Vector2(520, 520)) == CanvasItem.TEXTURE_FILTER_NEAREST, "a tiny image grows with sharp pixels")
 	check(Theme_.filter_for(Vector2(1280, 720), Vector2(924, 520)) == CanvasItem.TEXTURE_FILTER_LINEAR, "a large image is smoothed when it shrinks")
-	app.conflict_panel.open({"name": "x", "dest_is_dir": true, "dest_size": 0, "dest_modified": 0, "src_is_dir": true, "src_size": 0, "src_modified": 1700000000})
+	app.conflict_panel.open({"name": "x", "path": "/d/x", "dest_is_dir": true, "dest_size": 0, "dest_modified": 0, "src_is_dir": true, "src_size": 0, "src_modified": 1700000000})
 	check(app.conflict_panel._existing.text == "In this folder: Folder, change date unknown", "a clash with no date says so (%s)" % app.conflict_panel._existing.text)
 
 
@@ -1078,7 +1082,7 @@ func _contrast() -> void:
 	app._render()
 	audit("the properties")
 	press("jf_back")
-	app.conflict_panel.open({"name": "plain.txt", "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 1700000000})
+	app.conflict_panel.open({"name": "plain.txt", "path": "/d/plain.txt", "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 1700000000})
 	app.mode = app.Mode.CONFLICT
 	app._render()
 	audit("the clash prompt")
@@ -1375,6 +1379,109 @@ func _replaced_images() -> void:
 	check(app.thumbs.cache.size() <= JoyThumbs.CACHE_LIMIT, "the cache stays bounded")
 
 
+func _same_second_replace() -> void:
+	var base := root_dir + "/same_second"
+	var colors := [Color.RED, Color.BLUE, Color.GREEN, Color.YELLOW, Color.WHITE, Color("#ff8000")]
+	var pair := []
+	for i in colors.size():
+		for j in range(i + 1, colors.size()):
+			if pair.is_empty() and _png_bytes(colors[i]).size() == _png_bytes(colors[j]).size():
+				pair = [colors[i], colors[j]]
+	check(not pair.is_empty(), "two colors give png files of one size")
+	_png(base + "/a.png", 40, 30, pair[0])
+	show(base)
+	var side := JoyThumbs.THUMB_SIDE
+	await until(func(): return app.thumbs.entry(base + "/a.png", side).has("tex"), "the first image gets a thumbnail")
+	var before: Dictionary = app.entries[0]
+	check(before["modified_ns"] / 1000000000 == before["modified"], "the list entry holds the change time in nanoseconds")
+	_png(base + "/a.png", 40, 30, pair[1])
+	app.refresh()
+	app._render()
+	check(app.entries[0]["size"] == before["size"] and app.entries[0]["modified_ns"] != before["modified_ns"], "a rewrite of the same size has another stamp")
+	await until(func(): return app.thumbs.entry(base + "/a.png", side)["tex"].get_image().get_pixel(0, 0).is_equal_approx(pair[1]), "a same size rewrite gets a new thumbnail")
+
+
+func _png_bytes(color: Color) -> PackedByteArray:
+	var img := Image.create_empty(40, 30, false, Image.FORMAT_RGB8)
+	img.fill(color)
+	return img.save_png_to_buffer()
+
+
+func _true_names() -> void:
+	if OS.get_name() != "Linux":
+		return
+	var base := root_dir + "/true_names"
+	var names_raw := ["$(printf '\\357\\273\\277')bom.txt", "caf$(printf '\\351\\357\\235\\201').txt", "x$(printf '\\357\\235\\201')y.txt"]
+	DirAccess.make_dir_recursive_absolute(base + "/src")
+	DirAccess.make_dir_recursive_absolute(base + "/dst")
+	for n in names_raw:
+		shell("printf 1 > \"$JF_DIR/src/%s\"; printf 22 > \"$JF_DIR/dst/%s\"" % [n, n], base)
+	show(base + "/src")
+	for e: Dictionary in app.entries:
+		app._open_props(e["path"])
+		var want := JoyPathText.printable(e["path"].get_file())
+		check(app.props_panel.shown["Name"] == want, "the properties name comes from the path (%s)" % app.props_panel.shown["Name"])
+		app.props_panel.close()
+	app.mode = app.Mode.FILES
+	var paths := PackedStringArray()
+	for e: Dictionary in app.entries:
+		paths.append(e["path"])
+	app._set_clipboard(paths, false)
+	show(base + "/dst")
+	app.paste()
+	var seen := {}
+	for k in 120:
+		await frames(3)
+		app._render()
+		if app.mode == app.Mode.CONFLICT:
+			var name := JoyPathText.printable(app.conflict_panel.conflict["path"].get_file())
+			seen[name] = true
+			check(app.conflict_panel._title.text == "\"%s\" already exists here." % name, "the clash title comes from the path (%s)" % app.conflict_panel._title.text)
+			check(app._status.full == "Copying paused: " + name, "the paused status comes from the path (%s)" % app._status.full)
+			press("jf_accept")
+		if app.jobs.is_empty() and seen.size() == names_raw.size():
+			break
+	check(seen.has("<U+FEFF>bom.txt") and seen.has("x<U+F741>y.txt") and seen.has("caf\ufffd<U+F741>.txt"), "the clash names keep the marks and the real characters: %s" % [seen.keys()])
+	app.mode = app.Mode.FILES
+
+
+func _cache_bytes() -> void:
+	var t := JoyThumbs.new()
+	var chunk := JoyThumbs.CACHE_BYTES * 2 / 5
+	for i in 6:
+		t.cache["k%d" % i] = {"bytes": chunk, "stamp": "s"}
+		t._trim()
+	check(t.cache.size() == 2 and t.cache_bytes() <= JoyThumbs.CACHE_BYTES, "the cache holds at most the byte limit (%d entries, %d bytes)" % [t.cache.size(), t.cache_bytes()])
+	check(t.cache.has("k5") and t.cache.has("k4"), "the oldest entries leave first")
+	t.cache.clear()
+	t.cache["big"] = {"bytes": JoyThumbs.CACHE_BYTES * 2, "stamp": "s"}
+	t._trim()
+	check(t.cache.has("big"), "the newest entry stays even when it alone is over the limit")
+
+
+func _preview_skips() -> void:
+	var base := root_dir + "/preview_skips"
+	_png(base + "/a.png", 30, 30, Color.RED)
+	_png(base + "/c.png", 30, 30, Color.BLUE)
+	DirAccess.make_dir_recursive_absolute(base + "/b.png")
+	shell("truncate -s 49M \"$JF_DIR/big.png\"", base)
+	show(base)
+	var folder: Dictionary = app.entries.filter(func(e: Dictionary) -> bool: return e["name"] == "b.png")[0]
+	var huge: Dictionary = app.entries.filter(func(e: Dictionary) -> bool: return e["name"] == "big.png")[0]
+	check(not JoyThumbs.previewable(folder) and not JoyThumbs.previewable(huge), "a folder and an image over the cap are not previewable")
+	cursor_to("a.png")
+	press("jf_accept")
+	check(app.mode == app.Mode.PREVIEW and app.preview.current()["name"] == "a.png", "A opens the preview on a.png")
+	check(not app.preview._has_step(-1), "the preview does not step back onto a folder named like an image")
+	press("jf_right")
+	check(app.preview.current()["name"] == "c.png", "the preview steps over the folder and the image over the cap (%s)" % app.preview.current()["name"])
+	await until(func(): return app.thumbs.entry(base + "/c.png", JoyThumbs.PREVIEW_SIDE).has("tex"), "the next image is decoded")
+	var keys: Array = app.thumbs.cache.keys()
+	check(not keys.any(func(k: String) -> bool: return k.ends_with(base + "/b.png") or k.ends_with(base + "/big.png")), "the cache holds no decode of a folder or an image over the cap: %s" % [keys])
+	press("jf_back")
+	app.mode = app.Mode.FILES
+
+
 func _part_files() -> void:
 	var base := root_dir + "/leftovers"
 	write(base + "/doc.txt", "x")
@@ -1545,7 +1652,7 @@ func _round4_text() -> void:
 	check(app._confirm_label.text == "Move %s to the trash?" % shown, "the trash question is printable (%s)" % app._confirm_label.text)
 	app.mode = app.Mode.FILES
 
-	var info := {"name": evil, "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 0}
+	var info := {"name": evil, "path": odd + "/" + evil, "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 0}
 	app.conflict_panel.open(info)
 	check(app.conflict_panel._title.text == "\"%s\" already exists here." % shown, "the clash title is printable (%s)" % app.conflict_panel._title.text)
 	app.jobs[5] = {"watch": [], "state": "running", "kind": "copy", "current": evil, "done_bytes": 1, "total_bytes": 10, "conflict": info}
@@ -1567,7 +1674,7 @@ func _round4_text() -> void:
 	check(app.props_panel.shown["Error"].contains("no<U+202E>such") and not app.props_panel.shown["Error"].contains("\u202E"), "the props error is printable (%s)" % app.props_panel.shown["Error"])
 	app.mode = app.Mode.FILES
 	app.props_panel.close()
-	app.preview._entries = [{"name": "pic\u202Egnp.png", "path": odd + "/none.png", "size": 1, "modified": 0}]
+	app.preview._entries = [{"name": "pic\u202Egnp.png", "path": odd + "/none.png", "is_dir": false, "size": 1, "modified": 0, "modified_ns": 0}]
 	app.preview.index = 0
 	app.preview._thumbs = app.thumbs
 	app.preview.refresh()
@@ -1762,7 +1869,7 @@ func _round6_app() -> void:
 	check(field.count("<") == field.count(">"), "the rename field does not start with half a mark (%s)" % field)
 	app._on_keyboard_submitted(app._keyboard.text)
 
-	var clash := {"name": "n".repeat(120) + ".txt", "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 0}
+	var clash := {"name": "n".repeat(120) + ".txt", "path": "/d/" + "n".repeat(120) + ".txt", "dest_is_dir": false, "dest_size": 1, "dest_modified": 0, "src_is_dir": false, "src_size": 1, "src_modified": 0}
 	app.jobs[6] = {"watch": [], "state": "running", "kind": "copy", "current": "x", "done_bytes": 1, "total_bytes": 10, "conflict": clash}
 	app._render_status()
 	check(app._status.text.ends_with(" already exists.") and app._status.text.contains("\u2026") and app._status_tail.text == "", "the clash reason follows the name in one text (%s)" % app._status.text)

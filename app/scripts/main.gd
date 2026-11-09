@@ -370,9 +370,8 @@ func _list(path: String, quiet := false) -> Variant:
 			toast(result["error"], true)
 		return null
 	var listed: Array = result["entries"]
-	# the path gives the true name, because the core name loses a leading U+FEFF and turns an invalid byte into one replacement character
 	for e: Dictionary in listed:
-		e["name"] = e["path"].get_file()
+		e["name"] = JoyPathText.file_name(e["path"])
 	_only_hidden = listed.is_empty() and not settings.show_hidden and not core.list_dir(path, true, "name", false)["entries"].is_empty()
 	return listed
 
@@ -440,7 +439,7 @@ func _name_of(path: String) -> String:
 	for e: Dictionary in all_entries:
 		if e["path"] == path:
 			return JoyPathText.printable(e["name"])
-	return JoyPathText.printable(path.get_file())
+	return JoyPathText.printable(JoyPathText.file_name(path))
 
 
 func _label_of(paths: PackedStringArray) -> String:
@@ -526,17 +525,13 @@ func _clamp_view() -> void:
 	top = clampi(top, 0, maxi(entries.size() - visible_rows, 0))
 
 
-func _previewable(e: Dictionary) -> bool:
-	return not e["is_dir"] and JoyThumbs.is_image(e["name"]) and e["size"] <= JoyThumbs.MAX_FILE_BYTES
-
-
 func _open_current() -> void:
 	if entries.is_empty():
 		return
 	var e: Dictionary = entries[cursor]
 	if e["is_dir"]:
 		navigate(e["path"])
-	elif _previewable(e):
+	elif JoyThumbs.previewable(e):
 		preview.open(thumbs, entries, cursor)
 		_open(Mode.PREVIEW)
 	else:
@@ -855,7 +850,7 @@ func _announce_end(job: Dictionary) -> void:
 		return
 	match job["state"]:
 		"done":
-			toast("%s %s." % ["Moved" if moved else "Copied", job.get("label", job["current"])])
+			toast("%s %s." % ["Moved" if moved else "Copied", job.get("label", JoyPathText.file_name(job["current"]))])
 		"failed":
 			toast(job["error"], true)
 		"cancelled":
@@ -1213,7 +1208,7 @@ func _render_rows() -> void:
 		var is_selected: bool = selected.has(e["path"])
 		row.add_theme_stylebox_override("panel", Theme_.focus_box(is_cursor, Theme_.ROW_SEL if is_selected else Color.TRANSPARENT, 8, 8, 4))
 		var tex: Texture2D = null
-		if _previewable(e):
+		if JoyThumbs.previewable(e):
 			wanted.append(e)
 			tex = thumbs.texture(e["path"], JoyThumbs.THUMB_SIDE)
 		part["thumb"].texture = tex
@@ -1310,10 +1305,10 @@ func _render_status() -> void:
 	var j: Dictionary = running[0]
 	var verb := "Moving" if j.get("kind") == "move" else "Copying"
 	if not j.get("conflict", {}).is_empty():
-		_set_status("%s paused: %s" % [verb, j["conflict"]["name"]], "", Theme_.TEXT, JoyFitLabel.Cut.MIDDLE, " already exists.")
+		_set_status("%s paused: %s" % [verb, JoyPathText.file_name(j["conflict"]["path"])], "", Theme_.TEXT, JoyFitLabel.Cut.MIDDLE, " already exists.")
 		return
 	var pct: int = 0 if j.get("total_bytes", 0) == 0 else int(100.0 * j["done_bytes"] / j["total_bytes"])
-	_set_status("%s %s" % [verb, j.get("current", "")], "%d%%" % pct, Theme_.TEXT)
+	_set_status("%s %s" % [verb, JoyPathText.file_name(j.get("current", ""))], "%d%%" % pct, Theme_.TEXT)
 
 
 # the tail stays whole, so a long name never hides the percent or the reason

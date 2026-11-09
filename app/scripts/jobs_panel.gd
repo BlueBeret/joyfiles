@@ -236,7 +236,7 @@ func _fill_row(parts: Dictionary, job: Dictionary, focused: bool) -> void:
 	var ratio := 0.0 if total == 0 else clampf(float(done) / total, 0.0, 1.0)
 	var verb := "Moving" if job.get("kind") == "move" else "Copying"
 	var waiting: bool = not job.get("conflict", {}).is_empty()
-	parts["title"].set_full("%s %s" % [verb, job.get("current", "")])
+	parts["title"].set_full("%s %s" % [verb, JoyPathText.file_name(job.get("current", ""))])
 	parts["info"].text = "Needs an answer" if waiting else "%d%%  %s of %s" % [int(ratio * 100.0), Theme_.human_size(done), Theme_.human_size(total)]
 	parts["info"].add_theme_color_override("font_color", Theme_.WARN if waiting else Theme_.MUTED)
 	parts["bar"].value = ratio

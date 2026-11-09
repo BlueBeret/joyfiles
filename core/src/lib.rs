@@ -92,6 +92,7 @@ fn result_dict(r: Result<PathBuf, String>) -> VarDictionary {
 fn conflict_dict(c: &Conflict) -> VarDictionary {
     vdict! {
         "name" => c.name.as_str(),
+        "path" => &gstr(&c.src.path),
         "src_is_dir" => c.src.is_dir,
         "dest_is_dir" => c.dest.is_dir,
         "src_size" => c.src.size as i64,
@@ -141,6 +142,7 @@ impl JoyCore {
                         "is_dir" => e.is_dir,
                         "size" => e.size as i64,
                         "modified" => e.modified,
+                        "modified_ns" => e.modified_ns,
                         "hidden" => e.hidden,
                     }.to_variant());
                 }
@@ -302,7 +304,7 @@ impl JoyCore {
                 "state" => state,
                 "error" => error.as_str(),
                 "failures" => &failures_array(&p.failures()),
-                "current" => p.current.lock().unwrap().as_str(),
+                "current" => &gstr(&p.current.lock().unwrap()),
                 "conflict" => &p.pending_conflict().map_or_else(VarDictionary::new, |c| conflict_dict(&c)),
                 "done_bytes" => p.done_bytes.load(Ordering::Relaxed) as i64,
                 "total_bytes" => p.total_bytes.load(Ordering::Relaxed) as i64,

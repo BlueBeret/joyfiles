@@ -13,6 +13,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: i64,
+    // nanoseconds since the epoch, so two saves in one second differ
+    pub modified_ns: i64,
     pub hidden: bool,
 }
 
@@ -143,16 +145,15 @@ fn read_entry(path: &Path) -> io::Result<Entry> {
     // fs::metadata follows symlinks so a link to a folder opens like a folder
     let meta = fs::metadata(path).or_else(|_| fs::symlink_metadata(path))?;
     let name = path.file_name().ok_or_else(|| io::Error::other("The path has no name."))?.to_string_lossy().into_owned();
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
+    let since_epoch = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+    let modified = since_epoch.map_or(0, |d| d.as_secs() as i64);
+    let modified_ns = since_epoch.map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     Ok(Entry {
         hidden: is_hidden(&name, &meta),
         is_dir: meta.is_dir(),
         size: if meta.is_dir() { 0 } else { meta.len() },
         modified,
+        modified_ns,
         path: path.to_path_buf(),
         name,
     })
@@ -928,6 +929,22 @@ mod tests {
         assert_eq!(up, ["folder", "small.bin", "mid_a.bin", "mid_b.bin", "big.bin"]);
         let down = names(list_dir(tmp.path(), false, SortKey::Size, true).unwrap());
         assert_eq!(down, ["folder", "big.bin", "mid_b.bin", "mid_a.bin", "small.bin"]);
+    }
+
+    #[test]
+    fn modified_ns_tells_two_saves_in_one_second_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.txt");
+        fs::write(&path, "x").unwrap();
+        let set = |ns: u32| {
+            let when = UNIX_EPOCH + Duration::new(1_700_000_000, ns);
+            File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+            stat_entry(&path).unwrap()
+        };
+        let (first, second) = (set(100), set(200));
+        assert_eq!(first.modified, second.modified);
+        assert_eq!(first.modified_ns, 1_700_000_000_000_000_100);
+        assert_eq!(second.modified_ns, 1_700_000_000_000_000_200);
     }
 
     #[test]

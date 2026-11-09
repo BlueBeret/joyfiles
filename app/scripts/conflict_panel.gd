@@ -51,7 +51,7 @@ func open(info: Dictionary) -> void:
 	conflict = info
 	apply_all = false
 	cursor = 1
-	_title.text = JoyPathText.printable("\"%s\" already exists here." % info["name"])
+	_title.text = JoyPathText.printable("\"%s\" already exists here." % JoyPathText.file_name(info["path"]))
 	_existing.text = "In this folder: " + _describe(info["dest_is_dir"], info["dest_size"], info["dest_modified"])
 	_incoming.text = "Coming in: " + _describe(info["src_is_dir"], info["src_size"], info["src_modified"])
 	_render()
