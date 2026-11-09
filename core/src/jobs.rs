@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -195,6 +195,66 @@ struct Closing {
     key: Option<ItemKey>,
 }
 
+// the folders that jobs write into, so no job gives a folder its final rights while another job still fills it
+struct Rights {
+    claims: BTreeMap<ItemKey, Vec<u64>>,
+    waiting: Vec<Closing>,
+}
+
+static RIGHTS: Mutex<Rights> = Mutex::new(Rights { claims: BTreeMap::new(), waiting: Vec::new() });
+
+// a folder that a job made, merged into or wrote a part into stays open until that job ends
+fn claim(job: u64, key: Option<ItemKey>) {
+    let Some(key) = key else { return };
+    let mut rights = RIGHTS.lock().unwrap();
+    let jobs = rights.claims.entry(key).or_default();
+    if !jobs.contains(&job) {
+        jobs.push(job);
+    }
+}
+
+fn apply_rights(folder: &Closing) {
+    // a folder that moved or was replaced since keeps what it has, so the rights never land on another item
+    if item_key(&folder.dest) == folder.key {
+        keep_metadata(&folder.dest, &folder.meta);
+    }
+}
+
+// a folder that another job still fills waits, and the last of those jobs gives it the rights when it ends
+fn give_rights(job: u64, folders: Vec<Closing>) {
+    let mut rights = RIGHTS.lock().unwrap();
+    for folder in folders {
+        let busy = folder.key.as_ref().and_then(|key| rights.claims.get(key)).is_some_and(|jobs| jobs.iter().any(|&other| other != job));
+        if busy {
+            rights.waiting.push(folder);
+        } else {
+            apply_rights(&folder);
+        }
+    }
+}
+
+fn release_claims(job: u64) {
+    let mut rights = RIGHTS.lock().unwrap();
+    rights.claims.retain(|_, jobs| {
+        jobs.retain(|&other| other != job);
+        !jobs.is_empty()
+    });
+    let waiting = std::mem::take(&mut rights.waiting);
+    for folder in waiting {
+        if folder.key.as_ref().is_some_and(|key| rights.claims.contains_key(key)) {
+            rights.waiting.push(folder);
+        } else {
+            apply_rights(&folder);
+        }
+    }
+}
+
+impl Drop for Worker<'_> {
+    fn drop(&mut self) {
+        release_claims(self.owner.job());
+    }
+}
+
 #[cfg(unix)]
 type ItemKey = (u64, u64);
 
@@ -238,6 +298,41 @@ impl Stamp {
 
     fn holds_for(&self, path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|meta| Stamp::of(&meta) == *self)
+    }
+
+    // removing another link of the file changed its status time, so a file that is otherwise the same takes the new time
+    fn rebase(&mut self, path: &Path) {
+        let Ok(meta) = fs::symlink_metadata(path) else { return };
+        let now = Stamp::of(&meta);
+        if (now.len, now.modified, now.inode) == (self.len, self.modified, self.inode) {
+            self.changed = now.changed;
+        }
+    }
+}
+
+type Links = HashMap<(u64, u64), Vec<usize>>;
+
+// the places in a list of sources of the files that share one inode
+fn links_of(list: &[(PathBuf, Original)]) -> Links {
+    let mut links = Links::new();
+    for (at, (_, original)) in list.iter().enumerate() {
+        if let Original::File(Stamp { inode: Some(inode), .. }) = original {
+            links.entry(*inode).or_default().push(at);
+        }
+    }
+    links.retain(|_, group| group.len() > 1);
+    links
+}
+
+// a job that removed one link of a file keeps the stamps of the other links valid
+fn restamp_links(list: &mut [(PathBuf, Original)], links: &Links, removed: usize) {
+    let Original::File(Stamp { inode: Some(inode), .. }) = &list[removed].1 else { return };
+    let Some(group) = links.get(inode) else { return };
+    for &other in group.iter().filter(|&&other| other != removed) {
+        let (path, original) = &mut list[other];
+        if let Original::File(stamp) = original {
+            stamp.rebase(path);
+        }
     }
 }
 
@@ -355,7 +450,8 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
         Policy::Always(choice) => Some(choice),
     };
     let tasks = sources.iter().rev().map(|src| Task::Transfer { src: (*src).clone(), dest_dir: dest_dir.to_path_buf() }).collect();
-    let mut worker = Worker { p, owner, sticky, tasks, unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new(), merged_into: HashSet::new(), homes: HashMap::new(), closing: Vec::new() };
+    let mut worker = Worker::new(p, owner, sticky);
+    worker.tasks = tasks;
     for src in reserved {
         worker.note(src, &io::Error::other("its name is one that Joyfiles keeps for temporary items"));
     }
@@ -364,7 +460,11 @@ fn run(p: &Progress, sources: &[PathBuf], dest_dir: &Path, policy: Policy, owner
     result
 }
 
-impl Worker<'_> {
+impl<'a> Worker<'a> {
+    fn new(p: &'a Progress, owner: Owner, sticky: Option<Resolution>) -> Self {
+        Worker { p, owner, sticky, tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), created: HashSet::new(), merged_into: HashSet::new(), homes: HashMap::new(), closing: Vec::new() }
+    }
+
     fn run_tasks(&mut self) -> io::Result<()> {
         while let Some(task) = self.tasks.pop() {
             match task {
@@ -403,13 +503,8 @@ impl Worker<'_> {
         self.closing.push(Closing { dest, meta, key });
     }
 
-    // a folder that moved or was replaced since keeps what it has, so the rights never land on another item
     fn apply_closing(&mut self, from: usize) {
-        for folder in self.closing.drain(from..) {
-            if item_key(&folder.dest) == folder.key {
-                keep_metadata(&folder.dest, &folder.meta);
-            }
-        }
+        give_rights(self.owner.job(), self.closing.drain(from..).collect());
     }
 
     // records the error and lets the job go on, unless the user cancelled
@@ -437,53 +532,88 @@ impl Worker<'_> {
         let batch = std::mem::take(&mut self.unsettled);
         self.unsettled_bytes = 0;
         let dirs: BTreeSet<PathBuf> = batch.iter().filter_map(|u| u.dest().parent()).map(Path::to_path_buf).collect();
-        if let Err(e) = sync_drives(&dirs, false) {
-            for item in batch {
-                match item {
-                    Unsettled::File { src, part, home, .. } => {
-                        self.drop_part(&part, home);
-                        self.note(&src, &folder_moved(io::Error::new(e.kind(), e.to_string()), &part));
+        let gone = match sync_drives(&dirs, false) {
+            Ok(gone) => gone,
+            Err(e) => {
+                for item in batch {
+                    match item {
+                        Unsettled::File { src, part, home, .. } => {
+                            self.drop_part(&part, home);
+                            self.note(&src, &folder_moved(io::Error::new(e.kind(), e.to_string()), &part));
+                        }
+                        Unsettled::Close { dest, meta, .. } => self.close_folder(dest, meta),
+                        Unsettled::Link { .. } => {}
                     }
-                    Unsettled::Close { dest, meta, .. } => self.close_folder(dest, meta),
-                    Unsettled::Link { .. } => {}
                 }
+                return;
             }
-            return;
-        }
+        };
         let mut leaving = Vec::new();
+        let mut leaving_dirs = Vec::new();
         for item in batch {
+            let lost = item.dest().parent().is_some_and(|dir| gone.contains(dir));
             match item {
+                // a folder that went away costs only its own items, and the part goes through its folder handle
+                Unsettled::File { src, part, home, .. } if lost => {
+                    self.drop_part(&part, home);
+                    self.note(&src, &folder_moved(io::ErrorKind::NotFound.into(), &part));
+                }
                 Unsettled::File { src, part, dest, stamp, home } => match self.commit(&src, &part, &dest, home) {
-                    Ok(Some(_)) => leaving.push((src, Original::File(stamp))),
+                    Ok(Some(_)) => {
+                        leaving_dirs.push(dest.parent().map(Path::to_path_buf));
+                        leaving.push((src, Original::File(stamp)));
+                    }
                     Ok(None) => {}
                     Err(_) if self.p.cancel.load(Ordering::Relaxed) => {}
                     Err(e) => self.note(&src, &e),
                 },
-                Unsettled::Link { src, stamp, .. } => leaving.push((src, Original::File(stamp))),
+                Unsettled::Link { .. } if lost => {}
+                Unsettled::Link { src, dest, stamp } => {
+                    leaving_dirs.push(dest.parent().map(Path::to_path_buf));
+                    leaving.push((src, Original::File(stamp)));
+                }
+                Unsettled::Close { dest, meta, .. } if lost => self.close_folder(dest, meta),
                 Unsettled::Close { src, dest, meta } => {
+                    leaving_dirs.push(dest.parent().map(Path::to_path_buf));
                     leaving.push((src, Original::Folder(inode_of(&meta))));
                     self.close_folder(dest, meta);
                 }
             }
         }
-        if let Err(e) = sync_drives(&dirs, true) {
-            for (src, _) in &leaving {
-                self.note(src, &e);
+        let gone = match sync_drives(&dirs, true) {
+            Ok(gone) => gone,
+            Err(e) => {
+                for (src, _) in &leaving {
+                    self.note(src, &e);
+                }
+                return;
             }
-            return;
+        };
+        // a folder that went away after its items took their names is not known to be on the drive, so those sources stay
+        let mut kept = Vec::new();
+        for ((src, original), dir) in leaving.into_iter().zip(leaving_dirs) {
+            if dir.is_some_and(|dir| gone.contains(&dir)) {
+                self.note(&src, &io::Error::other("the destination folder moved or went away while it was copied"));
+            } else {
+                kept.push((src, original));
+            }
         }
+        let mut leaving = kept;
         if how != Copying::Moving {
             return;
         }
-        for (src, original) in leaving {
-            if !original.is_at(&src) {
-                self.note(&src, &changed_error(&src));
+        let links = links_of(&leaving);
+        for at in 0..leaving.len() {
+            let (src, original) = &leaving[at];
+            if !original.is_at(src) {
+                self.note(src, &changed_error(src));
                 continue;
             }
             // a source folder stays when a child of it was skipped or failed
-            match original.remove(&src) {
-                Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.note(&src, &e),
-                _ => {}
+            match original.remove(src) {
+                Err(e) if e.kind() != io::ErrorKind::DirectoryNotEmpty => self.note(src, &e),
+                Err(_) => {}
+                Ok(()) => restamp_links(&mut leaving, &links, at),
             }
         }
     }
@@ -534,6 +664,7 @@ impl Worker<'_> {
             self.tasks.push(Task::EndMerge(src.to_path_buf()));
         }
         if let Some(key) = item_key(target) {
+            claim(self.owner.job(), Some(key.clone()));
             self.merged_into.insert(key);
         }
         for entry in children.into_iter().rev().filter(|e| !parts::is_temp_name(&e.file_name())) {
@@ -591,18 +722,21 @@ impl Worker<'_> {
     }
 
     // only what the job copied goes, and an item that changed or came new since stays, so a move never deletes data it did not copy
-    fn remove_copied(&self, copied: Vec<(PathBuf, Original)>) {
-        for (path, original) in copied.into_iter().rev() {
-            if !original.is_at(&path) {
+    fn remove_copied(&self, mut copied: Vec<(PathBuf, Original)>) {
+        let links = links_of(&copied);
+        for at in (0..copied.len()).rev() {
+            let (path, original) = &copied[at];
+            if !original.is_at(path) {
                 // a folder that went or changed stays quiet, as it holds no bytes of its own
                 if let Original::File(_) = original {
-                    self.note(&path, &changed_error(&path));
+                    self.note(path, &changed_error(path));
                 }
                 continue;
             }
-            match original.remove(&path) {
-                Err(e) if !matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound) => self.note(&path, &e),
-                _ => {}
+            match original.remove(path) {
+                Err(e) if !matches!(e.kind(), io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound) => self.note(path, &e),
+                Err(_) => {}
+                Ok(()) => restamp_links(&mut copied, &links, at),
             }
         }
     }
@@ -610,16 +744,17 @@ impl Worker<'_> {
     // the old item moves aside, the new one takes its name, and the old one goes only once that name is on the drive
     fn swap_in(&self, new: &Path, target: &Path) -> io::Result<()> {
         let aside = parts::park_path(target.parent().unwrap_or(Path::new(".")), target.file_name().unwrap_or_default(), self.owner)?;
-        let done = self.swap_with(new, target, &aside);
+        let home = target.parent().and_then(|dir| File::open(dir).ok());
+        let done = self.swap_with(new, target, &aside, home.as_ref());
         parts::clear_hold(&aside, target);
         done
     }
 
-    fn swap_with(&self, new: &Path, target: &Path, aside: &Path) -> io::Result<()> {
+    fn swap_with(&self, new: &Path, target: &Path, aside: &Path, home: Option<&File>) -> io::Result<()> {
         // another job may park or remove the old item first, and then the name is free for the new item
         for _ in 0..SWAP_TRIES {
             match rename_noreplace(target, aside) {
-                Ok(()) => return self.finish_swap(new, target, aside),
+                Ok(()) => return self.finish_swap(new, target, aside, home),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => match rename_noreplace(new, target) {
                     Ok(()) => {
                         let _ = sync_dir(target.parent().unwrap_or(Path::new(".")));
@@ -634,26 +769,29 @@ impl Worker<'_> {
         Err(io::Error::other("another job keeps taking the name"))
     }
 
-    fn finish_swap(&self, new: &Path, target: &Path, aside: &Path) -> io::Result<()> {
-        if let Err(e) = rename_noreplace(new, target) {
-            if let Err(back) = rename_noreplace(aside, target) {
-                self.surface(aside, target, "Could not put back the old", &back);
+    // the folder handle reaches the folder wherever it moved, so the last steps never use a path that went stale
+    fn finish_swap(&self, new: &Path, target: &Path, aside: &Path, home: Option<&File>) -> io::Result<()> {
+        let dir = target.parent().unwrap_or(Path::new("."));
+        let at = reach(dir, home);
+        let (target_now, aside_now) = (at.join(target.file_name().unwrap_or_default()), at.join(aside.strip_prefix(dir).unwrap_or(aside)));
+        if let Err(e) = rename_noreplace(new, &target_now) {
+            if let Err(back) = rename_noreplace(&aside_now, &target_now) {
+                self.surface(&aside_now, &target_now, &at, "Could not put back the old", &back);
             }
             return Err(e);
         }
-        let dir = target.parent().unwrap_or(Path::new("."));
-        if let Err(e) = sync_dir(dir).and_then(|()| remove_temp_tree(aside)) {
-            self.surface(aside, target, "Could not remove all of the old", &e);
+        if let Err(e) = sync_home(dir, home).and_then(|()| remove_temp_tree(&aside_now)) {
+            self.surface(&aside_now, &target_now, &at, "Could not remove all of the old", &e);
         }
         Ok(())
     }
 
     // an old item that can neither go back nor go away comes back under a visible name, so it never hides on the drive
-    fn surface(&self, aside: &Path, target: &Path, what: &str, err: &io::Error) {
+    fn surface(&self, aside: &Path, target: &Path, at: &Path, what: &str, err: &io::Error) {
         let rest = unique_dest(target.parent().unwrap_or(Path::new(".")), target.file_name().unwrap_or_default(), is_real_dir(aside));
         let left = if rename_noreplace(aside, &rest).is_ok() { rest } else { aside.to_path_buf() };
         let message = format!("{what} \"{}\": {}. It is now \"{}\".", display_name(target), reason(err), display_name(&left));
-        self.p.failures.lock().unwrap().push(Failure { path: left, message });
+        self.p.failures.lock().unwrap().push(Failure { path: found_at(&left, at), message });
     }
 
     // an item counts as placed by this job when it or a folder above it was, so a merge into such a folder never replaces either
@@ -814,6 +952,7 @@ impl Worker<'_> {
                 made => made?,
             }
             self.record(dest);
+            claim(self.owner.job(), item_key(dest));
             pending.push(Step::Close { src: src.to_path_buf(), dest: dest.to_path_buf(), meta });
             let children = fs::read_dir(src)?.collect::<io::Result<Vec<_>>>()?;
             for entry in children.into_iter().rev().filter(|e| !parts::is_temp_name(&e.file_name())) {
@@ -829,6 +968,7 @@ impl Worker<'_> {
             }
         } else if meta.is_file() {
             let part = temp_beside(dest, self.owner, Role::Part);
+            claim(self.owner.job(), part.parent().and_then(item_key));
             let mut folder = None;
             let written = write_copy(self.p, src, &part, how != Copying::Plain, &mut folder);
             let home = self.keep_home(folder);
@@ -850,6 +990,35 @@ impl Worker<'_> {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "it is not a regular file"));
         }
         Ok(())
+    }
+}
+
+// the open handle of a folder names it wherever it moved, so a path made from it never goes stale
+#[cfg(target_os = "linux")]
+fn reach(dir: &Path, home: Option<&File>) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    home.map_or_else(|| dir.to_path_buf(), |folder| PathBuf::from(format!("/proc/self/fd/{}", folder.as_raw_fd())))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reach(dir: &Path, _home: Option<&File>) -> PathBuf {
+    dir.to_path_buf()
+}
+
+// the path a user can open, where the handle path stands in for a folder that moved
+fn found_at(path: &Path, at: &Path) -> PathBuf {
+    match (fs::read_link(at), path.strip_prefix(at)) {
+        (Ok(real), Ok(rest)) => real.join(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+// the open folder is already readable, so the sync needs no path and no search for a folder above it
+fn sync_home(dir: &Path, home: Option<&File>) -> io::Result<()> {
+    let Some(folder) = home else { return sync_dir(dir) };
+    match folder.sync_all() {
+        Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => Ok(()),
+        done => done,
     }
 }
 
@@ -893,18 +1062,27 @@ fn refused_in_tests(_dir: &Path) -> io::Result<()> {
 // one call syncs a whole Linux drive, which costs far less than one sync per file of a big batch
 const SYNC_EACH_FILE: bool = !cfg!(target_os = "linux");
 
+// a folder that went away is not an error of the drive, so the folders that went away come back for the caller to deal with
 #[cfg(target_os = "linux")]
-fn sync_drives(dirs: &BTreeSet<PathBuf>, _names: bool) -> io::Result<()> {
+fn sync_drives(dirs: &BTreeSet<PathBuf>, _names: bool) -> io::Result<BTreeSet<PathBuf>> {
     use std::os::unix::fs::MetadataExt;
     let mut synced = BTreeSet::new();
+    let mut gone = BTreeSet::new();
     for dir in dirs {
         refused_in_tests(dir)?;
-        let dev = fs::metadata(dir)?.dev();
+        let dev = match fs::metadata(dir) {
+            Ok(meta) => meta.dev(),
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+                gone.insert(dir.clone());
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         if synced.insert(dev) {
             syncfs_near(dir)?;
         }
     }
-    Ok(())
+    Ok(gone)
 }
 
 // a folder without read rights cannot be opened, so the nearest folder above it on the same drive stands in
@@ -927,11 +1105,19 @@ fn syncfs_near(dir: &Path) -> io::Result<()> {
 
 // each file was synced as it was written, so only the folders that got new names remain
 #[cfg(not(target_os = "linux"))]
-fn sync_drives(dirs: &BTreeSet<PathBuf>, names: bool) -> io::Result<()> {
+fn sync_drives(dirs: &BTreeSet<PathBuf>, names: bool) -> io::Result<BTreeSet<PathBuf>> {
+    let mut gone = BTreeSet::new();
     if names {
-        dirs.iter().try_for_each(|dir| sync_dir(dir))?;
+        for dir in dirs {
+            match sync_dir(dir) {
+                Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+                    gone.insert(dir.clone());
+                }
+                done => done?,
+            }
+        }
     }
-    Ok(())
+    Ok(gone)
 }
 
 // a new name is on the drive only once its folder is synced, and a drive that cannot sync a folder answers EINVAL
@@ -2446,7 +2632,7 @@ mod tests {
 
     #[cfg(unix)]
     fn hand_worker<'a>(p: &'a Progress, live: &LiveJob) -> Worker<'a> {
-        Worker { p, owner: live.owner(), sticky: None, tasks: Vec::new(), unsettled: Vec::new(), unsettled_bytes: 0, merged: Vec::new(), merged_into: HashSet::new(), created: HashSet::new(), homes: HashMap::new(), closing: Vec::new() }
+        Worker::new(p, live.owner(), None)
     }
 
     #[cfg(unix)]
@@ -2794,5 +2980,156 @@ mod tests {
         worker.swap_in(&dir.join("new"), &dir.join("target")).unwrap();
         assert_eq!(read(dir.join("target")), "new");
         assert_eq!(names_in(dir), ["target"]);
+    }
+
+    // returns None when this user can write into a mode 555 folder anyway
+    #[cfg(unix)]
+    fn locked_folder_binds(dir: &Path) -> Option<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir).unwrap().permissions().mode();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let blocked = fs::write(dir.join("probe"), "x").is_err();
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        blocked.then_some(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_another_job_still_fills_gets_its_rights_when_that_job_ends() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two, out) = (tmp.path().join("one"), tmp.path().join("two"), tmp.path().join("out"));
+        for dir in [&one, &two, &out] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::create_dir(one.join("r")).unwrap();
+        fs::write(one.join("r/a"), "a").unwrap();
+        fs::write(two.join("b"), "b").unwrap();
+        fs::set_permissions(one.join("r"), fs::Permissions::from_mode(0o555)).unwrap();
+        if locked_folder_binds(&out).is_none() {
+            return;
+        }
+        let (p, first) = idle_job(&out);
+        let second = LiveJob::start();
+        let mut early = hand_worker(&p, &first);
+        let mut late = hand_worker(&p, &second);
+        early.copy_tree(&one.join("r"), &out.join("r"), Copying::Plain, true).unwrap();
+        late.copy_tree(&two.join("b"), &out.join("r/b"), Copying::Moving, false).unwrap();
+        early.finish();
+        drop(early);
+        late.settle(Copying::Moving);
+        late.finish();
+        assert_eq!(names_in(&out.join("r")), ["a", "b"], "the late job placed its part and left no hidden item");
+        assert!(p.failures().is_empty(), "{:?}", p.failures());
+        assert_eq!(fs::metadata(out.join("r")).unwrap().permissions().mode() & 0o777, 0o755, "the rights wait for the late job");
+        drop(late);
+        assert_eq!(fs::metadata(out.join("r")).unwrap().permissions().mode() & 0o777, 0o555, "the last job gives the folder its rights");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_of_hard_links_across_the_batch_keeps_no_link_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("one"), "same data").unwrap();
+        fs::hard_link(src.join("one"), src.join("two")).unwrap();
+        fs::hard_link(src.join("one"), src.join("three")).unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        for name in ["one", "two", "three"] {
+            worker.copy_tree(&src.join(name), &out.join(name), Copying::Moving, false).unwrap();
+        }
+        worker.finish();
+        assert!(p.failures().is_empty(), "{:?}", p.failures());
+        assert!(names_in(&src).is_empty(), "every link left the source");
+        assert_eq!(names_in(&out), ["one", "three", "two"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replace_removes_every_hard_link_of_what_it_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("one"), "same data").unwrap();
+        fs::hard_link(src.join("one"), src.join("two")).unwrap();
+        let (p, live) = idle_job(tmp.path());
+        let worker = hand_worker(&p, &live);
+        worker.remove_copied(snapshot(&src));
+        assert!(p.failures().is_empty(), "{:?}", p.failures());
+        assert!(!src.exists(), "the whole tree went");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_still_keeps_a_hard_link_that_was_edited_in_place_after_its_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("one"), "same data").unwrap();
+        fs::hard_link(src.join("one"), src.join("two")).unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        for name in ["one", "two"] {
+            worker.copy_tree(&src.join(name), &out.join(name), Copying::Moving, false).unwrap();
+        }
+        let edited = fs::metadata(src.join("one")).unwrap().modified().unwrap();
+        let mut file = fs::OpenOptions::new().write(true).open(src.join("one")).unwrap();
+        file.write_all(b"SAME").unwrap();
+        file.set_modified(edited).unwrap();
+        worker.finish();
+        assert_eq!(p.failures().len(), 2, "an edit with the old time is seen by the status time: {:?}", p.failures());
+        assert!(src.join("one").exists() && src.join("two").exists(), "both links stay, as the edit changed their shared file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_folder_that_went_away_fails_only_its_own_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(src.join("a")).unwrap();
+        fs::create_dir_all(src.join("b/sub")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("a/f1"), "1").unwrap();
+        fs::write(src.join("b/f3"), "3").unwrap();
+        fs::write(src.join("b/sub/f2"), "2").unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        for name in ["a", "b"] {
+            worker.copy_tree(&src.join(name), &out.join(name), Copying::Moving, false).unwrap();
+        }
+        fs::rename(out.join("b/sub"), out.join("b/subx")).unwrap();
+        worker.finish();
+        let failures = p.failures();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].path.ends_with("b/sub/f2") && failures[0].message.contains("moved or went away"), "{failures:?}");
+        assert_eq!((read(out.join("a/f1")), read(out.join("b/f3"))), ("1".into(), "3".into()));
+        assert!(!src.join("a/f1").exists() && !src.join("b/f3").exists(), "the sources of the other folders went");
+        assert_eq!(read(src.join("b/sub/f2")), "2", "the source of the lost folder stays");
+        assert!(names_in(&out.join("b/subx")).is_empty(), "the part of the lost folder is gone");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replace_ends_the_old_item_through_the_folder_handle_when_the_folder_moved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dest");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("target"), "old").unwrap();
+        fs::write(tmp.path().join("new"), "new").unwrap();
+        let (p, live) = idle_job(tmp.path());
+        let worker = hand_worker(&p, &live);
+        let target = dir.join("target");
+        let aside = parts::park_path(&dir, std::ffi::OsStr::new("target"), worker.owner).unwrap();
+        let home = File::open(&dir).unwrap();
+        rename_noreplace(&target, &aside).unwrap();
+        fs::rename(&dir, tmp.path().join("moved")).unwrap();
+        worker.finish_swap(&tmp.path().join("new"), &target, &aside, Some(&home)).unwrap();
+        assert_eq!(read(tmp.path().join("moved/target")), "new");
+        assert_eq!(names_in(&tmp.path().join("moved")), ["target"], "no hidden old item stays");
+        assert!(p.failures().is_empty(), "{:?}", p.failures());
     }
 }

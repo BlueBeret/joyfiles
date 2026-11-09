@@ -46,6 +46,10 @@ impl Owner {
         Owner { pid: std::process::id(), job: 0, start: own_start() }
     }
 
+    pub fn job(self) -> u64 {
+        self.job
+    }
+
     fn is_this_process(self) -> bool {
         self.pid == std::process::id() && self.start.is_none_or(|start| Some(start) == own_start())
     }
@@ -277,9 +281,41 @@ fn is_stale(path: &Path, owner: Option<Owner>, role: Role, min_age: Duration) ->
     changed.is_ok_and(|at| SystemTime::now().duration_since(at).is_ok_and(|age| age >= min_age))
 }
 
+// a read only folder gets write rights while the sweep removes its stale items, then it gets its mode and times back
+struct Reopened {
+    dir: PathBuf,
+    meta: fs::Metadata,
+}
+
+#[cfg(unix)]
+fn reopen(dir: &Path) -> Option<Reopened> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::metadata(dir).ok()?;
+    let mode = meta.permissions().mode();
+    if !meta.is_dir() || mode & 0o200 != 0 {
+        return None;
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700)).ok()?;
+    Some(Reopened { dir: dir.to_path_buf(), meta })
+}
+
+#[cfg(not(unix))]
+fn reopen(_dir: &Path) -> Option<Reopened> {
+    None
+}
+
+impl Drop for Reopened {
+    fn drop(&mut self) {
+        let times = fs::FileTimes::new().set_modified(self.meta.modified().unwrap_or_else(|_| SystemTime::now()));
+        let _ = fs::File::open(&self.dir).and_then(|f| f.set_times(times));
+        let _ = fs::set_permissions(&self.dir, self.meta.permissions());
+    }
+}
+
 // a stale part goes, and a stale old item gets its name back, or goes when a new item took that name
 pub fn sweep(dir: &Path, min_age: Duration, stop: &AtomicBool) {
     let Ok(listing) = fs::read_dir(dir) else { return };
+    let mut reopened = None;
     for entry in listing.filter_map(Result::ok) {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -289,6 +325,7 @@ pub fn sweep(dir: &Path, min_age: Duration, stop: &AtomicBool) {
         if !is_stale(&path, temp.owner, temp.role, min_age) || (entry.file_type().is_ok_and(|t| t.is_dir()) && holds_mount_point(&path)) {
             continue;
         }
+        reopened.get_or_insert_with(|| reopen(dir));
         if temp.role == Role::Old && temp.owner.is_some() && temp.stem.is_empty() {
             release_hold(&path, dir);
             continue;
@@ -466,5 +503,27 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(names_in(dir), [old, fresh], "the part is gone, and an old item stays because its rename came after the process started");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_removes_a_stale_part_in_a_read_only_folder_and_restores_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro");
+        fs::create_dir(&dir).unwrap();
+        let ended = LiveJob::start().owner();
+        let part = temp_path(&dir, OsStr::new("x.bin"), ended, Role::Part);
+        fs::write(&part, "x").unwrap();
+        fs::write(dir.join("keep"), "k").unwrap();
+        backdate(&part);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(dir.join("probe"), "x").is_ok() {
+            return;
+        }
+        sweep(&dir, SAFE_AGE, &AtomicBool::new(false));
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o555, "the folder is read only again");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(names_in(&dir), ["keep"], "the stale part went");
     }
 }
