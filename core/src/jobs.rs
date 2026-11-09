@@ -269,10 +269,10 @@ fn inode_of(_meta: &fs::Metadata) -> Option<(u64, u64)> {
     None
 }
 
-// a NotFound error of a part whose folder is gone names that cause, since the source is there
+// an error of a part whose folder is gone or is no longer a folder names that cause, since the source is there
 fn folder_moved(e: io::Error, part: &Path) -> io::Error {
     match part.parent() {
-        Some(dir) if e.kind() == io::ErrorKind::NotFound && !dir.exists() => io::Error::other("the destination folder moved or went away while it was copied"),
+        Some(dir) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) && !dir.is_dir() => io::Error::other("the destination folder moved or went away while it was copied"),
         _ => e,
     }
 }
@@ -643,12 +643,12 @@ impl Worker<'_> {
         placed
     }
 
-    // a part goes by its path, or through the open handle of its folder when that folder moved or went away
+    // a part goes through the open handle of its folder, which reaches it wherever that folder moved, and by its path only when no handle is known
     fn drop_part(&self, part: &Path, home: Option<(u64, u64)>) {
-        let Err(e) = fs::remove_file(part) else { return };
-        if e.kind() == io::ErrorKind::NotFound {
-            if let (Some(folder), Some(name)) = (home.and_then(|key| self.homes.get(&key)), part.file_name()) {
-                unlink_in(folder, name);
+        match (home.and_then(|key| self.homes.get(&key)), part.file_name()) {
+            (Some(folder), Some(name)) => unlink_in(folder, name),
+            _ => {
+                let _ = fs::remove_file(part);
             }
         }
     }
@@ -2427,6 +2427,24 @@ mod tests {
         assert!(failed.len() == 1 && failed[0].contains("moved or went away"), "{failed:?}");
     }
 
+    // every file below root with its text, so a test sees hidden items too
+    #[cfg(unix)]
+    fn files_below(root: &Path) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap().map(Result::unwrap) {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    found.push((entry.path().strip_prefix(root).unwrap().to_string_lossy().into_owned(), read(entry.path())));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_move_never_removes_a_file_that_took_the_name_of_a_copied_source_folder() {
@@ -2444,6 +2462,49 @@ mod tests {
         worker.finish();
         assert_eq!(read(src.join("b")), "USER", "a file that took the name of the source folder stays");
         assert_eq!(read(src.join("zz/in/x")), "x", "the source folder that moved away keeps its files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_part_is_removed_when_a_file_took_the_name_of_its_destination_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(src.join("d")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("d/f"), "f").unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        worker.copy_tree(&src.join("d"), &out.join("d"), Copying::Moving, true).unwrap();
+        fs::rename(out.join("d"), out.join("moved")).unwrap();
+        fs::write(out.join("d"), "USER").unwrap();
+        worker.finish();
+        assert_eq!(names_in(&out.join("moved")), Vec::<String>::new(), "no hidden part stays in the moved folder");
+        assert_eq!(read(out.join("d")), "USER");
+        assert_eq!(read(src.join("d/f")), "f", "the source stays");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_never_takes_the_part_of_another_folder_when_two_destination_folders_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, out) = (tmp.path().join("src"), tmp.path().join("out"));
+        fs::create_dir_all(src.join("a")).unwrap();
+        fs::create_dir_all(src.join("b")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("a/f"), "A").unwrap();
+        fs::write(src.join("b/f"), "B").unwrap();
+        let (p, live) = idle_job(&out);
+        let mut worker = hand_worker(&p, &live);
+        worker.copy_tree(&src.join("a"), &out.join("a"), Copying::Moving, true).unwrap();
+        worker.copy_tree(&src.join("b"), &out.join("b"), Copying::Moving, true).unwrap();
+        fs::rename(out.join("a"), out.join("x")).unwrap();
+        fs::rename(out.join("b"), out.join("a")).unwrap();
+        worker.finish();
+        let files = files_below(tmp.path());
+        assert!(files.iter().all(|(path, _)| !path.split('/').any(|n| parts::is_temp_name(std::ffi::OsStr::new(n)))), "no hidden part stays: {files:?}");
+        for text in ["A", "B"] {
+            assert!(files.iter().any(|(_, t)| t == text), "{text} stays under a visible name: {files:?}");
+        }
     }
 
     #[cfg(unix)]

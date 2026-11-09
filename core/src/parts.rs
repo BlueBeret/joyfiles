@@ -91,9 +91,12 @@ impl Drop for LiveJob {
     }
 }
 
+// each temporary item of this process gets its own number, so the path of one part never reaches a part of another folder that moved there
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
 // a hidden name in the same folder, so a rename puts the finished item in place in one step
 pub fn temp_path(dir: &Path, name: &OsStr, owner: Owner, role: Role) -> PathBuf {
-    (1u64..)
+    std::iter::repeat_with(|| NEXT_TEMP.fetch_add(1, Ordering::Relaxed))
         .map(|n| {
             let tag = tag(owner, role, n);
             let mut temp = OsString::from(".");
